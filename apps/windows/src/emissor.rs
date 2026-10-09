@@ -1519,17 +1519,13 @@ fn fonte_da_camera_sintetica() -> Fonte {
 /// O id da câmera sintética: não é link de câmera nenhuma.
 const ID_DA_CAMERA_SINTETICA: &str = "camera-sintetica";
 
-/// Os monitores que a pessoa pode escolher: todos, **menos os nossos** — um monitor virtual da tela
-/// estendida não é origem para espelhar (`monitor::e_nosso`, pelo adaptador ou pelo
-/// `monitorDevicePath`, nunca pelo nome GDI). Sem monitor virtual criado neste processo, a lista é
-/// a de `fontes::monitores()`, igual à de antes. O `bool` é o ladrilho apagado da tela estendida.
+/// Quall Monitor oferece somente a tela estendida. O bool indica o ladrilho sem driver.
 fn monitores_para_o_seletor() -> (Vec<Fonte>, bool) {
-    let mut lista = Vec::new();
+    let mut lista: Vec<Fonte> = Vec::new();
     #[cfg(not(feature = "tela-estendida-futura"))]
     { return (lista, false); }
     #[cfg(feature = "tela-estendida-futura")]
     {
-    lista.retain(|f| !crate::monitor::e_nosso(&f.id));
     // **A tela estendida** (`docs/monitor-virtual-windows.md` §14 e a nota de 02/10 no §7): um
     // monitor virtual novo para cada aparelho que entrar, pelo SudoVDA **que a pessoa instalou**. Com
     // o adaptador presente (o PnP diz; nada é aberto aqui) ela entra na lista, com ou sem

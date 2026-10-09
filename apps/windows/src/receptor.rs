@@ -287,9 +287,9 @@ const QUEDAS_DA_GPU_TOLERADAS: u32 = 3;
 /// então o título diz o que está no ar e não finge saber se é o que se escolheu.
 fn titulo_da_exibicao(par: &str, no_ar: Option<(u32, u32, u32)>, agora: u64, sessao: u64) -> String {
     let mut base = if par.is_empty() {
-        "Quall".to_string()
+        "Quall Monitor".to_string() // i18n: fora (a marca)
     } else {
-        format!("Quall — {par}") // i18n: fora (o nome do app e o do par)
+        format!("Quall Monitor — {par}") // i18n: fora (o nome do app e o do par)
     };
     if let Some((w, h, fps)) = no_ar {
         base.push_str(&tf(" · {}x{} a {} fps", &[&w, &h, &fps]));
@@ -921,16 +921,7 @@ impl Receptor {
         // são limpos, e a sessão seguinte não nasce com "som: tocando" de outra.
         let _limpa_o_som = LimpaOSom(&self);
 
-        // --- R9b: o controle remoto da câmera de quem filma ----------------------------------------
-        //
-        // Pelo canal de dados desta sessão de vídeo, com o laço como o único leitor dele. O
-        // `Controlador` manda o `ola`, recebe o estado e as capacidades, e manda os pedidos da janela
-        // de ajustes remota; aqui ele só é bombeado, sem espera, a cada volta.
-        let camera = ControleRemoto::novo(nome_do_par.clone());
-        let mensageiro = pronto.session.mensageiro();
-        *self.camera_remota.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&camera));
-        let _limpa_a_camera = LimpaACamera(&self);
-        let mut situacao_da_camera = String::new();
+        // Quall Monitor receives screen tracks only and never opens camera control.
         let mut indice_do_som = tracks.iter().position(|t| t.kind().e_audio());
         let mut tocador: Option<Tocador> = indice_do_som.and_then(|i| self.abrir_o_som(&tracks[i]));
         let mut conferiu_o_som = Instant::now();
@@ -1037,7 +1028,6 @@ impl Receptor {
                     }
                 }
             }
-            self.bombear_a_camera(&camera, &mensageiro, &mut situacao_da_camera);
             match pronto.proximo_evento(Duration::from_millis(0)) {
                 EventoDeSessao::Desconectou => {
                     motivo_do_fim = tf("{} parou de transmitir.", &[&nome_do_par]);
@@ -1579,7 +1569,7 @@ impl Receptor {
             resumo.largura,
             resumo.altura,
             self.argumentos.fps,
-            &format!("Quall — {par}"), // i18n: fora (o nome do app e o do par)
+            &format!("Quall Monitor — {par}"), // i18n: fora (o nome do app e o do par)
             self.argumentos.escala_do_video,
             // A claquete (S7) lê a régua de cada quadro apresentado.
             self.argumentos.regua || self.argumentos.claquete,
@@ -1852,7 +1842,7 @@ mod testes {
     /// aviso permanente é ruído, e ruído permanente é a mesma coisa que silêncio.
     #[test]
     fn sessao_limpa_nao_ganha_alarme() {
-        assert_eq!(titulo_da_exibicao("SM-A107M", None, 0, 0), "Quall — SM-A107M");
+        assert_eq!(titulo_da_exibicao("SM-A107M", None, 0, 0), "Quall Monitor — SM-A107M");
     }
 
     /// **O aviso aparece pela derivada.** O que decide o `⚠` é o último segundo, não o acumulado.
@@ -1860,7 +1850,7 @@ mod testes {
     fn o_aviso_vem_do_ultimo_segundo() {
         assert_eq!(
             titulo_da_exibicao("SM-A107M", None, 8, 27),
-            "Quall — SM-A107M · ⚠ 8 quadros suspeitos agora · 27 na sessão"
+            "Quall Monitor — SM-A107M · ⚠ 8 quadros suspeitos agora · 27 na sessão"
         );
     }
 
@@ -1870,7 +1860,7 @@ mod testes {
     fn o_alarme_apaga_e_o_acumulado_fica() {
         assert_eq!(
             titulo_da_exibicao("SM-A107M", None, 0, 27),
-            "Quall — SM-A107M · 27 quadros suspeitos na sessão"
+            "Quall Monitor — SM-A107M · 27 quadros suspeitos na sessão"
         );
     }
 
@@ -1880,11 +1870,11 @@ mod testes {
     fn o_titulo_diz_o_que_esta_no_ar() {
         assert_eq!(
             titulo_da_exibicao("SM-S928B", Some((1920, 1080, 60)), 0, 0),
-            "Quall — SM-S928B · 1920x1080 a 60 fps"
+            "Quall Monitor — SM-S928B · 1920x1080 a 60 fps"
         );
         assert_eq!(
             titulo_da_exibicao("SM-S928B", Some((1920, 1080, 40)), 8, 27),
-            "Quall — SM-S928B · 1920x1080 a 40 fps · ⚠ 8 quadros suspeitos agora · 27 na sessão"
+            "Quall Monitor — SM-S928B · 1920x1080 a 40 fps · ⚠ 8 quadros suspeitos agora · 27 na sessão"
         );
     }
 
@@ -1892,8 +1882,8 @@ mod testes {
     /// produto e não um travessão solto.
     #[test]
     fn sem_nome_do_par_o_titulo_nao_fica_manco() {
-        assert_eq!(titulo_da_exibicao("", None, 0, 0), "Quall");
-        assert_eq!(titulo_da_exibicao("", None, 3, 3), "Quall · ⚠ 3 quadros suspeitos agora · 3 na sessão");
+        assert_eq!(titulo_da_exibicao("", None, 0, 0), "Quall Monitor");
+        assert_eq!(titulo_da_exibicao("", None, 3, 3), "Quall Monitor · ⚠ 3 quadros suspeitos agora · 3 na sessão");
     }
 
     /// Em inglês, o mesmo título pela tabela (a tradução EN/PT, 02/10).
@@ -1902,9 +1892,9 @@ mod testes {
         crate::idioma::com_idioma(crate::idioma::Idioma::En, || {
             assert_eq!(
                 titulo_da_exibicao("SM-S928B", Some((1920, 1080, 40)), 8, 27),
-                "Quall — SM-S928B · 1920x1080 at 40 fps · ⚠ 8 suspect frames now · 27 this session"
+                "Quall Monitor — SM-S928B · 1920x1080 at 40 fps · ⚠ 8 suspect frames now · 27 this session"
             );
-            assert_eq!(titulo_da_exibicao("SM-S928B", None, 0, 27), "Quall — SM-S928B · 27 suspect frames this session");
+            assert_eq!(titulo_da_exibicao("SM-S928B", None, 0, 27), "Quall Monitor — SM-S928B · 27 suspect frames this session");
         });
     }
 }

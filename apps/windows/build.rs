@@ -17,7 +17,7 @@
 //! # O ícone, sem `rc.exe` e sem crate nova (30/09)
 //!
 //! O `.exe` não tinha recurso de ícone (`ExtractIconEx` contava 0; ver o comentário do `<Icon>` em
-//! `scripts/instalador/Quall.wxs`), e o atalho e "Programas e Recursos" mostravam o genérico. O
+//! `scripts/instalador/QuallMonitor.wxs`), e o atalho e "Programas e Recursos" mostravam o genérico. O
 //! `link.exe` do MSVC aceita um arquivo `.res` como entrada e o converte sozinho (CVTRES): então este
 //! script **escreve o `.res`** a partir do `quall.ico` — um `RT_ICON` por imagem e um `RT_GROUP_ICON`
 //! de número 1, que é o que o Explorer e o `<Icon>` do WiX leem — e o passa ao linker do binário. O

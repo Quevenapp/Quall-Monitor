@@ -55,6 +55,7 @@ $msi = Join-Path $Destino "Quall-Monitor-$Versao-windows-x64.msi"
     -ext WixToolset.Util.wixext -ext WixToolset.Firewall.wixext -ext WixToolset.UI.wixext `
     -d "Versao=$Versao" -d "Bin=$estagio" -o $msi
 if ($LASTEXITCODE -ne 0) { throw 'Falha ao construir MSI.' }
+& (Join-Path $PSScriptRoot 'verificar-msi.ps1') -Pacote $msi -Versao $Versao -Revisao $rev -Estagio $estagio | Set-Content -LiteralPath "$msi.validation.json" -Encoding UTF8
 $hash = (Get-FileHash -LiteralPath $msi -Algorithm SHA256).Hash.ToLowerInvariant()
 [IO.File]::WriteAllText("$msi.sha256", "$hash  $([IO.Path]::GetFileName($msi))`n", [Text.Encoding]::ASCII)
 Write-Output $msi

@@ -10,15 +10,32 @@ protocol Sessao: AnyObject {
 }
 
 /// Bridge only on dedicated session threads. The main thread never waits for capture/network.
+private final class ResultadoAssincrono<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var result: Result<T, Error>?
+
+    func concluir(_ value: Result<T, Error>) {
+        lock.withLock { result = value }
+    }
+
+    func obter() throws -> T {
+        guard let value = lock.withLock({ result }) else {
+            preconditionFailure("A operação assíncrona terminou sem resultado")
+        }
+        return try value.get()
+    }
+}
+
 private func esperar<T>(_ operation: @escaping () async throws -> T) throws -> T {
     let semaphore = DispatchSemaphore(value: 0)
-    var result: Result<T, Error>!
+    let result = ResultadoAssincrono<T>()
     Task.detached {
-        do { result = .success(try await operation()) } catch { result = .failure(error) }
+        do { result.concluir(.success(try await operation())) }
+        catch { result.concluir(.failure(error)) }
         semaphore.signal()
     }
     semaphore.wait()
-    return try result.get()
+    return try result.obter()
 }
 
 final class SessaoEmissora: Sessao {

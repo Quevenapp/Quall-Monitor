@@ -39,7 +39,7 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiGetClassDevsW, SetupDiGetDeviceInstanceIdW, SetupDiGetDevicePropertyW, SetupDiGetDeviceRegistryPropertyW,
     SetupDiSetDevicePropertyW, SetupDiSetDeviceRegistryPropertyW, SetupUninstallOEMInfW, UpdateDriverForPlugAndPlayDevicesW,
     CM_DEVNODE_STATUS_FLAGS, CM_LOCATE_DEVNODE_NORMAL, CM_LOCATE_DEVNODE_PHANTOM, CM_PROB, CR_SUCCESS, DICD_GENERATE_ID,
-    DIF_REGISTERDEVICE, DIGCF_PRESENT, DN_HAS_PROBLEM, DN_STARTED, GUID_DEVCLASS_DISPLAY, GUID_DEVCLASS_MONITOR, HDEVINFO,
+    DIF_REGISTERDEVICE, DIGCF_PRESENT, DN_HAS_PROBLEM, DN_STARTED, GUID_DEVCLASS_DISPLAY, HDEVINFO,
     INSTALLFLAG_NONINTERACTIVE, SPDRP_HARDWAREID, SP_DEVINFO_DATA,
 };
 use windows::Win32::Devices::Properties::{
@@ -1182,31 +1182,7 @@ pub mod elevado {
         }
     }
 
-    fn fantasmas_do_sudovda() -> Vec<String> {
-        let Ok(h) = (unsafe { SetupDiGetClassDevsW(Some(&GUID_DEVCLASS_MONITOR), PCWSTR::null(), None, Default::default()) }) else {
-            return Vec::new();
-        };
-        let lista = Lista(h);
-        let mut v = Vec::new();
-        for i in 0.. {
-            let mut d = dados_vazios();
-            if unsafe { SetupDiEnumDeviceInfo(lista.0, i, &mut d) }.is_err() {
-                break;
-            }
-            let inst = instancia(lista.0, &d);
-            if !regras::monitor_do_sudovda(&inst) {
-                continue;
-            }
-            // Só os ausentes: um monitor do SudoVDA de pé é de alguém (a bancada, outro programa).
-            let l = largo(&inst);
-            let mut dn = 0u32;
-            let presente = unsafe { CM_Locate_DevNodeW(&mut dn, PCWSTR(l.as_ptr()), CM_LOCATE_DEVNODE_NORMAL) } == CR_SUCCESS;
-            if !presente {
-                v.push(inst);
-            }
-        }
-        v
-    }
+
 }
 
 // =============================================================================================

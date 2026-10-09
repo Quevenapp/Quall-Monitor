@@ -15,7 +15,7 @@
 //!
 //! # Quem entra na lista
 //!
-//! Na lista de **exibir**: só quem anuncia **alguma fonte** (`screen_source` ou `camera_source`)
+//! Na lista de **exibir**: só quem anuncia tela (`screen_source`)
 //! e **nenhum papel**. Um aparelho que só sabe exibir (`sink`) não tem o que nos mandar, e listá-lo
 //! seria oferecer um clique que só pode falhar — a mesma regra que fez o seletor de monitor não
 //! listar a câmera que o app não sabe abrir. Um prompter do teleprompter anuncia `papel` e nenhuma
@@ -267,6 +267,11 @@ mod testes {
         let f = Filtro::Video;
         assert!(f.aceita(&achado("emissor", true, None)));
         assert!(!f.aceita(&achado("so-exibe", false, None)));
+        let camera = DiscoveredDevice {
+            announcement: anuncio("camera", "Camera", Capabilities { screen_source: false, camera_source: true, sink: false }),
+            ..achado("camera", false, None)
+        };
+        assert!(!f.aceita(&camera), "Monitor não lista uma fonte que só transmite câmera");
         assert!(!f.aceita(&achado("prompter", false, Some(Papel::Teleprompter))));
         // Mesmo que um dia um prompter anuncie fonte, o papel o tira da lista de vídeo.
         assert!(!f.aceita(&achado("prompter-com-fonte", true, Some(Papel::Teleprompter))));

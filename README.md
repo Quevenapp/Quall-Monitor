@@ -6,7 +6,7 @@ O Quall Monitor oferece **Estender tela** e **Exibir**. Ele utiliza o núcleo e 
 
 ## Instalação e uso
 
-Os pacotes de distribuição são preparados pelos scripts deste repositório. Os downloads finais ficam no [site oficial Quéven](https://queven.com.br/). A preparação do site está descrita em [docs/downloads.md](docs/downloads.md); este snapshot não declara um download público já disponível.
+Os pacotes de distribuição são preparados pelos scripts deste repositório. Os downloads finais ficam na [página Quall Monitor do site oficial Quéven](https://queven.com.br/quall-monitor/). A preparação do site está descrita em [docs/downloads.md](docs/downloads.md); este snapshot não declara um download público já disponível. A página informa o requisito de **Quall Studio instalado no aparelho receptor**.
 
 - **Mac:** macOS 13 ou superior, Apple Silicon ou Intel conforme a arquitetura do pacote. Abra `Quall Monitor.app`. Para estender, autorize a captura de tela quando o sistema pedir. O monitor virtual é criado por um helper incluído no aplicativo e removido ao encerrar a sessão.
 - **Windows:** Windows 11 x64 (build 22000 ou superior). Execute o instalador MSI como administrador. O SudoVDA está embutido e é instalado junto. O desinstalador remove o driver quando ele pertence a esta instalação; um driver preexistente é preservado. Consulte [docs/sudovda.md](docs/sudovda.md) para a procedência e o estado de validação do pacote.

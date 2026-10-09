@@ -13,7 +13,7 @@ HASHES = {
     "SudoVDA.inf": "ad69ac682756f0cf339b081fac7e6e8159fdf2ca01ca69df8945c7246c286925",
 }
 errors = []
-for name in ("LICENSE", "LICENSE-SCOPE.md", "NOTICE.txt", "THIRD_PARTY_NOTICES.txt", "docs/SudoVDA-NOTICES.txt"):
+for name in ("LICENSE", "LICENSE-SCOPE.md", "NOTICE.txt", "THIRD_PARTY_NOTICES.txt", "docs/SudoVDA-NOTICES.txt", "docs/WiX-NOTICES.txt"):
     if not (ROOT / name).is_file():
         errors.append(f"Missing notice: {name}")
 for name, expected in HASHES.items():

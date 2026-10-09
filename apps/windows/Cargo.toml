@@ -27,39 +27,12 @@ path = "src/bin/quall_app.rs"
 required-features = ["net", "tela-estendida-futura"]
 
 [features]
-# Duas features, porque há dois pesos diferentes de "precisar de `quall-core`":
-#
-# - `EncodePreset` (`quall_core::protocol`), que `quall-capture-probe` usa: não depende de rede
-#   nenhuma, só de `serde`.
-# - `session::conectar`/`transport::Session` (o que `connect.rs` usa): esses módulos ficam atrás
-#   de `feature = "webrtc"` **dentro do próprio `quall-core`** (ver `crates/quall-core/Cargo.toml`
-#   — ligada por padrão lá), e é isso que arrasta `datachannel` (libdatachannel em C++ + OpenSSL
-#   compilado do fonte) — um build a frio disso leva minutos.
-#
-# Por isso `quall-core` entra aqui com `default-features = false`: `core` (default) dá acesso a
-# `protocol`/`discovery`/`pairing`/`signaling` sem tocar C++ nenhum; `net` acrescenta
-# `quall-core/webrtc` por cima, só para quem precisa mesmo de `connect.rs`. O caminho principal
-# desta entrega (decode H.264 em hardware + janela, a partir de um `.h264` de bancada) não
-# depende de nenhuma das duas — não usa `quall-core` de jeito nenhum:
-#
-#     cargo build --bin quall-receiver-probe --no-default-features
-#
-# — zero OpenSSL, compila em segundos (medido: ~45s a frio nesta bancada, contra minutos com
-# `webrtc`). `quall-receiver-probe connect` exige `--features net`.
-#
-# `net` também arrasta o `quall-opus` (libopus vendorizada, compilada por `cc`). Ele entra aqui e
-# não em `core` porque só o app de produto codifica áudio: as duas sondas de bancada não têm track
-# nenhuma. `docs/audio.md` §11 mede o custo em ~375 KiB de binário para encoder+decoder — barato ao
-# lado dos 10 MiB de OpenSSL+libdatachannel que o `net` já paga, mas não é motivo para cobrá-lo de
-# quem só decodifica um `.h264` de arquivo.
+# O app usa a rede e a tela estendida. `core` permite conferir regras puras sem C++/WebRTC.
 default = ["net", "tela-estendida-futura"]
 core = ["dep:quall-core"]
 net = ["core", "quall-core/webrtc", "dep:quall-opus"]
-# **A build de distribuição Microsoft Store**: não admite a feature futura de tela estendida.
-# O release sem a feature futura já exclui os módulos e payloads de driver; `loja` endurece
-# o contrato para a embalagem, inclusive quando alguém acrescentar features manualmente.
+# A guarda herdada proíbe combinar uma build de loja com o driver embutido.
 loja = []
-# Código preservado para desenvolvimento futuro; ausente de todos os artefatos deste release.
 tela-estendida-futura = ["windows/Win32_Security_Cryptography", "windows/Win32_Security_WinTrust", "windows/Win32_Storage_Packaging_Appx"]
 
 [dependencies]

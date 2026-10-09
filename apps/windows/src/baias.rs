@@ -31,7 +31,7 @@ use crate::registro;
 
 fn arquivo() -> Option<PathBuf> {
     let base = std::env::var_os("APPDATA")?;
-    Some(PathBuf::from(base).join("Quall").join("baias.json"))
+    Some(PathBuf::from(base).join("Quall Monitor").join("baias.json"))
 }
 
 fn ler() -> HashMap<String, String> {

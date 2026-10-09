@@ -4,9 +4,11 @@
 
 - Núcleo Rust: `cargo test -p quall-core --no-default-features --locked`, **341 testes passaram** (340 unitários e 1 de integração).
 - Núcleo nativo limpo: `MACOSX_DEPLOYMENT_TARGET=13.0 CARGO_PROFILE_RELEASE_LTO=false cargo build --release -p quall-ffi --locked`, compilação concluída, incluindo libdatachannel/OpenSSL/Opus.
-- Casca macOS e helper: build Release concluído e bundle/ZIP arm64 montados. Assinatura ad-hoc verificada; não é assinatura Developer ID nem notarização pública.
+- Casca macOS e helper: build Release concluído e bundle/ZIP arm64 montados. Assinatura Developer ID Application do titular, hardened runtime e timestamp verificados; a notarização pública ainda depende de um perfil de credenciais salvo no Chaves.
 - Duas aberturas pelo LaunchServices confirmaram identidade persistida do Monitor, helper próprio e produto de monitor virtual 2; o Studio já aberto permaneceu em execução. A prova usou o modo de verificação sem captura ou criação de monitor.
 - Mac: **47 testes passaram**, incluindo encode/decode de H.264 sintético com conferência em pixels, recuperação/troca de resolução, escalas e identidade distinta do monitor virtual.
+- A diferença de diagnóstico de concorrência do Swift no runner arm64 da CI foi corrigida com armazenamento do resultado assíncrono protegido por trava. Build Release e os 47 testes locais passaram após a correção.
+- Windows: verificação cruzada da biblioteca para MSVC x64 concluída; testes locais das regras e da interface passaram. O build completo do transporte e do MSI é validado no runner Windows.
 - Snapshot público: avisos de licença presentes e SHA-256 dos quatro payloads SudoVDA conferidos.
 - Página `/quall-monitor/`: verificada no navegador local e enviada por WebFTP para `public_html/quall-monitor/`, incluindo o requisito do Quall Studio instalado no receptor. A abertura HTTPS pública não respondeu nesta rede durante a preparação.
 

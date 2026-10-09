@@ -65,7 +65,7 @@ impl Window {
     pub fn create(title: &str, client_width: u32, client_height: u32) -> Result<Self> {
         unsafe {
             let hinstance = GetModuleHandleW(None)?;
-            let class_name = w!("QuallReceiverWindow");
+            let class_name = w!("QuallMonitorReceiverWindow");
 
             let wc = WNDCLASSW {
                 lpfnWndProc: Some(wndproc),

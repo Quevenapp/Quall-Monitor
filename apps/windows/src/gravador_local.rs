@@ -86,7 +86,7 @@ pub fn pasta_padrao() -> Result<PathBuf, String> {
     if base.is_empty() {
         return Err(idioma::t("a pasta Vídeos veio vazia").into());
     }
-    Ok(PathBuf::from(base).join("Quall"))
+    Ok(PathBuf::from(base).join("Quall Monitor"))
 }
 
 /// O espaço livre (para este usuário) no disco da pasta.

@@ -4,7 +4,7 @@ O Quall Monitor é distribuído exclusivamente pelo site oficial Quéven, sem Ap
 
 A frente do site deve oferecer os pacotes macOS e Windows com versão, arquitetura, requisitos e SHA-256, acompanhados de um link para a revisão de fonte correspondente. O pacote macOS contém o app e seu helper; o instalador Windows contém o app e o driver SudoVDA, com instalação e desinstalação integradas.
 
-Um build de validação não deve ser apresentado como release assinada. Para a entrega pública final no site, executar os scripts de empacotamento com as identidades de assinatura de distribuição e, no Mac, notarizar o pacote. A compilação local e a CI não importam chaves privadas para o repositório.
+Um build de validação não deve ser apresentado como release assinada. A prévia Windows 0.1.0 pode ser oferecida com o estado de assinatura informado: o MSI da CI não tem Authenticode do aplicativo. Para uma versão estável, assinar o instalador e validar instalação, remoção e tela estendida em aparelhos físicos. Para a entrega pública do Mac, usar Developer ID e notarizar o pacote. A compilação local e a CI não importam chaves privadas para o repositório.
 
 A publicação da página e a transferência dos pacotes para a hospedagem do site são uma etapa separada. Nenhuma URL de download é declarada ativa por este documento.
 
@@ -12,14 +12,23 @@ A publicação da página e a transferência dos pacotes para a hospedagem do si
 
 Destino escolhido: **https://queven.com.br/quall-monitor/**. Os arquivos estáticos estão em `site/quall-monitor/`. Sem pacotes associados, a página mostra “Em preparação” e não oferece links quebrados.
 
-Depois de reunir os pacotes da mesma revisão e versão:
+Depois de reunir os pacotes da mesma revisão e versão, substituir `SHA40_DOS_PACOTES` pelo SHA completo dos fontes usados no build. Obter esse valor do registro do build e do `SOURCE-REVISION.txt` de cada pacote; ele pode ser diferente do checkout atual:
 
 ```sh
 python3 tools/prepare-site.py --version 0.1.0 \
+  --source-revision SHA40_DOS_PACOTES \
   --mac dist/macos/Quall-Monitor-0.1.0-macos-arm64.zip \
   --windows dist/windows/Quall-Monitor-0.1.0-windows-x64.msi
 ```
 
-O comando prepara `dist/site/quall-monitor/` com os pacotes reais, hashes SHA-256 e o endereço dos fontes. Copiar esse diretório para a rota `/quall-monitor/` da hospedagem oficial. Não executar upload de binários de outra revisão com um manifesto apontando para o HEAD atual.
+O comando exige um SHA de 40 caracteres que exista localmente como commit Git; se necessário, buscar a revisão antes. Não escolhe o `HEAD` automaticamente. Os nomes devem seguir exatamente `Quall-Monitor-VERSAO-macos-arm64.zip`, `Quall-Monitor-VERSAO-macos-x64.zip`, `Quall-Monitor-VERSAO-macos-universal.zip` ou `Quall-Monitor-VERSAO-windows-x64.msi`, com a mesma versão `MAJOR.MINOR.PATCH` passada ao comando.
+
+Para o Mac, o preparador aceita os ZIPs produzidos pelo empacotamento e pela notarização. Confere a versão e a identidade no `Info.plist`, a revisão e o repositório no `SOURCE-REVISION.txt`, e as arquiteturas Mach-O do app **e do helper**. Recusa metadados que indiquem alterações não commitadas. Um ZIP universal precisa conter arm64 e x64 nos dois executáveis e recebe o rótulo “Mac Universal (Apple Silicon + Intel)”. O comando não verifica assinatura nem notarização; conferir ambas no Mac antes da publicação.
+
+Para o Windows, a conferência interna do MSI é externa ao preparador. Antes de passá-lo a `--windows`, extrair os arquivos com o decompilador do WiX, sem executar ações de instalação, e conferir o `SOURCE-REVISION.txt` incluído: mesmo repositório e SHA, com `Dirty: False`. Conferir também `ProductVersion`, o executável PE x64 e sua versão, e o estado exato da assinatura Authenticode. Na prévia, informar a ausência de assinatura; uma versão estável deve ter assinatura de distribuição válida. O preparador confere o nome e o cabeçalho do arquivo, mas não lê essas propriedades do MSI; seu campo `provenance: external` indica que a comprovação depende dessa conferência do responsável pela publicação. Renomear um MSI antigo não comprova versão nem revisão.
+
+Depois de validar todos os arquivos, o comando substitui `dist/site/quall-monitor/` por uma preparação nova, com os pacotes, hashes SHA-256, arquiteturas e o endereço da revisão comprovada dos fontes. Os pacotes de entrada devem ficar fora desse diretório gerado. Uma entrada recusada preserva a preparação anterior. Copiar o diretório resultante para a rota `/quall-monitor/` da hospedagem oficial.
+
+O canal padrão é `preview`: a página identifica a versão como prévia. Usar `--channel stable` somente após as validações de assinatura e uso em aparelhos físicos descritas acima.
 
 A página destaca o requisito solicitado: **Quall Studio instalado no aparelho receptor**. O Quall Monitor fica no computador principal.

@@ -33,7 +33,7 @@
 <script>
 fetch('./downloads.json').then(r => { if(!r.ok) throw Error(); return r.json(); }).then(data => {
   if (!Array.isArray(data.files) || !data.files.length) return;
-  document.querySelector('#version').textContent = `Versão ${data.version}`;
+  document.querySelector('#version').textContent = `${data.channel === 'preview' ? 'Prévia' : 'Versão'} ${data.version}`;
   if (data.source && /^https:\/\/github\.com\/Quevenapp\/Quall-Monitor\/(tree|commit)\/[a-f0-9]{40}$/.test(data.source)) document.querySelector('#source-link').href = data.source;
   for (const platform of ['mac', 'windows']) {
     const container = document.querySelector(`#${platform}-downloads`);
