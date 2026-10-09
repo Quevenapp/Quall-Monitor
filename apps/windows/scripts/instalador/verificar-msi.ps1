@@ -69,7 +69,7 @@ try {
     if ($propriedades.SUDOVDA_CONSENT) { throw 'O consentimento do driver não pode vir marcado por padrão.' }
 
     $extraidos = Join-Path $temporaria 'conteudo'
-    & wix msi decompile $Pacote -x $extraidos -o (Join-Path $temporaria 'pacote.wxs')
+    & wix msi decompile $Pacote -x $extraidos -o (Join-Path $temporaria 'pacote.wxs') | Out-Host
     if ($LASTEXITCODE -ne 0) { throw 'Falha ao extrair o cabinet do MSI para inspeção.' }
     $hashes = @{}
     foreach ($nome in $esperados) {

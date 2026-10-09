@@ -36,7 +36,7 @@ Instalação real de driver, atualização, rollback, reinício, remoção e sim
 
 ## Conferência sem instalar
 
-O build abre o MSI somente para leitura e decompila o cabinet com WiX, sem executar ações de instalação ou driver. Confere produto, versão, arquivos, SHA-256 do payload, revisão dos fontes, PE x64 GUI e o diálogo e as ações do driver. O resultado fica no `.msi.validation.json`, com o estado real das assinaturas Authenticode.
+O build abre o MSI somente para leitura e decompila o cabinet com WiX, sem executar ações de instalação ou driver. Confere produto, versão, arquivos, SHA-256 do payload, revisão dos fontes, PE x64 GUI e o diálogo e as ações do driver. O resultado fica no `.msi.validation.json`, com o estado real das assinaturas Authenticode. Os avisos da decompilação aparecem no console e ficam fora do JSON.
 
 Também é possível conferir um MSI externo:
 

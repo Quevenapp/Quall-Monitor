@@ -8,6 +8,12 @@ Um build de validação não deve ser apresentado como release assinada. A prév
 
 A publicação da página e a transferência dos pacotes para a hospedagem do site são uma etapa separada. Nenhuma URL de download é declarada ativa por este documento.
 
+## Estado em 09/10/2026
+
+O [Build 37938552250](https://github.com/Quevenapp/Quall-Monitor/actions/runs/37938552250) passou nos quatro jobs. Foram preparados três pacotes 0.1.0 da revisão `8f9f1f58f9a9391db6c40b478594f09d247d9995`: Mac Apple Silicon (arm64), Mac Intel (x64) e Windows x64 (MSI). Os dois pacotes Mac estão assinados, com notarização `Accepted`, tickets anexados e validados, e aceitação pelo Gatekeeper. O MSI e o executável Windows estão sem Authenticode; a distribuição Windows está preparada como prévia. Os testes de tela estendida em aparelhos físicos permanecem pendentes.
+
+O `index.html` e o `downloads.json` com lista de arquivos vazia foram enviados por WebFTP. A página informa o requisito de **Quall Studio instalado no receptor** e mantém os downloads “Em preparação”. O upload dos binários pelo WebFTP falhou, e o acesso HTTPS apresentou timeout nesta rede. Os downloads de produto ainda não estão ativos.
+
 ## Página própria
 
 Destino escolhido: **https://queven.com.br/quall-monitor/**. Os arquivos estáticos estão em `site/quall-monitor/`. Sem pacotes associados, a página mostra “Em preparação” e não oferece links quebrados.
