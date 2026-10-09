@@ -6,7 +6,7 @@ A frente do site deve oferecer os pacotes macOS e Windows com versão, arquitetu
 
 Um build de validação não deve ser apresentado como release assinada. A prévia Windows 0.1.0 pode ser oferecida com o estado de assinatura informado: o MSI da CI não tem Authenticode do aplicativo. Para uma versão estável, assinar o instalador e validar instalação, remoção e tela estendida em aparelhos físicos. Para a entrega pública do Mac, usar Developer ID e notarizar o pacote. A compilação local e a CI não importam chaves privadas para o repositório.
 
-A publicação da página e a transferência dos pacotes para a hospedagem do site são uma etapa separada. A disponibilidade das URLs de download por HTTP público ainda não foi confirmada.
+A publicação da página e a transferência dos pacotes para a hospedagem do site são uma etapa separada. A disponibilidade pública da prévia 0.1.0 foi confirmada pelo usuário em um Samsung Galaxy S24 pela rede móvel.
 
 ## Estado em 09/10/2026
 
@@ -14,7 +14,7 @@ O [Build 37938552250](https://github.com/Quevenapp/Quall-Monitor/actions/runs/37
 
 O `index.html`, com o requisito de **Quall Studio instalado no receptor** e o aviso de ausência de Authenticode no Windows, foi enviado por WebFTP. Após a falha do upload dos binários pelo WebFTP, os três pacotes foram publicados por SFTP em `/public_html/quall-monitor/downloads/`, e o manifesto final `downloads.json` foi enviado por SFTP com confirmação de envio concluído. Os links de download estão configurados no manifesto.
 
-Os três binários foram baixados de volta por SFTP para `dist/hosted-check/`; seus SHA-256 coincidiram com os valores de `dist/site/quall-monitor/downloads.json`. O `index.html` e o manifesto também foram baixados de volta e são iguais, byte a byte, à preparação. Essa conferência valida os arquivos armazenados na hospedagem. O acesso HTTP público aos downloads ainda não foi confirmado; a tentativa HTTPS após a publicação apresentou timeout nesta rede.
+Os três binários foram baixados de volta por SFTP para `dist/hosted-check/`; seus SHA-256 coincidiram com os valores de `dist/site/quall-monitor/downloads.json`. O `index.html` e o manifesto também foram baixados de volta e são iguais, byte a byte, à preparação. Essa conferência valida os arquivos armazenados na hospedagem. Em 09/10/2026, o usuário confirmou que a página HTTPS abriu e que os downloads foram baixados em um Samsung Galaxy S24 pela rede móvel. O timeout observado na rede de desenvolvimento permanece como limitação dessa verificação local.
 
 ## Página própria
 

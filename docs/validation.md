@@ -12,7 +12,11 @@
 - Snapshot público: avisos de licença presentes e SHA-256 dos quatro payloads SudoVDA conferidos.
 - Página `/quall-monitor/`: verificada no navegador local; `index.html` enviado por WebFTP para `public_html/quall-monitor/`, com o requisito do Quall Studio instalado no receptor e o aviso de ausência de Authenticode no Windows.
 - Publicação por SFTP: após a falha do upload dos binários pelo WebFTP, os três pacotes foram enviados para `/public_html/quall-monitor/downloads/`. O manifesto final `downloads.json` foi enviado por SFTP com confirmação de envio concluído; os links de download estão configurados.
-- Integridade na hospedagem: os três binários foram baixados de volta por SFTP para `dist/hosted-check/`, e seus SHA-256 coincidiram com `dist/site/quall-monitor/downloads.json`. A página e o manifesto baixados de volta são iguais, byte a byte, à preparação; os três botões foram conferidos no navegador usando essa preparação. O acesso HTTP público aos downloads ainda não foi confirmado; a tentativa HTTPS após a publicação apresentou timeout nesta rede.
+- Integridade na hospedagem: os três binários foram baixados de volta por SFTP para `dist/hosted-check/`, e seus SHA-256 coincidiram com `dist/site/quall-monitor/downloads.json`. A página e o manifesto baixados de volta são iguais, byte a byte, à preparação; os três botões foram conferidos no navegador usando essa preparação.
+
+## Acesso público
+
+Em 09/10/2026, o usuário confirmou que a página HTTPS abriu e que os downloads foram baixados em um Samsung Galaxy S24 pela rede móvel. A confirmação cobre a publicação da página e a transferência dos arquivos. O timeout observado na rede de desenvolvimento permanece como limitação da verificação local.
 
 ## Validação nativa e limites
 
