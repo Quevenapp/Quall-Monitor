@@ -1,3 +1,4 @@
+// Os identificadores e endereços de exemplos/fixtures são sintéticos; não identificam a bancada privada.
 //! Como as peças se encaixam: descoberta → sinalização → pareamento → transporte.
 //!
 //! Este módulo existe para que as quatro cascas (SwiftUI, Compose, app do desktop, plugin de
@@ -20,15 +21,18 @@ use std::time::{Duration, Instant};
 
 use crate::cancel::Cancelamento;
 use crate::error::{Error, Result};
-use crate::pairing::{KnownPeer, PairOutcome, PairedPeers, Pairing, Pin, Role};
+use crate::pairing::{PairOutcome, PairedPeers, Pairing, Pin, Role};
 use crate::protocol::{
     papel_do_anfitriao_serve, papel_do_convidado_serve, Announcement, DeviceId, Papel,
 };
 use crate::signaling::{
-    conferir_anuncio, connect_de, CausaDeRecusa, Link, RelatoDoEnlace, SignalMessage, SignalingServer,
+    conferir_anuncio, connect_de, CausaDeRecusa, Link, RelatoDoEnlace, SignalMessage,
+    SignalingServer,
 };
 use crate::track::{TrackConfig, TrackEmissor};
-use crate::transport::{Delivery, ParDaSessao, PeerState, Session, TransportConfig, TransportEvent};
+use crate::transport::{
+    Delivery, ParDaSessao, PeerState, Session, TransportConfig, TransportEvent,
+};
 
 /// **Depois de quanto silêncio uma sessão de teleprompter é dada por caída.**
 ///
@@ -41,10 +45,13 @@ use crate::transport::{Delivery, ParDaSessao, PeerState, Session, TransportConfi
 pub const SILENCIO_DO_TELEPROMPTER: Duration = Duration::from_secs(5);
 
 /// Quem é o outro lado, para o transporte (e dele para todo `Mensageiro`). O `device_id` veio no
-/// `Hello`/`Welcome` e passou pelo pareamento; é o que diz à réplica do teleprompter se o prompter
+/// `Hello`/`Welcome` cifrado e foi comparado à identidade confirmada pelo PAKE; é o que diz à réplica do teleprompter se o prompter
 /// desta sessão é o da última vez (`docs/contrato-teleprompter.md` §11.2).
 fn par_da_sessao(anuncio: &Announcement) -> ParDaSessao {
-    ParDaSessao { id: anuncio.device_id.0.clone(), nome: anuncio.display_name.clone() }
+    ParDaSessao {
+        id: anuncio.device_id.0.clone(),
+        nome: anuncio.display_name.clone(),
+    }
 }
 
 /// A entrega e o detector de silêncio que o papel pede. Um lugar só, para as duas pontas.
@@ -67,7 +74,8 @@ fn ajustar_ao_papel(cfg: &mut SessionConfig) {
 pub struct SessionConfig {
     /// Quem sou eu, para o outro lado.
     pub announcement: Announcement,
-    /// PIN ativo. Obrigatório no primeiro pareamento; ignorado quando o par já é conhecido.
+    /// PIN explícito escolhe um novo pareamento. Vazio tenta retomada de vínculo v3 conhecido;
+    /// primeiro pareamento e vínculos antigos exigem um novo PIN.
     pub pin: Option<Pin>,
     /// Aparelhos já pareados, lidos do armazenamento da plataforma.
     pub known: PairedPeers,
@@ -366,42 +374,15 @@ impl Ready {
         self.ultimo_relato.take()
     }
 
-    /// **Atende a porta enquanto a sessão dura**: quem bate ouve "ocupado" em vez de ficar
-    /// pendurado. **Nada que chega pela porta derruba esta sessão.**
-    ///
-    /// # O defeito que isto fecha
-    ///
-    /// Depois que [`hospedar`] volta, o servidor de sinalização continua com a porta aberta (a
-    /// casca o guarda para a porta não mudar) e **ninguém aceita** nela. Um segundo controle, ou o
-    /// mesmo controle que voltou de uma queda que o prompter ainda não percebeu, conecta o TCP, cai
-    /// na fila do `listen` e fica esperando o `Welcome` até o prazo dele estourar — 30 s sem
-    /// explicação.
-    ///
-    /// # O que o atendente responde
-    ///
-    /// - papel que não é `controle_remoto`: a recusa por papel;
-    /// - versão diferente: a mesma recusa legível do aperto de mão normal;
-    /// - qualquer controle — **inclusive um com o `device_id` do controle desta sessão**:
-    ///   `Ocupado`, "tente de novo".
-    ///
-    /// # Por que o mesmo `device_id` não derruba a sessão
-    ///
-    /// A primeira versão derrubava: o controle de volta de uma queda não esperaria os 5 s do
-    /// detector. A revisão de 13/09 (defeito 2) mostrou o preço: o `Hello` **não prova nada** — o id
-    /// está no TXT do mDNS, qualquer aparelho da LAN o lê e derrubaria a sessão a cada segundo sem
-    /// PIN, e dois aparelhos com o mesmo id (o restauro de um iPhone num iPad) se derrubariam um ao
-    /// outro sem fim. Provar exigiria rodar o pareamento aqui dentro. O preço de não derrubar é
-    /// menor: o controle de verdade, que voltou, ouve "ocupado" até o detector de silêncio do
-    /// prompter ([`SILENCIO_DO_TELEPROMPTER`], 5 s) dar a sessão velha por caída; aí o prompter
-    /// hospeda de novo e a tentativa seguinte dele entra.
-    ///
-    /// Nenhum caminho aqui cria `Session` ou toca a libdatachannel: é só sinalização.
-    ///
-    /// Chamar uma segunda vez troca o atendente (o anterior para antes). O atendente para quando o
-    /// `Ready` morre.
+    /// Atende novos candidatos sem alterar a sessão ativa. Depois do Probe efêmero,
+    /// devolve somente fechamento genérico 1013; não lê identidade ou anúncio pessoal.
     pub fn atender_enquanto_dura(&mut self, servidor: Arc<SignalingServer>, eu: Announcement) {
         self.atendente = None; // o anterior para e é esperado aqui
-        self.atendente = Some(Atendente::iniciar(servidor, eu, self.peer.device_id.clone()));
+        self.atendente = Some(Atendente::iniciar(
+            servidor,
+            eu,
+            self.peer.device_id.clone(),
+        ));
     }
 
     /// Quantos candidatos o atendente respondeu durante a sessão (ocupado, papel, versão).
@@ -450,7 +431,11 @@ impl Atendente {
                 })
                 .ok()
         };
-        Atendente { parar, atendidos, thread }
+        Atendente {
+            parar,
+            atendidos,
+            thread,
+        }
     }
 }
 
@@ -464,44 +449,26 @@ impl Drop for Atendente {
 }
 
 /// Responde **um** candidato que bateu durante a sessão, e fecha.
-fn atender_um(link: &mut Link, eu: &Announcement, par: &DeviceId) {
+fn atender_um(link: &mut Link, _eu: &Announcement, _par: &DeviceId) {
     let fim = Instant::now() + PRAZO_DO_HELLO_NO_ATENDENTE;
-    let anuncio = loop {
+    loop {
         match link.poll_por(Duration::from_millis(50)) {
-            Ok(Some(SignalMessage::Hello { announcement })) => break announcement,
+            Ok(Some(SignalMessage::Pair(_))) => {
+                // Sem autenticar uma segunda sessão ou ler qualquer identidade pessoal.
+                link.close_busy();
+                return;
+            }
             Ok(Some(_)) | Err(_) => {
-                link.close("fora de hora");
+                link.close("protocolo inválido");
                 return;
             }
             Ok(None) if Instant::now() >= fim => {
-                link.close("não disse quem é");
+                link.close("prazo encerrado");
                 return;
             }
             Ok(None) => {}
         }
-    };
-    // Na mesma ordem do aperto de mão normal: o papel antes da versão.
-    let (motivo, causa) = if let Err(motivo) = papel_do_convidado_serve(eu.papel, anuncio.papel) {
-        (motivo, CausaDeRecusa::PapelIncompativel)
-    } else if let Err(e) = conferir_anuncio(&anuncio) {
-        (e.to_string(), CausaDeRecusa::VersaoIncompativel)
-    } else if anuncio.device_id == *par {
-        // O mesmo id da sessão de pé: pode ser o controle de volta de uma queda, ou qualquer um
-        // que leu o id no TXT. O `Hello` não prova qual — e a sessão não cai por ele.
-        (
-            "este teleprompter ainda está com a sessão anterior deste aparelho; ela cai sozinha em \
-             alguns segundos se o aparelho sumiu — tente de novo em instantes"
-                .to_string(),
-            CausaDeRecusa::Ocupado,
-        )
-    } else {
-        (
-            "este teleprompter já tem um controle conectado".to_string(),
-            CausaDeRecusa::Ocupado,
-        )
-    };
-    let _ = link.send(&SignalMessage::Error { motivo, causa });
-    link.close("recusado durante a sessão");
+    }
 }
 
 /// Teto da espera de uma espiada na sinalização.
@@ -513,42 +480,6 @@ const FATIA_DE_ESCUTA: Duration = Duration::from_millis(10);
 /// Fatia de espera dos laços. Curta para que sinalização e transporte se revezem sem que
 /// nenhum dos dois fique parado esperando o outro.
 const FATIA: Duration = Duration::from_millis(10);
-
-/// Lado do emissor: aceita um receptor, pareia e oferece.
-/// Manda o motivo pelo fio **antes** de a conexão morrer, e só então propaga o erro.
-///
-/// ## Por que isto existe, e o que ele consertou
-///
-/// Em 2026-08-31 o `PROTOCOL_VERSION` subiu para 2, e a checagem de compatibilidade passou a
-/// recusar par de versão diferente — que era exatamente o objetivo. Fui aferir no aparelho, com um
-/// A07 na versão nova e um A10s na antiga, e o que o lado antigo mostrou foi:
-///
-/// ```text
-/// não consegui conectar em 192.168.1.138:7924: sinalização:
-///     WebSocket protocol error: Connection reset without closing handshake
-/// ```
-///
-/// **A recusa funcionava e a explicação não saía.** `conferir_anuncio(&a)?` propagava o erro na
-/// hora, o socket morria, e o outro lado via um erro de transporte — a mensagem que manda alguém
-/// caçar rede, firewall e cabo, quando a resposta é "atualize o aplicativo". Uma checagem de versão
-/// existe **para dar uma mensagem boa**; sem ela, é só uma sessão que não sobe.
-///
-/// O caminho de volta já existia e estava desenhado para isto: `SignalMessage::Error` carrega
-/// `motivo` em prosa, e `causa` tem `deserialize_with = "causa_do_fio"`, que degrada código
-/// desconhecido para `NaoInformada` em vez de falhar. Um par da versão 1 **entende** esta mensagem
-/// e mostra o texto, mesmo sem conhecer `VersaoIncompativel`.
-///
-/// Falha ao mandar é engolida de propósito: o erro que interessa é o original, não o de escrita num
-/// socket que talvez já esteja morto.
-fn dizer_por_que_antes_de_fechar(link: &mut Link, r: Result<()>) -> Result<()> {
-    if let Err(e) = &r {
-        let _ = link.send(&SignalMessage::Error {
-            motivo: e.to_string(),
-            causa: CausaDeRecusa::VersaoIncompativel,
-        });
-    }
-    r
-}
 
 /// **Um candidato que cai é acidente; um candidato que é recusado é decisão.** Só o primeiro faz
 /// [`hospedar`] voltar a esperar.
@@ -571,13 +502,148 @@ fn dizer_por_que_antes_de_fechar(link: &mut Link, r: Result<()>) -> Result<()> {
 ///   Repare no que **não** muda com o conserto: quem cai antes de tentar parear não gasta
 ///   tentativa nenhuma e também não aprende nada. Reesperar depois de um acidente não devolve
 ///   fôlego a um atacante — devolve a porta a quem ia usá-la.
-/// - `Protocol` — versão incompatível e mensagem fora de ordem. A recusa por versão existe
-///   **para dar uma mensagem boa** (ver [`dizer_por_que_antes_de_fechar`]); reesperar em silêncio
-///   apagaria do emissor exatamente o diagnóstico que ela produz.
+/// - `Protocol` — versão incompatível e mensagem fora de ordem. Reesperar em silêncio apagaria
+///   o diagnóstico de incompatibilidade. Antes de autenticar, o fechamento não inclui payload.
 /// - `Timeout` e `Cancelled` — são os dois limites do próprio laço. É o que garante que ele
 ///   termina.
 fn e_acidente_do_candidato(e: &Error) -> bool {
     matches!(e, Error::Io(_) | Error::Closed | Error::Signaling(_))
+}
+
+/// Os papéis são parâmetros funcionais públicos do protocolo PAKE, não identidades.
+fn codigo_do_papel(papel: Option<Papel>) -> Result<u8> {
+    match papel {
+        None => Ok(0),
+        Some(Papel::Teleprompter) => Ok(1),
+        Some(Papel::ControleRemoto) => Ok(2),
+        Some(Papel::Desconhecido) => Err(Error::Protocol("papel desconhecido".into())),
+    }
+}
+
+fn papel_do_codigo(codigo: u8) -> Result<Option<Papel>> {
+    match codigo {
+        0 => Ok(None),
+        1 => Ok(Some(Papel::Teleprompter)),
+        2 => Ok(Some(Papel::ControleRemoto)),
+        _ => Err(Error::Protocol("papel funcional inválido".into())),
+    }
+}
+
+fn conferir_identidade_autenticada(
+    anuncio: &Announcement,
+    resultado: &PairOutcome,
+    papel: u8,
+) -> Result<()> {
+    conferir_anuncio(anuncio)?;
+    if anuncio.device_id != resultado.peer || codigo_do_papel(anuncio.papel)? != papel {
+        return Err(Error::Protocol(
+            "anúncio diverge da identidade ou papel autenticado".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// A máquina PAKE contém somente material efêmero público antes de confirmar ambas as pontas.
+/// Toda identidade/SDP/ICE/relato subsequente passa pelo Link cifrado, sem modo legado.
+fn parear_link(
+    link: &mut Link,
+    cfg: &SessionConfig,
+    role: Role,
+    prazo: Instant,
+) -> Result<(PairOutcome, u8)> {
+    conferir_anuncio(&cfg.announcement)?;
+    let mut maquina = Pairing::new_with_store(
+        role,
+        cfg.announcement.device_id.clone(),
+        cfg.pin.clone(),
+        &cfg.known,
+    )?;
+    maquina.bind_local_role(codigo_do_papel(cfg.announcement.papel)?)?;
+    let auth_prazo = prazo.min(Instant::now() + Duration::from_secs(30));
+    let mut frames = 0u8;
+    if role == Role::Guest {
+        link.send(&SignalMessage::Pair(maquina.open()?))?;
+    }
+    loop {
+        let passo = (|| -> Result<Option<crate::pairing::Step>> {
+            restante(auth_prazo, &cfg.cancelamento)?;
+            match link.poll()? {
+                Some(SignalMessage::Pair(quadro)) => {
+                    frames = frames.saturating_add(1);
+                    if frames > 12 {
+                        return Err(Error::Protocol("excesso de quadros de autenticação".into()));
+                    }
+                    // Os hints públicos só podem recusar uma rota, nunca conceder identidade
+                    // ou privilégios. O papel será novamente comparado após autenticação AEAD.
+                    if let crate::pairing::PairFrame::Probe { guest_role, .. } = &quadro {
+                        if role == Role::Host
+                            && papel_do_convidado_serve(
+                                cfg.announcement.papel,
+                                papel_do_codigo(*guest_role)?,
+                            )
+                            .is_err()
+                        {
+                            link.close_role();
+                            return Err(Error::Signaling(
+                                "papel recusado antes do pareamento".into(),
+                            ));
+                        }
+                    }
+                    if let crate::pairing::PairFrame::Challenge { host_role, .. } = &quadro {
+                        if role == Role::Guest {
+                            papel_do_anfitriao_serve(
+                                cfg.announcement.papel,
+                                papel_do_codigo(*host_role)?,
+                            )
+                            .map_err(Error::Protocol)?;
+                        }
+                    }
+                    Ok(Some(maquina.step(quadro)?))
+                }
+                Some(_) => Err(Error::Protocol(
+                    "sinalização fora do PAKE antes da autenticação".into(),
+                )),
+                None => Ok(None),
+            }
+        })();
+        match passo {
+            Ok(Some(passo)) => {
+                if let Some(resposta) = passo.reply {
+                    if let Err(e) = link.send(&SignalMessage::Pair(resposta)) {
+                        return Err(erro_da_tentativa(&maquina, role, e));
+                    }
+                }
+                if let Some(resultado) = passo.done {
+                    let papel = maquina.peer_role()?;
+                    link.enable_secure(maquina.take_secure_channel()?)?;
+                    return Ok((resultado, papel));
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                link.close("pareamento recusado");
+                return Err(erro_da_tentativa(&maquina, role, e));
+            }
+        }
+    }
+}
+
+fn erro_da_tentativa(maquina: &Pairing, role: Role, e: Error) -> Error {
+    // Guest pode detectar PIN incorreto em KE2 e fechar sem KE3. A tentativa já foi consumida.
+    if role == Role::Host
+        && maquina.attempt_started()
+        && matches!(
+            e,
+            Error::Io(_) | Error::Closed | Error::Signaling(_) | Error::Timeout(_)
+        )
+    {
+        Error::Pairing("tentativa interrompida; gere outro PIN".into())
+    } else if role == Role::Host && !maquina.attempt_started() && matches!(e, Error::Timeout(_)) {
+        // Probe/Challenge públicos não consumiram um palpite. A espera global continua limitada.
+        Error::Signaling("candidato não completou a abertura de autenticação".into())
+    } else {
+        e
+    }
 }
 
 /// Aceita **um** candidato e o leva até o fim do pareamento. Nada de mídia nasce aqui — é o que
@@ -596,15 +662,11 @@ fn abrir_candidato(
         .accept_cancelavel(restante(prazo, &cfg.cancelamento)?, &cfg.cancelamento)?
         .ok_or_else(|| Error::Timeout("nenhum receptor conectou".into()))?;
 
-    // 1. Quem é você?
+    let (resultado, papel_autenticado) = parear_link(&mut link, cfg, Role::Host, prazo)?;
     let par = loop {
         match link.poll()? {
             Some(SignalMessage::Hello { announcement }) => {
-                // O papel, **antes da versão, antes do `Welcome` e antes do PIN**. Antes da
-                // versão porque a recusa por versão encerra a espera (é decisão), e num prompter
-                // um aparelho de versão antiga nunca é o controle: recusá-lo por papel mantém a
-                // espera e o PIN. Um anfitrião de vídeo não confere nada — a regra devolve `Ok` —,
-                // e para ele a ordem das duas conferências não muda coisa alguma.
+                conferir_identidade_autenticada(&announcement, &resultado, papel_autenticado)?;
                 if let Err(motivo) =
                     papel_do_convidado_serve(cfg.announcement.papel, announcement.papel)
                 {
@@ -615,82 +677,20 @@ fn abrir_candidato(
                     link.close("papel incompatível");
                     return Ok(None);
                 }
-                dizer_por_que_antes_de_fechar(&mut link, conferir_anuncio(&announcement))?;
                 link.send(&SignalMessage::Welcome {
                     announcement: cfg.announcement.clone(),
                 })?;
                 break announcement;
             }
-            Some(outra) => return Err(Error::Protocol(format!("esperava Hello, veio {outra:?}"))),
-            None => {
-                restante(prazo, &cfg.cancelamento)?;
-            }
-        };
-    };
-
-    // 2. Pareamento. O primeiro quadro é que diz se é PIN ou retomada, então a máquina de
-    //    estados só nasce quando ele chega.
-    let mut estado: Option<Pairing> = None;
-    let resultado = loop {
-        match link.poll()? {
-            Some(SignalMessage::Pair(quadro)) => {
-                if estado.is_none() {
-                    estado = Some(Pairing::with_store(
-                        Role::Host,
-                        cfg.announcement.device_id.clone(),
-                        cfg.pin.clone(),
-                        &cfg.known,
-                        &quadro,
-                    )?);
-                }
-                let maquina = estado
-                    .as_mut()
-                    .ok_or_else(|| Error::Pairing("máquina de pareamento perdida".into()))?;
-
-                match maquina.step(quadro) {
-                    Ok(passo) => {
-                        if let Some(resposta) = passo.reply {
-                            link.send(&SignalMessage::Pair(resposta))?;
-                        }
-                        if let Some(r) = passo.done {
-                            break r;
-                        }
-                    }
-                    Err(e) => {
-                        // Dizer o motivo antes de cair é a diferença entre "PIN incorreto" na
-                        // tela do usuário e uma conexão que morre sem explicação. E cair é
-                        // obrigatório: uma tentativa por conexão é o que segura o PIN de seis
-                        // dígitos.
-                        // **Dívida 29.** `motivo` é a prosa; `causa` é o código. Sem o
-                        // segundo, o tipo do erro morria aqui e a outra ponta reconstruía
-                        // tudo como recusa genérica.
-                        let _ = link.send(&SignalMessage::Error {
-                            motivo: e.to_string(),
-                            causa: CausaDeRecusa::de(&e),
-                        });
-                        link.close("pareamento recusado");
-                        return Err(e);
-                    }
-                }
-            }
-            // **Dívida 29.** Era `Error::Pairing` para tudo — inclusive para o
-            // "não conheço este aparelho", que as cascas rotulavam de "O PIN não
-            // conferiu". Agora quem decide é o código, não a prosa.
-            Some(SignalMessage::Error { motivo, causa }) => {
-                return Err(causa.erro(format!("o receptor recusou: {motivo}")))
-            }
-            Some(SignalMessage::Bye { motivo }) => {
-                return Err(Error::Signaling(format!("o receptor desistiu: {motivo}")))
-            }
             Some(outra) => {
                 return Err(Error::Protocol(format!(
-                    "esperava pareamento, veio {outra:?}"
+                    "esperava Hello cifrado, veio {outra:?}"
                 )))
             }
             None => {
                 restante(prazo, &cfg.cancelamento)?;
             }
-        };
+        }
     };
 
     Ok(Some((link, par, resultado)))
@@ -765,24 +765,14 @@ pub fn conectar(destino: std::net::SocketAddr, cfg: SessionConfig) -> Result<Rea
         cfg.transport.origem()?,
         &cfg.cancelamento,
     )?;
+    let (resultado, papel_autenticado) = parear_link(&mut link, &cfg, Role::Guest, prazo)?;
     link.send(&SignalMessage::Hello {
         announcement: cfg.announcement.clone(),
-    })
-    .map_err(|e| match e {
-        Error::Io(m) => Error::Io(format!("mandar o Hello: {m}")),
-        outro => outro,
     })?;
-
     let par = loop {
         match link.poll()? {
             Some(SignalMessage::Welcome { announcement }) => {
-                dizer_por_que_antes_de_fechar(&mut link, conferir_anuncio(&announcement))?;
-                // O papel, **antes de `Pairing::new`** e antes de mandar qualquer quadro de
-                // pareamento. Diante de um anfitrião que não serve, a saída é um `Bye`, e não um
-                // `Error`: para o anfitrião, `Bye` é candidato que desistiu (acidente, ele volta a
-                // esperar), enquanto `Error` é decisão e encerraria a espera dele — um emissor de
-                // vídeo antigo perderia a espera por causa de um controle que bateu na porta
-                // errada. Ver `e_acidente_do_candidato`.
+                conferir_identidade_autenticada(&announcement, &resultado, papel_autenticado)?;
                 if let Err(motivo) =
                     papel_do_anfitriao_serve(cfg.announcement.papel, announcement.papel)
                 {
@@ -791,75 +781,17 @@ pub fn conectar(destino: std::net::SocketAddr, cfg: SessionConfig) -> Result<Rea
                 }
                 break announcement;
             }
-            // As duas causas novas viram o erro delas; as de antes continuam como sempre foram
-            // aqui — `Signaling` com o motivo —, para nenhuma casca mudar de comportamento.
-            Some(SignalMessage::Error {
-                motivo,
-                causa: causa @ (CausaDeRecusa::PapelIncompativel | CausaDeRecusa::Ocupado),
-            }) => return Err(causa.erro(format!("o outro aparelho recusou: {motivo}"))),
-            Some(SignalMessage::Error { motivo, .. }) => {
-                return Err(Error::Signaling(format!("o emissor recusou: {motivo}")))
-            }
-            Some(outra) => {
-                return Err(Error::Protocol(format!("esperava Welcome, veio {outra:?}")))
-            }
-            None => {
-                restante(prazo, &cfg.cancelamento)?;
-            }
-        };
-    };
-
-    let conhecido = cfg.known.get(&par.device_id).map(|secret| KnownPeer {
-        id: par.device_id.clone(),
-        secret,
-    });
-    let mut maquina = Pairing::new(
-        Role::Guest,
-        cfg.announcement.device_id.clone(),
-        cfg.pin.clone(),
-        conhecido,
-    )?;
-    link.send(&SignalMessage::Pair(maquina.open()?))?;
-
-    let resultado = loop {
-        match link.poll()? {
-            Some(SignalMessage::Pair(quadro)) => match maquina.step(quadro) {
-                Ok(passo) => {
-                    if let Some(resposta) = passo.reply {
-                        link.send(&SignalMessage::Pair(resposta))?;
-                    }
-                    if let Some(r) = passo.done {
-                        break r;
-                    }
-                }
-                Err(e) => {
-                    // **Dívida 29.** Ver o gêmeo em `hospedar`.
-                    let _ = link.send(&SignalMessage::Error {
-                        motivo: e.to_string(),
-                        causa: CausaDeRecusa::de(&e),
-                    });
-                    link.close("pareamento recusado");
-                    return Err(e);
-                }
-            },
-            // **Dívida 29.** Era `Error::Pairing` para tudo — inclusive para o
-            // "não conheço este aparelho", que as cascas rotulavam de "O PIN não
-            // conferiu". Agora quem decide é o código, não a prosa.
-            Some(SignalMessage::Error { motivo, causa }) => {
-                return Err(causa.erro(format!("o emissor recusou: {motivo}")))
-            }
-            Some(SignalMessage::Bye { motivo }) => {
-                return Err(Error::Signaling(format!("o emissor desistiu: {motivo}")))
-            }
+            Some(SignalMessage::Error { motivo, causa }) => return Err(causa.erro(motivo)),
+            Some(SignalMessage::Bye { motivo }) => return Err(Error::Signaling(motivo)),
             Some(outra) => {
                 return Err(Error::Protocol(format!(
-                    "esperava pareamento, veio {outra:?}"
+                    "esperava Welcome cifrado, veio {outra:?}"
                 )))
             }
             None => {
                 restante(prazo, &cfg.cancelamento)?;
             }
-        };
+        }
     };
 
     let mut sessao = Session::answerer(&cfg.transport)?;
@@ -998,6 +930,7 @@ fn restante(prazo: Instant, cancelar: &Cancelamento) -> Result<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pairing::PairFrame;
     use crate::protocol::{Capabilities, DeviceId, PROTOCOL_VERSION};
     // Só os testes abrem uma sinalização "na mão": o produto entra por `conectar`.
     use crate::signaling::connect;
@@ -1070,7 +1003,10 @@ mod tests {
 
         assert_eq!(emissor.peer.device_id.0, "receptor-1");
         assert_eq!(receptor.peer.device_id.0, "emissor-1");
-        assert_eq!(emissor.peer.screen, crate::protocol::Screen::nova(1125, 2436));
+        assert_eq!(
+            emissor.peer.screen,
+            crate::protocol::Screen::nova(1125, 2436)
+        );
         assert_eq!(receptor.peer.screen, None, "quem hospeda não diz tela");
         assert_eq!(
             emissor.outcome.secret, receptor.outcome.secret,
@@ -1096,6 +1032,131 @@ mod tests {
 
         emissor.link.close("fim do teste");
         drop(receptor);
+    }
+
+    /// Oito receptores, uma identidade de Monitor e um Studio simultâneo. Só protocolo e
+    /// transporte em loopback: não cria monitor virtual, não captura nem decodifica imagem.
+    #[test]
+    fn oito_monitores_e_studio_mantem_sessoes_independentes_e_retomam_sem_pin() {
+        use crate::track::TrackKind;
+
+        fn abrir_par(
+            emissor_id: &str,
+            receptor_id: &str,
+            pin: Option<Pin>,
+            conhecidos_emissor: PairedPeers,
+            conhecidos_receptor: PairedPeers,
+        ) -> (SignalingServer, Ready, Ready) {
+            let servidor = SignalingServer::bind(0).expect("porta independente");
+            let porta = servidor.port().expect("porta");
+            let mut cfg_emissor = config(
+                anuncio(emissor_id, emissor_id),
+                &Pin::parse("313131").unwrap(),
+            );
+            cfg_emissor.known = conhecidos_emissor;
+            cfg_emissor.announcement.capabilities = Capabilities {
+                screen_source: true,
+                camera_source: false,
+                sink: false,
+            };
+            cfg_emissor.tracks = vec![TrackConfig::new(TrackKind::Screen, "Tela estendida")];
+            let emissor = thread::spawn(move || {
+                let pronto = hospedar(&servidor, cfg_emissor).expect("emissor conectado");
+                (servidor, pronto)
+            });
+            let mut cfg_receptor = config(
+                anuncio(receptor_id, receptor_id),
+                &Pin::parse("313131").unwrap(),
+            );
+            cfg_receptor.pin = pin;
+            cfg_receptor.known = conhecidos_receptor;
+            cfg_receptor.announcement.capabilities = Capabilities {
+                screen_source: false,
+                camera_source: false,
+                sink: true,
+            };
+            cfg_receptor.announcement.screen = crate::protocol::Screen::nova(1920, 1080);
+            let receptor = conectar(em(porta), cfg_receptor).expect("receptor conectado");
+            let (servidor, emissor) = emissor.join().expect("thread do emissor");
+            let track = receptor
+                .session
+                .proxima_track(Duration::from_secs(5))
+                .expect("track de tela");
+            assert_eq!(track.kind(), TrackKind::Screen);
+            assert_eq!(
+                emissor.peer.screen,
+                crate::protocol::Screen::nova(1920, 1080)
+            );
+            assert_eq!(emissor.outcome.secret, receptor.outcome.secret);
+            (servidor, emissor, receptor)
+        }
+
+        fn conferir_dados(emissor: &Ready, receptor: &Ready, valor: u8) {
+            emissor.session.send(&[valor]).expect("envio independente");
+            assert_eq!(
+                receptor.session.next_data(Duration::from_secs(5)),
+                Some(vec![valor])
+            );
+        }
+
+        let pin = || Some(Pin::parse("313131").expect("PIN de teste"));
+        let (servidor_studio, studio, receptor_studio) = abrir_par(
+            "studio",
+            "receptor-studio",
+            pin(),
+            PairedPeers::new(),
+            PairedPeers::new(),
+        );
+        let mut conhecidos_monitor = PairedPeers::new();
+        let mut conhecidos_receptores = Vec::new();
+        let mut sessoes = Vec::new();
+        for indice in 0..8 {
+            let (servidor, emissor, receptor) = abrir_par(
+                "monitor",
+                &format!("receptor-{indice}"),
+                pin(),
+                conhecidos_monitor.clone(),
+                PairedPeers::new(),
+            );
+            assert_ne!(servidor.port().unwrap(), servidor_studio.port().unwrap());
+            assert!(sessoes
+                .iter()
+                .all(
+                    |(_, s, _, _): &(usize, SignalingServer, Ready, Ready)| s.port().unwrap()
+                        != servidor.port().unwrap()
+                ));
+            assert!(emissor.outcome.novo && receptor.outcome.novo);
+            conhecidos_monitor.insert(&emissor.outcome);
+            let mut conhecidos = PairedPeers::new();
+            conhecidos.insert(&receptor.outcome);
+            conhecidos_receptores.push(conhecidos);
+            sessoes.push((indice, servidor, emissor, receptor));
+        }
+        for (indice, _, emissor, receptor) in &sessoes {
+            conferir_dados(emissor, receptor, *indice as u8);
+        }
+        conferir_dados(&studio, &receptor_studio, 99);
+
+        // Reabre cada conexão por segredo salvo, mantendo as outras sete e o Studio vivos.
+        for indice in 0..8 {
+            let (slot, servidor, emissor, receptor) = sessoes.remove(0);
+            assert_eq!(slot, indice);
+            drop((servidor, emissor, receptor));
+            let (servidor, emissor, receptor) = abrir_par(
+                "monitor",
+                &format!("receptor-{indice}"),
+                None,
+                conhecidos_monitor.clone(),
+                conhecidos_receptores[indice].clone(),
+            );
+            assert!(!emissor.outcome.novo && !receptor.outcome.novo);
+            conferir_dados(&emissor, &receptor, indice as u8 + 10);
+            sessoes.push((indice, servidor, emissor, receptor));
+        }
+        for (indice, _, emissor, receptor) in &sessoes {
+            conferir_dados(emissor, receptor, *indice as u8 + 20);
+        }
+        conferir_dados(&studio, &receptor_studio, 100);
     }
 
     /// **O caminho de volta do sinal**, ponta a ponta: o receptor relata o enlace e o emissor lê.
@@ -1180,7 +1241,11 @@ mod tests {
                 }
             }
         }
-        assert_eq!(visto, Some(novo), "o emissor não recebeu o relato mais recente");
+        assert_eq!(
+            visto,
+            Some(novo),
+            "o emissor não recebeu o relato mais recente"
+        );
 
         // E não repete: sem relato novo, a leitura seguinte é vazia.
         assert_eq!(emissor.relato_do_enlace(Duration::from_millis(20)), None);
@@ -1749,10 +1814,13 @@ mod tests {
             },
         );
 
-        assert!(r.is_err(), "PIN errado não podia fechar a sessão");
         assert!(
-            emissor.join().expect("thread do emissor").is_err(),
-            "o emissor tinha de recusar"
+            matches!(&r, Err(Error::WrongPin(_))),
+            "PIN errado no receptor tem de ser recusa de pareamento, não HTTP: {:?}", r.err()
+        );
+        assert!(
+            matches!(emissor.join().expect("thread do emissor"), Err(Error::Pairing(_))),
+            "o emissor precisa consumir a tentativa interrompida e exigir outro PIN"
         );
     }
 
@@ -1822,12 +1890,12 @@ mod tests {
         drop(receptor);
     }
 
-    /// O mesmo defeito um passo adiante: o candidato **fala WebSocket**, se apresenta, e some
+    /// O mesmo defeito um passo adiante: o candidato **fala WebSocket**, inicia o Probe, e some
     /// antes de parear. É o "depois que sai não conecta" na forma em que ele aparece no produto —
     /// o receptor que fecha o app enquanto o emissor espera.
     ///
-    /// Repare no que este teste **não** afrouxa: o candidato some antes de mandar um único quadro
-    /// de pareamento, então não gastou tentativa de PIN nenhuma. Quem erra o PIN continua
+    /// O candidato some antes de mandar KE1, então não gastou tentativa de PIN nenhuma.
+    /// Quem erra o PIN continua
     /// derrubando a hospedagem — é o que `pin_errado_derruba_a_sessao_dos_dois_lados` cobra.
     #[test]
     fn candidato_que_cai_antes_de_parear_nao_derruba_a_espera() {
@@ -1854,21 +1922,28 @@ mod tests {
 
         let destino: std::net::SocketAddr = format!("127.0.0.1:{porta}").parse().expect("endereço");
 
-        // O candidato que desiste: Hello, Welcome, e sai sem parear.
+        // O candidato desiste depois do Challenge público, antes de qualquer tentativa PAKE.
         {
             let mut link = connect(destino, Duration::from_secs(10)).expect("candidato conecta");
-            link.send(&SignalMessage::Hello {
-                announcement: anuncio("candidato-sumico", "Candidato"),
-            })
-            .expect("Hello");
+            link.send(&SignalMessage::Pair(PairFrame::Probe {
+                version: PROTOCOL_VERSION,
+                guest_nonce: "31".repeat(16),
+                guest_role: 0,
+            }))
+            .expect("Probe");
             let ate = Instant::now() + Duration::from_secs(5);
+            let mut recebeu_challenge = false;
             while Instant::now() < ate {
                 match link.poll() {
-                    Ok(Some(SignalMessage::Welcome { .. })) => break,
+                    Ok(Some(SignalMessage::Pair(PairFrame::Challenge { .. }))) => {
+                        recebeu_challenge = true;
+                        break;
+                    }
                     Ok(_) => {}
-                    Err(e) => panic!("o candidato tinha de receber Welcome: {e}"),
+                    Err(e) => panic!("o candidato tinha de receber Challenge: {e}"),
                 }
             }
+            assert!(recebeu_challenge, "Challenge não chegou dentro do prazo");
             // Sem `close`: some sem se despedir, que é o caso real.
         }
 
@@ -2083,14 +2158,12 @@ mod tests {
         format!("127.0.0.1:{porta}").parse().expect("endereço")
     }
 
-    /// **O que acontece HOJE** quando um receptor de vídeo de build anterior conecta num
-    /// anfitrião **sem track** e sem papel — medido, não suposto (é o pedido do despacho).
+    /// Um receptor de vídeo v3 pode negociar com anfitrião sem track e sem papel.
     ///
-    /// O `Hello` sem papel é byte a byte o de uma build anterior
-    /// (`protocol::anuncio_sem_papel_e_o_de_antes_byte_a_byte`), e um anfitrião sem papel não
-    /// confere papel nenhum: o que se mede aqui é o comportamento da build de hoje.
+    /// O anúncio cifrado omite o papel (`protocol::anuncio_sem_papel_omite_a_chave_e_declara_v3`).
+    /// O teste mede o caminho de vídeo vazio da versão atual; versões antigas são recusadas.
     ///
-    /// 1. A sessão **sobe** dos dois lados: `Hello`, PIN, ICE, canal aberto.
+    /// 1. A sessão sobe dos dois lados: PAKE, anúncio cifrado, ICE, canal aberto.
     /// 2. Nenhuma track chega em 3 s.
     /// 3. A sessão continua "saudável": `proximo_evento` diz `Nenhum`.
     /// 4. O que o anfitrião manda pelo canal se acumula no receptor, que não lê: 64 ficam, o resto
@@ -2099,20 +2172,32 @@ mod tests {
     /// O que cada casca receptora faz nesse estado (prazos de 15 a 20 s, e o OBS tentando de novo
     /// a cada 3 s) está em `docs/contrato-teleprompter.md` §7, lido do código das cascas.
     #[test]
-    fn hoje_um_receptor_de_video_antigo_num_anfitriao_sem_track_sobe_e_fica_sem_imagem() {
+    fn receptor_de_video_v3_num_anfitriao_sem_track_sobe_e_fica_sem_imagem() {
         let pin = Pin::parse("616161").expect("pin");
         let servidor = SignalingServer::bind(0).expect("bind");
         let porta = servidor.port().expect("porta");
         let p = pin.clone();
         let anfitriao = thread::spawn(move || {
-            hospedar(&servidor, config(com_papel("anfitriao-sem-track", None), &p))
+            hospedar(
+                &servidor,
+                config(com_papel("anfitriao-sem-track", None), &p),
+            )
         });
         let mut receptor = conectar(em(porta), config(com_papel("receptor-antigo", None), &pin))
             .expect("hoje, a sessão sobe");
         let anfitriao = anfitriao.join().expect("thread").expect("anfitrião");
 
-        assert!(receptor.session.proxima_track(Duration::from_secs(3)).is_none(), "chegou track?");
-        assert_eq!(receptor.proximo_evento(Duration::ZERO), EventoDeSessao::Nenhum);
+        assert!(
+            receptor
+                .session
+                .proxima_track(Duration::from_secs(3))
+                .is_none(),
+            "chegou track?"
+        );
+        assert_eq!(
+            receptor.proximo_evento(Duration::ZERO),
+            EventoDeSessao::Nenhum
+        );
 
         let m = anfitriao.session.mensageiro();
         let mut mandou = 0;
@@ -2129,8 +2214,16 @@ mod tests {
         while receptor.session.dropped_frames() < 36 && Instant::now() < fim {
             thread::sleep(Duration::from_millis(20));
         }
-        assert_eq!(receptor.session.dropped_frames(), 36, "64 ficam na fila, o resto é contado");
-        assert_eq!(receptor.proximo_evento(Duration::ZERO), EventoDeSessao::Nenhum, "nada cai");
+        assert_eq!(
+            receptor.session.dropped_frames(),
+            36,
+            "64 ficam na fila, o resto é contado"
+        );
+        assert_eq!(
+            receptor.proximo_evento(Duration::ZERO),
+            EventoDeSessao::Nenhum,
+            "nada cai"
+        );
         drop(receptor);
         drop(anfitriao);
     }
@@ -2145,7 +2238,10 @@ mod tests {
         let porta = servidor.port().expect("porta");
         let p = pin.clone();
         let prompter = thread::spawn(move || {
-            hospedar(&servidor, config(com_papel("prompter", Some(Papel::Teleprompter)), &p))
+            hospedar(
+                &servidor,
+                config(com_papel("prompter", Some(Papel::Teleprompter)), &p),
+            )
         });
 
         // Um receptor de vídeo (sem papel), com o PIN certo.
@@ -2154,16 +2250,31 @@ mod tests {
             .expect("o receptor de vídeo tinha de ser recusado");
         let texto = erro.to_string();
         assert!(matches!(erro, Error::Protocol(_)), "{erro:?}");
-        assert!(texto.contains("teleprompter"), "o motivo tem de dizer por quê: {texto}");
+        assert!(
+            texto.contains("teleprompter"),
+            "o motivo tem de dizer por quê: {texto}"
+        );
 
         // O controle, com o **mesmo** PIN, depois.
-        let controle = conectar(em(porta), config(com_papel("controle", Some(Papel::ControleRemoto)), &pin))
-            .expect("o controle entra");
-        let prompter = prompter.join().expect("thread").expect("a espera do prompter continuou");
-        assert_eq!(prompter.descartados, 1, "o receptor recusado conta como candidato que caiu");
+        let controle = conectar(
+            em(porta),
+            config(com_papel("controle", Some(Papel::ControleRemoto)), &pin),
+        )
+        .expect("o controle entra");
+        let prompter = prompter
+            .join()
+            .expect("thread")
+            .expect("a espera do prompter continuou");
+        assert_eq!(
+            prompter.descartados, 1,
+            "o receptor recusado conta como candidato que caiu"
+        );
         assert_eq!(prompter.peer.papel, Some(Papel::ControleRemoto));
         assert_eq!(controle.peer.papel, Some(Papel::Teleprompter));
-        assert_eq!(prompter.session.entrega_do_canal(), Some(Delivery::ReliableUnordered));
+        assert_eq!(
+            prompter.session.entrega_do_canal(),
+            Some(Delivery::ReliableUnordered)
+        );
         assert!(
             (0..200).any(|_| {
                 thread::sleep(Duration::from_millis(10));
@@ -2188,15 +2299,28 @@ mod tests {
         let porta = servidor.port().expect("porta");
         let p = pin.clone();
         let prompter = thread::spawn(move || {
-            hospedar(&servidor, config(com_papel("prompter-par", Some(Papel::Teleprompter)), &p))
+            hospedar(
+                &servidor,
+                config(com_papel("prompter-par", Some(Papel::Teleprompter)), &p),
+            )
         });
-        let controle = conectar(em(porta), config(com_papel("controle-par", Some(Papel::ControleRemoto)), &pin))
-            .expect("o controle entra");
+        let controle = conectar(
+            em(porta),
+            config(com_papel("controle-par", Some(Papel::ControleRemoto)), &pin),
+        )
+        .expect("o controle entra");
         let prompter = prompter.join().expect("thread").expect("prompter");
         let (mp, mc) = (prompter.session.mensageiro(), controle.session.mensageiro());
-        assert_eq!(mc.par().map(|p| (p.id.as_str(), p.nome.as_str())), Some(("prompter-par", "prompter-par")));
+        assert_eq!(
+            mc.par().map(|p| (p.id.as_str(), p.nome.as_str())),
+            Some(("prompter-par", "prompter-par"))
+        );
         assert_eq!(mp.par().map(|p| p.id.as_str()), Some("controle-par"));
-        assert!(Session::offerer(&TransportConfig::default()).expect("sessão").mensageiro().par().is_none());
+        assert!(Session::offerer(&TransportConfig::default())
+            .expect("sessão")
+            .mensageiro()
+            .par()
+            .is_none());
         drop(controle);
         drop(prompter);
     }
@@ -2209,17 +2333,24 @@ mod tests {
         let servidor = SignalingServer::bind(0).expect("bind");
         let porta = servidor.port().expect("porta");
         let p = pin.clone();
-        let emissor = thread::spawn(move || hospedar(&servidor, config(com_papel("emissor", None), &p)));
+        let emissor =
+            thread::spawn(move || hospedar(&servidor, config(com_papel("emissor", None), &p)));
 
-        let erro = conectar(em(porta), config(com_papel("controle", Some(Papel::ControleRemoto)), &pin))
-            .err()
-            .expect("o controle tinha de recusar um emissor de vídeo");
+        let erro = conectar(
+            em(porta),
+            config(com_papel("controle", Some(Papel::ControleRemoto)), &pin),
+        )
+        .err()
+        .expect("o controle tinha de recusar um emissor de vídeo");
         assert!(matches!(erro, Error::Protocol(_)), "{erro:?}");
         assert!(erro.to_string().contains("não é um teleprompter"), "{erro}");
 
         let receptor = conectar(em(porta), config(com_papel("receptor", None), &pin))
             .expect("o receptor de vídeo entra depois");
-        let emissor = emissor.join().expect("thread").expect("a espera do emissor continuou");
+        let emissor = emissor
+            .join()
+            .expect("thread")
+            .expect("a espera do emissor continuou");
         assert_eq!(emissor.descartados, 1);
         assert_eq!(
             emissor.session.entrega_do_canal(),
@@ -2230,11 +2361,8 @@ mod tests {
         drop(emissor);
     }
 
-    /// **O atendente**: com a sessão de pé, um segundo controle ouve "ocupado" na hora (em vez de
-    /// ficar pendurado até o prazo) — e **um `Hello` com o `device_id` do controle da sessão não
-    /// derruba nada** (defeito 2 da revisão): o `Hello` não prova nada, qualquer aparelho da LAN lê
-    /// o `id` do TXT, e dois aparelhos com o mesmo id (o restauro do iPhone num iPad) se
-    /// derrubariam um ao outro sem fim. Quem decide que o controle morreu é o detector de 5 s.
+    /// O atendente devolve ocupado antes do PAKE sem revelar a identidade da sessão ativa.
+    /// Um candidato que tem o mesmo ID local não pode substituir o controle autenticado.
     #[test]
     fn o_atendente_responde_ocupado_e_um_hello_nao_derruba_a_sessao() {
         let pin = Pin::parse("646464").expect("pin");
@@ -2244,29 +2372,47 @@ mod tests {
         let eu = com_papel("prompter", Some(Papel::Teleprompter));
         let eu_t = eu.clone();
         let prompter = thread::spawn(move || hospedar(&s, config(eu_t, &p)));
-        let controle = conectar(em(porta), config(com_papel("controle-a", Some(Papel::ControleRemoto)), &pin))
-            .expect("o controle entra");
+        let controle = conectar(
+            em(porta),
+            config(com_papel("controle-a", Some(Papel::ControleRemoto)), &pin),
+        )
+        .expect("o controle entra");
         let mut prompter = prompter.join().expect("thread").expect("prompter");
         prompter.atender_enquanto_dura(std::sync::Arc::clone(&servidor), eu);
 
         // Um segundo controle: "ocupado", na hora.
         let comeco = Instant::now();
-        let erro = conectar(em(porta), config(com_papel("controle-b", Some(Papel::ControleRemoto)), &pin))
-            .err()
-            .expect("o segundo controle tinha de ouvir ocupado");
+        let erro = conectar(
+            em(porta),
+            config(com_papel("controle-b", Some(Papel::ControleRemoto)), &pin),
+        )
+        .err()
+        .expect("o segundo controle tinha de ouvir ocupado");
         assert!(matches!(erro, Error::Ocupado(_)), "{erro:?}");
-        assert!(comeco.elapsed() < Duration::from_secs(5), "levou {:?}", comeco.elapsed());
-        assert_eq!(prompter.proximo_evento(Duration::ZERO), EventoDeSessao::Nenhum, "a sessão de A segue");
+        assert!(
+            comeco.elapsed() < Duration::from_secs(5),
+            "levou {:?}",
+            comeco.elapsed()
+        );
+        assert_eq!(
+            prompter.proximo_evento(Duration::ZERO),
+            EventoDeSessao::Nenhum,
+            "a sessão de A segue"
+        );
 
-        // Um receptor de vídeo durante a sessão: recusa por papel.
-        let erro = conectar(em(porta), config(com_papel("receptor", None), &pin)).err().expect("recusado");
-        assert!(matches!(erro, Error::Protocol(_)), "{erro:?}");
-
-        // Um `Hello` com o **mesmo** `device_id` do controle da sessão — o controle de volta, ou
-        // qualquer um que tenha lido o id no TXT: ouve "ocupado", e a sessão **não** cai.
-        let erro = conectar(em(porta), config(com_papel("controle-a", Some(Papel::ControleRemoto)), &pin))
+        // A sessão ocupada não autentica nem revela papéis ou identidades a outro candidato.
+        let erro = conectar(em(porta), config(com_papel("receptor", None), &pin))
             .err()
-            .expect("o mesmo id ouve ocupado");
+            .expect("recusado");
+        assert!(matches!(erro, Error::Ocupado(_)), "{erro:?}");
+
+        // O mesmo ID persistente local também ouve ocupado antes de poder transmiti-lo.
+        let erro = conectar(
+            em(porta),
+            config(com_papel("controle-a", Some(Papel::ControleRemoto)), &pin),
+        )
+        .err()
+        .expect("o mesmo id ouve ocupado");
         assert!(matches!(erro, Error::Ocupado(_)), "{erro:?}");
         assert_eq!(
             prompter.proximo_evento(Duration::ZERO),
@@ -2288,10 +2434,16 @@ mod tests {
         let porta = servidor.port().expect("porta");
         let p = pin.clone();
         let prompter = thread::spawn(move || {
-            hospedar(&servidor, config(com_papel("prompter-s", Some(Papel::Teleprompter)), &p))
+            hospedar(
+                &servidor,
+                config(com_papel("prompter-s", Some(Papel::Teleprompter)), &p),
+            )
         });
-        let controle = conectar(em(porta), config(com_papel("controle-s", Some(Papel::ControleRemoto)), &pin))
-            .expect("controle");
+        let controle = conectar(
+            em(porta),
+            config(com_papel("controle-s", Some(Papel::ControleRemoto)), &pin),
+        )
+        .expect("controle");
         let mut prompter = prompter.join().expect("thread").expect("prompter");
         let m = controle.session.mensageiro();
         assert!((0..100).any(|_| {
@@ -2305,8 +2457,14 @@ mod tests {
         }
         let levou = comeco.elapsed();
         assert_eq!(evento, EventoDeSessao::Desconectou, "não caiu em {levou:?}");
-        assert!(levou >= Duration::from_secs(4), "caiu cedo demais: {levou:?}");
-        assert!(levou < Duration::from_secs(8), "caiu tarde demais: {levou:?}");
+        assert!(
+            levou >= Duration::from_secs(4),
+            "caiu cedo demais: {levou:?}"
+        );
+        assert!(
+            levou < Duration::from_secs(8),
+            "caiu tarde demais: {levou:?}"
+        );
         drop(controle);
         drop(prompter);
     }

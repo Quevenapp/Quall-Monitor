@@ -4,6 +4,8 @@ use super::*;
 
 /// Os arquivos com texto de interface: a varredura lê o código deles.
 const ARQUIVOS: &[(&str, &str)] = &[
+    ("bin/quall_app.rs", include_str!("../bin/quall_app.rs")),
+    ("opcoes_do_monitor.rs", include_str!("../opcoes_do_monitor.rs")),
     ("janela.rs", include_str!("../janela.rs")),
     ("modelo_da_janela.rs", include_str!("../modelo_da_janela.rs")),
     ("estilo.rs", include_str!("../estilo.rs")),
@@ -169,7 +171,10 @@ fn literais(linha: &str) -> Vec<(usize, String)> {
             i += 1;
             while i < b.len() && b[i] != b'"' {
                 if b[i] == b'\\' && i + 1 < b.len() {
-                    s.push(b[i + 1] as char);
+                    s.push(match b[i + 1] {
+                        b'n' => '\n', b'r' => '\r', b't' => '\t', b'0' => '\0',
+                        outro => outro as char,
+                    });
                     i += 2;
                     continue;
                 }

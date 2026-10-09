@@ -33,7 +33,8 @@ use serde::{Deserialize, Serialize};
 /// a alternativa, e é mudança de comportamento com lado de segurança (falhar alto contra ignorar
 /// calado) que ninguém decidiu. O teste que fixa o comportamento de hoje diz, em voz alta, que se
 /// um dia ele passar a devolver `Ok` é o teste que está errado, não o código.
-pub const PROTOCOL_VERSION: u16 = 2;
+/// Revisão com PAKE autenticado e sinalização integralmente cifrada. Não aceita v1/v2.
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Tipo de serviço anunciado por mDNS/Bonjour na LAN.
 pub const SERVICE_TYPE: &str = "_quall._tcp";
@@ -86,7 +87,10 @@ impl Screen {
 
     pub fn nova(width_px: u32, height_px: u32) -> Option<Screen> {
         let valido = |l: u32| (1..=Screen::LADO_MAXIMO).contains(&l);
-        (valido(width_px) && valido(height_px)).then_some(Screen { width_px, height_px })
+        (valido(width_px) && valido(height_px)).then_some(Screen {
+            width_px,
+            height_px,
+        })
     }
 }
 
@@ -200,7 +204,10 @@ impl Announcement {
 /// | `controle_remoto` ou desconhecido | qualquer um | recusa: quem hospeda não controla |
 ///
 /// Ver `docs/contrato-teleprompter.md` §2.
-pub fn papel_do_convidado_serve(anfitriao: Option<Papel>, convidado: Option<Papel>) -> Result<(), String> {
+pub fn papel_do_convidado_serve(
+    anfitriao: Option<Papel>,
+    convidado: Option<Papel>,
+) -> Result<(), String> {
     match (anfitriao, convidado) {
         (None, _) => Ok(()),
         (Some(Papel::Teleprompter), Some(Papel::ControleRemoto)) => Ok(()),
@@ -230,12 +237,19 @@ pub fn papel_do_convidado_serve(anfitriao: Option<Papel>, convidado: Option<Pape
 /// | `controle_remoto` | `teleprompter` | segue |
 /// | `controle_remoto` | qualquer outro, inclusive sem papel | recusa: não é um teleprompter |
 /// | `teleprompter` ou desconhecido | qualquer um | recusa: quem conecta não mostra |
-pub fn papel_do_anfitriao_serve(convidado: Option<Papel>, anfitriao: Option<Papel>) -> Result<(), String> {
+pub fn papel_do_anfitriao_serve(
+    convidado: Option<Papel>,
+    anfitriao: Option<Papel>,
+) -> Result<(), String> {
     match (convidado, anfitriao) {
         (None, None) => Ok(()),
         (None, Some(p)) => Err(format!(
             "o outro aparelho é um {} do Quall, não um emissor de vídeo",
-            if p == Papel::Teleprompter { "teleprompter" } else { "aparelho de outro papel" }
+            if p == Papel::Teleprompter {
+                "teleprompter"
+            } else {
+                "aparelho de outro papel"
+            }
         )),
         (Some(Papel::ControleRemoto), Some(Papel::Teleprompter)) => Ok(()),
         (Some(Papel::ControleRemoto), _) => {
@@ -290,7 +304,10 @@ mod tests {
         let mut original = announcement(PROTOCOL_VERSION);
         original.screen = Screen::nova(1125, 2436);
         let texto = serde_json::to_string(&original).expect("serializa");
-        assert!(texto.contains("\"screen\":{\"width_px\":1125,\"height_px\":2436}"), "{texto}");
+        assert!(
+            texto.contains("\"screen\":{\"width_px\":1125,\"height_px\":2436}"),
+            "{texto}"
+        );
         let voltou: Announcement = serde_json::from_str(&texto).expect("desserializa");
         assert_eq!(original, voltou);
     }
@@ -311,6 +328,10 @@ mod tests {
             "capabilities":{"screen_source":false,"camera_source":false,"sink":true}}"#;
         let a: Announcement = serde_json::from_str(antigo).expect("desserializa");
         assert_eq!(a.screen, None);
+        assert!(
+            !a.is_compatible(),
+            "desserializar não autoriza a versão antiga"
+        );
     }
 
     /// O outro sentido: uma build **anterior** lendo um anúncio **com** a tela. A struct de lá não
@@ -329,19 +350,18 @@ mod tests {
         let mut novo = announcement(PROTOCOL_VERSION);
         novo.screen = Screen::nova(1920, 1200);
         let texto = serde_json::to_string(&novo).expect("serializa");
-        let lido: AnuncioDaBuildAnterior = serde_json::from_str(&texto).expect("a build anterior aceita");
+        let lido: AnuncioDaBuildAnterior =
+            serde_json::from_str(&texto).expect("a build anterior aceita");
         assert_eq!(lido.display_name, "Galaxy A10s");
     }
 
-    /// **Sem papel, o JSON é o de antes, byte a byte** — o `Hello` de um receptor de vídeo desta
-    /// build é idêntico ao de uma build anterior. É o que torna o teste de "receptor antigo num
-    /// prompter", em `session.rs`, uma medida do receptor antigo de verdade.
+    /// O receptor de vídeo omite o papel; sua identidade só circula no canal cifrado v3.
     #[test]
-    fn anuncio_sem_papel_e_o_de_antes_byte_a_byte() {
+    fn anuncio_sem_papel_omite_a_chave_e_declara_v3() {
         let texto = serde_json::to_string(&announcement(PROTOCOL_VERSION)).expect("serializa");
         assert_eq!(
             texto,
-            r#"{"protocol_version":2,"device_id":"a10s-teste","display_name":"Galaxy A10s","capabilities":{"screen_source":true,"camera_source":true,"sink":true}}"#
+            r#"{"protocol_version":3,"device_id":"a10s-teste","display_name":"Galaxy A10s","capabilities":{"screen_source":true,"camera_source":true,"sink":true}}"#
         );
     }
 
@@ -377,7 +397,8 @@ mod tests {
         let mut novo = announcement(PROTOCOL_VERSION);
         novo.papel = Some(Papel::Teleprompter);
         let texto = serde_json::to_string(&novo).expect("serializa");
-        let lido: AnuncioDaBuildAnterior = serde_json::from_str(&texto).expect("a build anterior aceita");
+        let lido: AnuncioDaBuildAnterior =
+            serde_json::from_str(&texto).expect("a build anterior aceita");
         assert_eq!(lido.display_name, "Galaxy A10s");
     }
 
@@ -401,7 +422,12 @@ mod tests {
     fn a_regra_do_papel_e_a_tabela_do_contrato() {
         use Papel::*;
         // Quem hospeda vídeo não confere nada: o vídeo de sempre não muda.
-        for convidado in [None, Some(Teleprompter), Some(ControleRemoto), Some(Desconhecido)] {
+        for convidado in [
+            None,
+            Some(Teleprompter),
+            Some(ControleRemoto),
+            Some(Desconhecido),
+        ] {
             assert!(papel_do_convidado_serve(None, convidado).is_ok());
         }
         assert!(papel_do_convidado_serve(Some(Teleprompter), Some(ControleRemoto)).is_ok());

@@ -27,3 +27,18 @@ O verificador MSI inicial emitiu dois avisos WiX antes do JSON externo. A inspe�
 Não foi executada instalação/desinstalação do MSI em Windows limpo, importação de certificado, captura de tela, criação de monitor virtual nem sessão em aparelhos físicos nesta preparação. As regras de upgrade, ownership e consentimento do driver foram revisadas no código; rollback real, reboot e compatibilidade de drivers precisam de ensaio em Windows. A compilação e os testes sintéticos não são prova física de monitor estendido.
 
 O `cargo fmt --all --check` do núcleo herdado encontrou diferenças de formatação preexistentes. Não foi feita uma reformatação geral dos fontes do Studio neste recorte.
+
+## Versão 0.1.1 — validação automática do protocolo
+
+O núcleo foi portado do baseline público [`5842bbc5d52c3be91d3b094fab10d81c0fddf842`](https://github.com/Quevenapp/Quall/tree/5842bbc5d52c3be91d3b094fab10d81c0fddf842), com protocolo 3, rota WebSocket `/quall/v3`, pareamento OPAQUE-3DH e canal de sinalização autenticado e cifrado. Não há fallback para as rotas ou o pareamento antigos. Os registros legados são preservados, mas o primeiro vínculo v3 exige digitar novamente o PIN; a retomada sem PIN usa o vínculo v3 salvo.
+
+- Núcleo sem dependências nativas: **340 testes passaram e 2 foram ignorados**.
+- Núcleo com transporte nativo, em Release: **541 testes passaram e 3 foram ignorados**.
+- Fronteira C/FFI com transporte nativo, em Release: **99 testes passaram**, sem falhas.
+- Regressão do HTTP 404: a incompatibilidade de rota foi reproduzida no host 0.1.0 antes do PIN; os testes conferiram a rota v3, a rejeição HTTP 404 de rotas legadas e o diagnóstico de um endpoint que recusa o handshake. As verificações direcionadas finais de rota legada e PIN incorreto também passaram.
+- Oito sessões de Monitor e uma de Studio ficaram conectadas simultaneamente em **loopback**, com portas e transportes separados, dados isolados e oito receptores com identidades distintas. A regressão conferiu o armazenamento dos vínculos e a retomada sem PIN de cada receptor, mantendo os demais e o Studio conectados.
+- Os testes do protocolo incluem rejeição de PIN incorreto, autenticação, adulteração e replay do canal cifrado.
+- Casca e bibliotecas Mac: **55 testes passaram**, incluindo o limite de oito monitores, reconexão, cancelamento, tradução PT/EN e reserva de índice quando a saída do helper/monitor não é confirmada. A classificação da rede local foi conferida com testes puros; nenhum deles altera permissões do sistema.
+- Preparação de downloads: o verificador rejeitou um MSI cujo relatório tinha SHA-256 diferente e rejeitou a promoção a canal estável dos pacotes Windows sem Authenticode. A preparação anterior foi preservada nos dois casos.
+
+Essas provas automáticas verificam protocolo, transporte, pareamento e retomada. Não comprovam oito telas físicas, captura e criação de monitores reais, sessões Android/iPad com a nova release ou instalação do driver em Windows. Os builds, a CI, a assinatura/notarização dos novos pacotes e a publicação da 0.1.1 serão registrados após sua conclusão; a publicação e o acesso público descritos acima correspondem à **0.1.0**.

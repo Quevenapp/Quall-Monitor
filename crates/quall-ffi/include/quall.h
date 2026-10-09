@@ -552,7 +552,7 @@ typedef struct QuallDeviceDesc {
      */
     const char *device_id;
     /**
-     * Nome exibido na lista de aparelhos.
+     * Nome real exibido ao par depois da autenticação, sem anunciar em mDNS.
      */
     const char *display_name;
     bool screen_source;
@@ -902,6 +902,17 @@ struct QuallAdvertiser *quall_advertiser_start(const struct QuallDeviceDesc *me,
                                                uint16_t signaling_port);
 
 /**
+ * Rótulo público efêmero do anunciante (`Quall <prefix8>`), igual ao mostrado na descoberta.
+ * Padrão `(buf, cap)`: tamanho UTF-8 incluindo NUL; não escreve se não couber; `-1` em erro.
+ * O nome real do aparelho só é enviado depois da autenticação.
+ *
+ * # Safety
+ * `a` precisa vir de `quall_advertiser_start`/`_with_role` e continuar vivo durante a chamada.
+ * `buf` precisa ser nulo ou apontar para `cap` bytes graváveis.
+ */
+intptr_t quall_advertiser_label(const struct QuallAdvertiser *a, char *buf, uintptr_t cap);
+
+/**
  * Para de anunciar e libera. Nulo é ignorado.
  *
  * # Dívida 3: isto não desregistrava nada
@@ -961,6 +972,8 @@ int32_t quall_browser_collect(const struct QuallBrowser *b, uint32_t ms);
  * Formato: um array de objetos com `device_id`, `display_name`, `protocol_version`,
  * `capabilities` (`screen_source`, `camera_source`, `sink`) e `endpoint` (`"ip:porta"` ou
  * `null` quando o aparelho não anunciou endereço utilizável).
+ * `identity_authenticated` é `false`: o ID e nome desta lista são placeholders efêmeros,
+ * não servem para consultar ou persistir pareamentos. Use o peer da sessão após autenticar.
  *
  * # Safety
  *
@@ -1077,7 +1090,7 @@ uint16_t quall_session_signaling_port(const struct QuallSession *s);
 /**
  * Sobe uma sessão como **receptor**: conecta no endereço, pareia e responde.
  *
- * `endpoint` é `"192.168.1.131:7877"` ou só `"192.168.1.131"` (a porta padrão entra sozinha).
+ * `endpoint` é `"192.168.56.131:7877"` ou só `"192.168.56.131"` (a porta padrão entra sozinha).
  * É a **mesma** função para o endereço que veio do mDNS e para o que o usuário digitou — de
  * propósito: o fallback de rede sem multicast não pode ser um caminho de código que ninguém
  * exercita.
@@ -1133,13 +1146,16 @@ struct QuallSession *quall_connect_with_screen(const char *endpoint,
 
 /**
  * O aparelho do outro lado, como JSON (`device_id`, `display_name`, `protocol_version`,
- * `capabilities`). Padrão `(buf, cap)`.
+ * `capabilities`, `identity_authenticated: true`). Padrão `(buf, cap)`.
+ * ID e nome reais vêm do anúncio autenticado e cifrado; substituem a linha efêmera da descoberta.
  *
  * # Safety
  *
  * `s` precisa vir de [`quall_host`] ou [`quall_connect`].
  */
-intptr_t quall_session_peer_json(const struct QuallSession *s, char *buf, uintptr_t cap);
+intptr_t quall_session_peer_json(const struct QuallSession *s,
+                                 char *buf,
+                                 uintptr_t cap);
 
 /**
  * **Quantos candidatos caíram antes deste**, sem derrubar a espera. `0` no receptor, e `0` é o
@@ -1166,10 +1182,10 @@ int64_t quall_session_descartados(const struct QuallSession *s);
  * Quatro campos, todos podendo ser `null`:
  *
  * ```json
- * {"local_candidate":"a=candidate:1 1 UDP 2122317823 192.168.1.131 62493 typ host",
- *  "remote_candidate":"a=candidate:1 1 UDP 2122317823 192.168.1.131 51698 typ host",
- *  "local_address":"192.168.1.131:62493",
- *  "remote_address":"192.168.1.131:51698"}
+ * {"local_candidate":"a=candidate:1 1 UDP 2122317823 192.168.56.131 62493 typ host",
+ *  "remote_candidate":"a=candidate:1 1 UDP 2122317823 192.168.56.131 51698 typ host",
+ *  "local_address":"192.168.56.131:62493",
+ *  "remote_address":"192.168.56.131:51698"}
  * ```
  *
  * # `null` é "o ICE ainda não fechou", e não é erro
@@ -1183,7 +1199,7 @@ int64_t quall_session_descartados(const struct QuallSession *s);
  *
  * Porque **uma corrida "pelo cabo" pode fechar pela Wi-Fi e parecer sucesso**. Medido nesta
  * bancada em 2026-09-01: duas pontas na mesma máquina, sinalização por `127.0.0.1`, e o par
- * escolhido foi `192.168.1.131 <-> 192.168.1.131` — a mídia saiu pelo rádio. O `quall-probe`
+ * escolhido foi `192.168.56.131 <-> 192.168.56.131` — a mídia saiu pelo rádio. O `quall-probe`
  * sempre soube disso porque lê o `Ready` do Rust; a casca não tinha nada equivalente, e foi
  * exatamente essa linha que explicou os 8,6 s de `docs/receptor-ios.md:243`.
  *
@@ -2296,6 +2312,16 @@ enum QuallStatus quall_teto_ajustar_para(uint32_t largura,
 uint8_t quall_teto_nivel_anunciado(void);
 
 /**
+ * Existe algum vínculo autenticado pela revisão segura v3? Registros legados não contam.
+ *
+ * Retorna `1`/`0`, ou `-1` se o JSON é inválido. Não identifica o aparelho remoto da descoberta.
+ *
+ * # Safety
+ * `known_json` precisa ser nulo ou apontar para uma string UTF-8 terminada em zero.
+ */
+int32_t quall_known_peers_has_secure(const char *known_json);
+
+/**
  * **Esquece um par.** Devolve o estado de pareamento sem ele, no padrão `(buf, cap)`.
  *
  * É o que a casca oferece como "parear de novo". Sem isto, um pareamento que dessincronizou não
@@ -2482,7 +2508,7 @@ uint16_t quall_teleprompter_pick_port(uint32_t wait_ms);
  * o QR trouxe —, sem rede nenhuma. Padrão `(buf, cap)`:
  *
  * ```json
- * {"endereco":"192.168.15.8:7979","pin":"424242"}
+ * {"endereco":"192.168.57.8:7979","pin":"424242"}
  * ```
  *
  * `"pin"` é `null` quando a entrada não era um link. Sem porta, a do papel: `role`
@@ -3311,7 +3337,7 @@ enum QuallStatus quall_camera_remote_pump(const struct QuallCameraRemote *r,
  *
  * ```json
  * {"situacao":"pronto","capacidades":{…},"ajuste":{…},"aplicado":{…},"pendente":{"iso":800},
- *  "lido":{…},"autor":"Pixel do Bruno","versao":17,
+ *  "lido":{…},"autor":"Pixel do Pessoa Exemplo","versao":17,
  *  "recusa":{"motivo":"superado","campo":"iso","ha_ms":300},"contadores":{…}}
  * ```
  *

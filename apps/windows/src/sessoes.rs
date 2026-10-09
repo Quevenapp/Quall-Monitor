@@ -826,12 +826,12 @@ impl Tabela {
 // traduz na hora de mostrar (`idioma::tr`), e a troca de idioma vale também para um conselho que já
 // está na tela. Uma linha cada (a varredura da tradução lê o literal inteiro numa linha só).
 const CONSELHO_PIN_ERRADO_REABRE: &str = "Um aparelho tentou entrar com o PIN errado. O PIN mudou: passe os seis dígitos novos — cada PIN vale uma tentativa por conexão."; // i18n: chave
-const CONSELHO_PIN_ERRADO: &str = "Um aparelho tentou entrar com o PIN errado. Clique em Espelhar de novo e passe os seis dígitos novos — cada PIN vale uma tentativa por conexão."; // i18n: chave
+const CONSELHO_PIN_ERRADO: &str = "Um aparelho tentou entrar com o PIN errado. Clique em Estender de novo e passe os seis dígitos novos — cada PIN vale uma tentativa por conexão."; // i18n: chave
 const CONSELHO_PRECISA_DE_PIN: &str = "Um aparelho tentou entrar com um pareamento que este computador não reconhece mais. Peça para ele digitar o PIN de novo; se continuar falhando, esqueça os pareamentos e comecem do zero."; // i18n: chave
 const CONSELHO_SEM_ROTA: &str = "O pareamento fechou, mas os dois aparelhos não acharam caminho um para o outro. Quase sempre é a rede: Wi-Fi de hóspede, isolamento entre aparelhos ou redes diferentes. Ponha os dois na mesma rede e tente de novo."; // i18n: chave
-const CONSELHO_PRAZO: &str = "Ninguém entrou em cinco minutos. Clique em Espelhar de novo quando o outro aparelho estiver pronto."; // i18n: chave
+const CONSELHO_PRAZO: &str = "Ninguém entrou em cinco minutos. Clique em Estender de novo quando o outro aparelho estiver pronto."; // i18n: chave
 const CONSELHO_PAREAMENTO_REABRE: &str = "O pareamento de mais um aparelho não fechou. Ou o PIN não conferiu, ou o outro aparelho tentou entrar com um pareamento que este computador não reconhece mais. O PIN mudou: digite no outro aparelho o PIN novo que aparece aqui."; // i18n: chave
-const CONSELHO_PAREAMENTO: &str = "O pareamento não fechou. Ou o PIN não conferiu, ou o outro aparelho tentou entrar com um pareamento que este computador não reconhece mais. Nos dois casos a saída é a mesma: clique em Espelhar de novo e digite no outro aparelho o PIN novo que aparecer aqui."; // i18n: chave
+const CONSELHO_PAREAMENTO: &str = "O pareamento não fechou. Ou o PIN não conferiu, ou o outro aparelho tentou entrar com um pareamento que este computador não reconhece mais. Nos dois casos a saída é a mesma: clique em Estender de novo e digite no outro aparelho o PIN novo que aparecer aqui."; // i18n: chave
 
 /// Os conselhos de quando a espera falha — os textos de `emissor.rs::ao_falhar`, e os do Mac para
 /// a espera de mais um aparelho (`reabre`): ela volta sozinha, e o conselho não pode mandar a
@@ -960,6 +960,8 @@ mod testes {
             t.conectou(e, par(&format!("a{i}")), 1_000, &mut fx);
         }
         assert_eq!(fx.transmitir.len(), 8);
+        let indices: BTreeSet<_> = fx.transmitir.iter().map(|(_, indice)| *indice).collect();
+        assert_eq!(indices, (0..8).collect(), "cada aparelho captura seu próprio monitor");
         assert!(t.sessoes().iter().all(|s| s.estado == Estado::Transmitindo), "nenhuma espera");
         assert_eq!(fx.anuncios.last(), Some(&None), "no limite o anúncio sai do ar");
         assert!(!t.retrato().esperando_mais_um);
@@ -971,6 +973,13 @@ mod testes {
         assert!(t.sessoes().iter().any(|s| s.estado == Estado::Esperando));
         assert_eq!(t.retrato().receptores.len(), 7);
         assert!(t.retrato().esperando_mais_um);
+        // The returning device gets its old display index without ending the other seven.
+        let volta = espera(&t);
+        t.conectou(volta, par("a3"), 6_000, &mut fx);
+        assert_eq!(fx.transmitir.last(), Some(&(volta, 3)));
+        assert_eq!(fx.encerrar, vec![ids[3]], "as outras sete sessões continuam");
+        assert_eq!(t.retrato().receptores.len(), 8);
+        assert!(!t.retrato().esperando_mais_um, "nono aparelho não ganha uma espera");
     }
 
     #[test]
@@ -1387,7 +1396,7 @@ mod testes {
         t.falhou_ao_hospedar(e, Falha::PinErrado, 10_000, &mut fx);
         assert_eq!(t.fase(), Fase::Inicial);
         assert!(t.retrato().conselho.contains("PIN errado"));
-        assert!(t.retrato().conselho.contains("Clique em Espelhar"));
+        assert!(t.retrato().conselho.contains("Clique em Estender"));
     }
 
     #[test]

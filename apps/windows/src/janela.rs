@@ -1347,7 +1347,7 @@ impl Janela {
         let (sessao, painel) = match cena {
             Cena::Esperando => (sessao(Painel::Espelhar, estilo::Luz::Aguardando, t("Aguardando"), nota_do_emissor), Painel::Espelhar),
             Cena::NoAr | Cena::Varios => (
-                sessao(Painel::Espelhar, estilo::Luz::NoAr, if camera { t("No ar") } else { t("Espelhando") }, nota_do_emissor),
+                sessao(Painel::Espelhar, estilo::Luz::NoAr, if camera { t("No ar") } else { t("Estendendo") }, nota_do_emissor),
                 Painel::Espelhar,
             ),
             Cena::Conectando => (sessao(Painel::Exibir, estilo::Luz::Aguardando, t("Conectando"), nota_do_receptor), Painel::Exibir),
@@ -1450,12 +1450,13 @@ impl Janela {
             (String::new(), false)
         };
         let endereco = e.endereco.clone().unwrap_or_else(|| t("sem rede").to_string());
+        let rotulo_da_espera = modelo::rotulo_da_espera(e.porta_da_espera, e.rotulo_da_descoberta.as_ref());
         let espera = TelaEspera {
             pin: e.pin.clone(),
             endereco: endereco.clone(),
             ha_pares: e.ha_pares_conhecidos,
-            nome: e.nome_do_aparelho.clone(),
-            anunciando: e.anunciando_por_mdns,
+            nome: rotulo_da_espera.unwrap_or_default().to_string(),
+            anunciando: rotulo_da_espera.is_some(),
             origem: origem.clone(),
             com_som: (!camera).then_some(e.com_som),
             // O que a caixa prometeu, dito como **resultado**: a recusa do WASAPI, ou a linha do
@@ -1513,6 +1514,7 @@ impl Janela {
         };
         let n = e.receptores.len();
         let varios_tela = TelaVarios {
+            nome_da_espera: rotulo_da_espera.unwrap_or_default().to_string(),
             receptores: e.receptores.iter().map(|x| LinhaDeReceptor { nome: x.nome.clone(), monitor: x.monitor.clone(), resumo: x.resumo.clone() }).collect(),
             mais_um: e.esperando_mais_um.then(|| (e.pin.clone(), endereco.clone())),
             mais_um_texto: if n >= crate::sessoes::LIMITE_DE_SESSOES {

@@ -141,7 +141,7 @@ pub fn decidir_abertura(i: Instancia) -> Abertura {
 /// um erro do sistema vai como veio.
 pub fn conselho_da_falha(motivo: &str) -> String {
     let m = crate::idioma::tr(motivo.trim().trim_end_matches('.'));
-    crate::idioma::tf("A tela estendida não está disponível: {}. Toque em Espelhar para tentar de novo.", &[&m])
+    crate::idioma::tf("A tela estendida não está disponível: {}. Toque em Estender para tentar de novo.", &[&m])
 }
 
 // ================================================================================================
@@ -251,7 +251,7 @@ mod testes {
         );
         assert_eq!(
             conselho_da_falha("o adaptador SudoVDA não abre: acesso negado."),
-            "A tela estendida não está disponível: o adaptador SudoVDA não abre: acesso negado. Toque em Espelhar para tentar de novo."
+            "A tela estendida não está disponível: o adaptador SudoVDA não abre: acesso negado. Toque em Estender para tentar de novo."
         );
     }
 

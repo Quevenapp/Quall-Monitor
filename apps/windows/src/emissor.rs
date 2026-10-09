@@ -114,6 +114,8 @@ pub struct Estado {
     pub conselho: String,
     pub oferece_desparear: bool,
     pub anunciando_por_mdns: bool,
+    /// Public ephemeral discovery label and the port it actually advertises (protocol v3).
+    pub rotulo_da_descoberta: Option<(u16, String)>,
     pub resumo: String,
     /// Corrida de bancada pediu para o processo sair.
     pub sair: bool,
@@ -250,6 +252,7 @@ impl Emissor {
                 conselho: String::new(),
                 oferece_desparear: false,
                 anunciando_por_mdns: false,
+                rotulo_da_descoberta: None,
                 resumo: String::new(),
                 sair: false,
                 receptores: Vec::new(),
@@ -778,6 +781,7 @@ impl Emissor {
         {
             let mut e = self.estado();
             e.endereco = endereco.clone();
+            e.porta_da_espera = Some(porta);
             e.mudou();
         }
 
@@ -800,6 +804,7 @@ impl Emissor {
         {
             let mut e = self.estado();
             e.anunciando_por_mdns = anunciante.is_some();
+            e.rotulo_da_descoberta = anunciante.as_ref().map(|a| (porta, a.discovery_label().to_string()));
             e.mudou();
         }
         registro::linha(format!(
@@ -909,6 +914,7 @@ impl Emissor {
         {
             let mut e = self.estado();
             e.anunciando_por_mdns = false;
+            e.rotulo_da_descoberta = None;
             e.mudou();
         }
 
@@ -1295,7 +1301,7 @@ impl Emissor {
                 e.conselho = idioma::t("O pareamento fechou, mas os dois aparelhos não acharam caminho um para o outro. Quase sempre é a rede: Wi-Fi de hóspede, isolamento entre aparelhos ou redes diferentes. Ponha os dois na mesma rede e tente de novo.").into();
             }
             Error::Timeout(_) => {
-                e.conselho = idioma::t("Ninguém entrou em cinco minutos. Clique em Espelhar de novo quando o outro aparelho estiver pronto.").into();
+                e.conselho = idioma::t("Ninguém entrou em cinco minutos. Clique em Estender de novo quando o outro aparelho estiver pronto.").into();
             }
             // **Medido, e não era o que este braço dizia.** Ao exercitar a dívida 22 — este
             // computador esquece o par, o outro tenta retomar — o núcleo **não** devolveu
@@ -1308,7 +1314,7 @@ impl Emissor {
             // existe, o texto nomeia as duas e dá a saída, que é a mesma. Adivinhar a causa por
             // comparação de string na mensagem de erro seria pior que não adivinhar.
             Error::Pairing(_) => {
-                e.conselho = idioma::t("O pareamento não fechou. Ou o PIN não conferiu, ou o outro aparelho tentou entrar com um pareamento que este computador não reconhece mais. Nos dois casos a saída é a mesma: clique em Espelhar de novo e digite no outro aparelho o PIN novo que aparecer aqui.").into();
+                e.conselho = idioma::t("O pareamento não fechou. Ou o PIN não conferiu, ou o outro aparelho tentou entrar com um pareamento que este computador não reconhece mais. Nos dois casos a saída é a mesma: clique em Estender de novo e digite no outro aparelho o PIN novo que aparecer aqui.").into();
             }
             outro => e.conselho = outro.to_string(),
         }
@@ -1337,6 +1343,8 @@ impl Emissor {
         e.par.clear();
         e.endereco = None;
         e.anunciando_por_mdns = false;
+        e.rotulo_da_descoberta = None;
+        e.porta_da_espera = None;
         e.resumo.clear();
         e.ha_pares_conhecidos = identidade::ha_pares_conhecidos();
         self.aplicar_lista(&mut e, geracao, nova);
@@ -1717,7 +1725,7 @@ impl Emissor {
                 }
             }
             if ocioso_desde.elapsed() >= ESPERA_OCIOSA {
-                motivo = idioma::tf("Ninguém entrou em {} minutos, e nada estava gravando: a câmera fechou. Clique em Espelhar de novo quando o outro aparelho estiver pronto.", &[&(ESPERA_OCIOSA.as_secs() / 60)]);
+                motivo = idioma::tf("Ninguém entrou em {} minutos, e nada estava gravando: a câmera fechou. Clique em Estender de novo quando o outro aparelho estiver pronto.", &[&(ESPERA_OCIOSA.as_secs() / 60)]);
                 break;
             }
             if aberta_em.is_none() && dono.fase() == crate::dono_da_captura::FaseDoDono::Aberto {

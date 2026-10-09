@@ -200,6 +200,9 @@ public final class TransmissaoAoVivo {
     /// `parar()` já começou. Sob `travaDoMonitor`: é o que impede um monitor que termina de subir
     /// **depois** da parada de ficar vivo sem dono.
     private var paradaPedida = false
+    /// False from the first helper attempt until its process and display have both disappeared.
+    /// A failed startup can leave an unreported display, so it also keeps the identity reserved.
+    private var monitorLiberado = true
     private let travaDoMonitor = NSLock()
     /// O monitor da tela estendida, depois de nascer — para a captura saber se ele continua lá quando
     /// o ScreenCaptureKit a derruba. Sob `travaDoMonitor`.
@@ -552,6 +555,7 @@ public final class TransmissaoAoVivo {
     #if QUALL_TELA_ESTENDIDA_FUTURA
         if let modo = fonte.modoDaTelaEstendida {
             Self.anotarReorganizacaoNossa()
+            travaDoMonitor.withLock { monitorLiberado = false }
             let monitor = try await MonitorVirtualAuxiliar.subir(modo: modo, nome: nomeDoMonitor,
                                                                  indice: indiceDoMonitor)
             Self.anotarReorganizacaoNossa()
@@ -562,8 +566,9 @@ public final class TransmissaoAoVivo {
             }
             guard adotado else {
                 // `parar()` chegou enquanto o monitor subia: ninguém mais vai soltá-lo.
-                let linha = await monitor.soltar()
-                aoRegistrarDiagnostico?("tela estendida: a sessão acabou enquanto o monitor subia — \(linha)")
+                let resultado = await monitor.soltar()
+                travaDoMonitor.withLock { monitorLiberado = resultado.confirmado }
+                aoRegistrarDiagnostico?("tela estendida: a sessão acabou enquanto o monitor subia — \(resultado.relato)")
                 throw Falha.fonteNaoIniciou("a sessão foi encerrada enquanto o monitor virtual subia")
             }
             aoRegistrarDiagnostico?(monitor.relato)
@@ -709,7 +714,8 @@ public final class TransmissaoAoVivo {
         return (largura: largura, altura: altura)
     }
 
-    public func parar() async {
+    @discardableResult
+    public func parar() async -> Bool {
     #if QUALL_TELA_ESTENDIDA_FUTURA
         let monitor = travaDoMonitor.withLock { () -> MonitorVirtualAuxiliar? in
             paradaPedida = true
@@ -738,12 +744,15 @@ public final class TransmissaoAoVivo {
     #if QUALL_TELA_ESTENDIDA_FUTURA
         if let monitor {
             Self.anotarReorganizacaoNossa()
-            aoRegistrarDiagnostico?(await monitor.soltar())
+            let resultado = await monitor.soltar()
+            travaDoMonitor.withLock { monitorLiberado = resultado.confirmado }
+            aoRegistrarDiagnostico?(resultado.relato)
             // E de novo depois: o auxiliar leva até 3 s para sair, e o sumiço do monitor é que mexe
             // nos outros.
             Self.anotarReorganizacaoNossa()
         }
     #endif
+        return travaDoMonitor.withLock { monitorLiberado }
     }
 
     #if QUALL_TELA_ESTENDIDA_FUTURA

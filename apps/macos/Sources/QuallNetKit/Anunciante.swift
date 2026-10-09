@@ -29,6 +29,13 @@ public final class Anunciante {
 
     public init() {}
 
+    /// Protocol 3 advertises an ephemeral label; the real host identity is shared after pairing.
+    public var rotulo: String {
+        trava.lock(); defer { trava.unlock() }
+        guard let handle else { return "" }
+        return NucleoDeRede.lerTexto { out, cap in Int(quall_advertiser_label(handle, out, cap)) }
+    }
+
     deinit {
         parar()
         for p in vivas { free(p) }

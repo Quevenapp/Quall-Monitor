@@ -165,32 +165,34 @@ impl Anunciante {
                 if let Some(a) = atual.take() {
                     let _ = a.stop();
                 }
-                let anunciando = match porta {
+                let rotulo = match porta {
                     // `--so-local` (bancada): nada escuta fora do loopback, nem o mDNS.
                     Some(porta) if desligado => {
                         registro::linha(format!("mdns: desligado por --so-local (a espera na porta {porta} só em 127.0.0.1)"));
-                        false
+                        None
                     }
                     Some(porta) => match Advertiser::start(&eu, porta) {
                         Ok(a) => {
+                            let rotulo = a.discovery_label().to_string();
                             atual = Some(a);
                             registro::linha(format!("mdns: anunciando a porta {porta}"));
-                            true
+                            Some((porta, rotulo))
                         }
                         Err(e) => {
                             registro::linha(format!("mdns: não anunciou a porta {porta}: status={}", crate::diagnostico_rede::status(&e)));
-                            false
+                            None
                         }
                     },
                     None => {
                         registro::linha("mdns: parado");
-                        false
+                        None
                     }
                 };
                 {
                     let mut e = emissor.estado();
-                    if e.anunciando_por_mdns != anunciando {
-                        e.anunciando_por_mdns = anunciando;
+                    if e.rotulo_da_descoberta != rotulo {
+                        e.anunciando_por_mdns = rotulo.is_some();
+                        e.rotulo_da_descoberta = rotulo;
                         e.versao += 1;
                     }
                 }

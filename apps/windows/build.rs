@@ -22,7 +22,8 @@
 //! script **escreve o `.res`** a partir do `quall.ico` — um `RT_ICON` por imagem e um `RT_GROUP_ICON`
 //! de número 1, que é o que o Explorer e o `<Icon>` do WiX leem — e o passa ao linker do binário. O
 //! formato é o de sempre (cabeçalho de 32 bytes por recurso, tudo alinhado a 4); nada a baixar, e o
-//! portão continua offline. O `quall.ico` sai de `tools/icones/gerar.py`.
+//! portão continua offline. O `quall.ico` sai de `tools/generate-icons.py` e mostra a marca Quall na
+//! tela de um monitor.
 
 use std::fs;
 use std::path::Path;
@@ -40,7 +41,7 @@ fn main() {
     println!("cargo:rustc-link-arg-bin=quall-monitor=/MANIFEST:EMBED");
     println!("cargo:rustc-link-arg-bin=quall-monitor=/MANIFESTINPUT:{raiz}\\app.manifest");
 
-    let ico = fs::read(Path::new(&raiz).join("quall.ico")).expect("quall.ico (gerado por tools/icones/gerar.py)");
+    let ico = fs::read(Path::new(&raiz).join("quall.ico")).expect("quall.ico (gerado por tools/generate-icons.py)");
     let icones = res_do_icone(&ico).expect("quall.ico malformado");
     let versao = std::env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION");
     let mut res = icones.clone();

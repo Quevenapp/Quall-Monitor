@@ -1232,7 +1232,7 @@ fn mudar(a: Andamento) {
 pub fn perguntar(hwnd: HWND, acao: Acao) -> bool {
     use crate::idioma::{t, tf};
     use windows::Win32::UI::Controls::{
-        TaskDialogIndirect, TASKDIALOGCONFIG, TASKDIALOGCONFIG_0, TASKDIALOG_BUTTON, TASKDIALOG_NOTIFICATIONS, TDCBF_CANCEL_BUTTON,
+        TaskDialogIndirect, TASKDIALOGCONFIG, TASKDIALOGCONFIG_0, TASKDIALOG_BUTTON, TASKDIALOG_NOTIFICATIONS,
         TDF_ALLOW_DIALOG_CANCELLATION, TDF_POSITION_RELATIVE_TO_WINDOW, TDM_SET_BUTTON_ELEVATION_REQUIRED_STATE, TDN_CREATED,
         TD_SHIELD_ICON,
     };
@@ -1270,12 +1270,15 @@ pub fn perguntar(hwnd: HWND, acao: Acao) -> bool {
         ),
     };
     let (titulo, pergunta, corpo, sim) = (largo(&titulo), largo(&pergunta), largo(&corpo), largo(&sim));
-    let botoes = [TASKDIALOG_BUTTON { nButtonID: ID_SIM, pszButtonText: PCWSTR(sim.as_ptr()) }];
+    let cancelar = largo(t("Cancelar"));
+    let botoes = [
+        TASKDIALOG_BUTTON { nButtonID: ID_SIM, pszButtonText: PCWSTR(sim.as_ptr()) },
+        TASKDIALOG_BUTTON { nButtonID: 2, pszButtonText: PCWSTR(cancelar.as_ptr()) },
+    ];
     let config = TASKDIALOGCONFIG {
         cbSize: std::mem::size_of::<TASKDIALOGCONFIG>() as u32,
         hwndParent: hwnd,
         dwFlags: TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW,
-        dwCommonButtons: TDCBF_CANCEL_BUTTON,
         pszWindowTitle: PCWSTR(titulo.as_ptr()),
         Anonymous1: TASKDIALOGCONFIG_0 { pszMainIcon: TD_SHIELD_ICON },
         pszMainInstruction: PCWSTR(pergunta.as_ptr()),

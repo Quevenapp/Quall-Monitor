@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<WixLocalization xmlns="http://wixtoolset.org/schemas/v4/wxl" Culture="pt-BR" Codepage="1252">
+  <String Id="ProductLanguage" Value="1046" />
+  <String Id="NewerVersionInstalled" Value="Uma versão mais nova do Quall Monitor já está instalada." />
+  <String Id="MinimumWindows" Value="Quall Monitor requer Windows 11 x64, build 22000 ou mais recente." />
+  <String Id="CloseMonitor" Value="Feche o Quall Monitor para continuar." />
+  <String Id="ExitNote" Value="O driver SudoVDA acompanha o Quall Monitor. Se o Windows pedir, reinicie antes de usar. Detalhes em driver-setup.log na pasta do aplicativo." />
+  <String Id="DriverDialogTitle" Value="Quall Monitor — driver SudoVDA" />
+  <String Id="DriverTitle" Value="Driver de monitor virtual incluído" />
+  <String Id="DriverExplanation" Value="Para criar monitores, o setup instala SudoVDA 1.10.9.289. Se o driver já existir, ele será preservado. O pacote incluído usa o certificado autoemitido CN=sudovda@su.mk. Ao marcar a confirmação abaixo, você autoriza adicionar esse certificado às lojas Root e TrustedPublisher da máquina. Isso concede confiança ao certificado. O setup remove somente o driver e a confiança que o Quall Monitor tiver instalado quando você desinstalar o aplicativo." />
+  <String Id="DriverConsent" Value="Aceito confiar no certificado para instalar o driver incluído." />
+  <String Id="DriverNote" Value="Sem confirmação, a instalação só continua com driver ou confiança já existentes. Instalação silenciosa nunca adiciona confiança." />
+  <String Id="Continue" Value="Continuar" />
+  <String Id="Cancel" Value="Cancelar" />
+</WixLocalization>

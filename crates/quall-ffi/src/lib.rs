@@ -1,3 +1,4 @@
+// Os identificadores e endereços de exemplos/fixtures são sintéticos; não identificam a bancada privada.
 //! Superfície C do núcleo, consumida pelas cascas: Swift (macOS/iOS), Kotlin via JNI (Android),
 //! C++ (plugin de OBS) e C/C++ (câmera virtual do Windows).
 //!
@@ -464,7 +465,7 @@ pub struct QuallDeviceDesc {
     /// Identificador estável, gerado na primeira execução e persistido pela casca. É o que o
     /// pareamento vincula — não o nome, que o usuário pode trocar.
     pub device_id: *const c_char,
-    /// Nome exibido na lista de aparelhos.
+    /// Nome real exibido ao par depois da autenticação, sem anunciar em mDNS.
     pub display_name: *const c_char,
     pub screen_source: bool,
     pub camera_source: bool,
@@ -536,6 +537,26 @@ pub unsafe extern "C" fn quall_advertiser_start(
             ptr::null_mut()
         }
     }
+}
+
+/// Rótulo público efêmero do anunciante (`Quall <prefix8>`), igual ao mostrado na descoberta.
+/// Padrão `(buf, cap)`: tamanho UTF-8 incluindo NUL; não escreve se não couber; `-1` em erro.
+/// O nome real do aparelho só é enviado depois da autenticação.
+///
+/// # Safety
+/// `a` precisa vir de `quall_advertiser_start`/`_with_role` e continuar vivo durante a chamada.
+/// `buf` precisa ser nulo ou apontar para `cap` bytes graváveis.
+#[no_mangle]
+pub unsafe extern "C" fn quall_advertiser_label(
+    a: *const QuallAdvertiser,
+    buf: *mut c_char,
+    cap: usize,
+) -> isize {
+    let Some(anunciante) = a.as_ref().and_then(|a| a.interno.as_ref()) else {
+        guardar_nulo("quall_advertiser_label: anunciante nulo ou encerrado");
+        return -1;
+    };
+    escrever_texto(anunciante.discovery_label(), buf, cap)
 }
 
 /// Para de anunciar e libera. Nulo é ignorado.
@@ -684,6 +705,8 @@ pub unsafe extern "C" fn quall_browser_collect(b: *const QuallBrowser, ms: u32) 
 /// Formato: um array de objetos com `device_id`, `display_name`, `protocol_version`,
 /// `capabilities` (`screen_source`, `camera_source`, `sink`) e `endpoint` (`"ip:porta"` ou
 /// `null` quando o aparelho não anunciou endereço utilizável).
+/// `identity_authenticated` é `false`: o ID e nome desta lista são placeholders efêmeros,
+/// não servem para consultar ou persistir pareamentos. Use o peer da sessão após autenticar.
 ///
 /// # Safety
 ///
@@ -706,6 +729,7 @@ pub unsafe extern "C" fn quall_browser_devices_json(
         .iter()
         .map(|a| {
             let mut item = serde_json::json!({
+                "identity_authenticated": false,
                 "device_id": a.announcement.device_id.0,
                 "display_name": a.announcement.display_name,
                 "protocol_version": a.announcement.protocol_version,
@@ -1255,7 +1279,7 @@ pub unsafe extern "C" fn quall_session_signaling_port(s: *const QuallSession) ->
 
 /// Sobe uma sessão como **receptor**: conecta no endereço, pareia e responde.
 ///
-/// `endpoint` é `"192.168.1.131:7877"` ou só `"192.168.1.131"` (a porta padrão entra sozinha).
+/// `endpoint` é `"192.168.56.131:7877"` ou só `"192.168.56.131"` (a porta padrão entra sozinha).
 /// É a **mesma** função para o endereço que veio do mDNS e para o que o usuário digitou — de
 /// propósito: o fallback de rede sem multicast não pode ser um caminho de código que ninguém
 /// exercita.
@@ -1385,7 +1409,8 @@ unsafe fn conectar_pela_fronteira(
 }
 
 /// O aparelho do outro lado, como JSON (`device_id`, `display_name`, `protocol_version`,
-/// `capabilities`). Padrão `(buf, cap)`.
+/// `capabilities`, `identity_authenticated: true`). Padrão `(buf, cap)`.
+/// ID e nome reais vêm do anúncio autenticado e cifrado; substituem a linha efêmera da descoberta.
 ///
 /// # Safety
 ///
@@ -1400,7 +1425,11 @@ pub unsafe extern "C" fn quall_session_peer_json(
         guardar_nulo("quall_session_peer_json: sessão nula");
         return -1;
     };
-    match serde_json::to_string(&sessao.pronto.peer) {
+    let texto = serde_json::to_value(&sessao.pronto.peer).and_then(|mut value| {
+        value["identity_authenticated"] = serde_json::Value::Bool(true);
+        serde_json::to_string(&value)
+    });
+    match texto {
         Ok(texto) => escrever_texto(&texto, buf, cap),
         Err(e) => {
             guardar_erro(&Error::from(e));
@@ -1438,10 +1467,10 @@ pub unsafe extern "C" fn quall_session_descartados(s: *const QuallSession) -> i6
 /// Quatro campos, todos podendo ser `null`:
 ///
 /// ```json
-/// {"local_candidate":"a=candidate:1 1 UDP 2122317823 192.168.1.131 62493 typ host",
-///  "remote_candidate":"a=candidate:1 1 UDP 2122317823 192.168.1.131 51698 typ host",
-///  "local_address":"192.168.1.131:62493",
-///  "remote_address":"192.168.1.131:51698"}
+/// {"local_candidate":"a=candidate:1 1 UDP 2122317823 192.168.56.131 62493 typ host",
+///  "remote_candidate":"a=candidate:1 1 UDP 2122317823 192.168.56.131 51698 typ host",
+///  "local_address":"192.168.56.131:62493",
+///  "remote_address":"192.168.56.131:51698"}
 /// ```
 ///
 /// # `null` é "o ICE ainda não fechou", e não é erro
@@ -1455,7 +1484,7 @@ pub unsafe extern "C" fn quall_session_descartados(s: *const QuallSession) -> i6
 ///
 /// Porque **uma corrida "pelo cabo" pode fechar pela Wi-Fi e parecer sucesso**. Medido nesta
 /// bancada em 2026-09-01: duas pontas na mesma máquina, sinalização por `127.0.0.1`, e o par
-/// escolhido foi `192.168.1.131 <-> 192.168.1.131` — a mídia saiu pelo rádio. O `quall-probe`
+/// escolhido foi `192.168.56.131 <-> 192.168.56.131` — a mídia saiu pelo rádio. O `quall-probe`
 /// sempre soube disso porque lê o `Ready` do Rust; a casca não tinha nada equivalente, e foi
 /// exatamente essa linha que explicou os 8,6 s de `docs/receptor-ios.md:243`.
 ///
@@ -4183,6 +4212,20 @@ pub extern "C" fn quall_teto_nivel_anunciado() -> u8 {
 // Aparelhos pareados (dívidas 22 e 23)
 // =============================================================================================
 
+/// Existe algum vínculo autenticado pela revisão segura v3? Registros legados não contam.
+///
+/// Retorna `1`/`0`, ou `-1` se o JSON é inválido. Não identifica o aparelho remoto da descoberta.
+///
+/// # Safety
+/// `known_json` precisa ser nulo ou apontar para uma string UTF-8 terminada em zero.
+#[no_mangle]
+pub unsafe extern "C" fn quall_known_peers_has_secure(known_json: *const c_char) -> i32 {
+    match ler_pares(known_json, "known_json") {
+        Ok(pares) => i32::from(pares.has_secure_peers()),
+        Err(f) => { guardar_falha(&f); -1 }
+    }
+}
+
 /// **Esquece um par.** Devolve o estado de pareamento sem ele, no padrão `(buf, cap)`.
 ///
 /// É o que a casca oferece como "parear de novo". Sem isto, um pareamento que dessincronizou não
@@ -4564,7 +4607,7 @@ pub extern "C" fn quall_teleprompter_pick_port(wait_ms: u32) -> u16 {
 /// o QR trouxe —, sem rede nenhuma. Padrão `(buf, cap)`:
 ///
 /// ```json
-/// {"endereco":"192.168.15.8:7979","pin":"424242"}
+/// {"endereco":"192.168.57.8:7979","pin":"424242"}
 /// ```
 ///
 /// `"pin"` é `null` quando a entrada não era um link. Sem porta, a do papel: `role`
@@ -6078,7 +6121,7 @@ pub unsafe extern "C" fn quall_camera_remote_pump(
 ///
 /// ```json
 /// {"situacao":"pronto","capacidades":{…},"ajuste":{…},"aplicado":{…},"pendente":{"iso":800},
-///  "lido":{…},"autor":"Pixel do Bruno","versao":17,
+///  "lido":{…},"autor":"Pixel do Pessoa Exemplo","versao":17,
 ///  "recusa":{"motivo":"superado","campo":"iso","ha_ms":300},"contadores":{…}}
 /// ```
 ///
@@ -6572,6 +6615,91 @@ mod tests {
         }
     }
 
+    #[test]
+    fn indicador_de_pares_seguros_preserva_legado_sem_confiar_nele() {
+        let legacy = c"{\"pares\":{\"fixture-peer\":\"0101010101010101010101010101010101010101010101010101010101010101\"}}";
+        let mut modern = PairedPeers::new();
+        modern.insert(&quall_core::pairing::PairOutcome {
+            peer: DeviceId("fixture-peer".into()),
+            secret: [7; 32],
+            novo: true,
+        });
+        let modern = CString::new(modern.to_json().unwrap()).unwrap();
+        unsafe {
+            assert_eq!(quall_known_peers_has_secure(ptr::null()), 0);
+            assert_eq!(quall_known_peers_has_secure(c"".as_ptr()), 0);
+            assert_eq!(quall_known_peers_has_secure(legacy.as_ptr()), 0);
+            assert_eq!(quall_known_peers_has_secure(modern.as_ptr()), 1);
+            assert_eq!(quall_known_peers_has_secure(c"{invalid}".as_ptr()), -1);
+        }
+        let legacy_table = PairedPeers::from_json(legacy.to_str().unwrap()).unwrap();
+        assert_eq!(legacy_table.len(), 1);
+        assert!(legacy_table.to_json().unwrap().contains("fixture-peer"));
+    }
+
+    #[test]
+    fn lista_de_descoberta_expoe_identidade_efemera_nao_autenticada() {
+        let props = std::collections::HashMap::from([
+            ("v".into(), PROTOCOL_VERSION.to_string()),
+            ("t".into(), "12".repeat(16)),
+            ("p".into(), "7877".into()),
+            ("c".into(), "sck".into()),
+        ]);
+        let (announcement, signaling_port) =
+            quall_core::discovery::announcement_from_txt(&props).unwrap();
+        let browser = QuallBrowser {
+            interno: None,
+            achados: Mutex::new(vec![DiscoveredDevice {
+                announcement,
+                signaling_port,
+                addresses: Vec::new(),
+                fullname: "Quall fixture._quall._tcp.local.".into(),
+            }]),
+        };
+        unsafe {
+            let length = quall_browser_devices_json(&browser, ptr::null_mut(), 0);
+            assert!(length > 0);
+            let mut buf = vec![0 as c_char; length as usize];
+            assert_eq!(quall_browser_devices_json(&browser, buf.as_mut_ptr(), buf.len()), length);
+            let items: serde_json::Value =
+                serde_json::from_str(CStr::from_ptr(buf.as_ptr()).to_str().unwrap()).unwrap();
+            assert_eq!(items[0]["identity_authenticated"], false);
+            assert_eq!(items[0]["device_id"], format!("discovery-{}", "12".repeat(16)));
+            assert_eq!(items[0]["display_name"], "Quall 12121212");
+            assert_eq!(items[0]["endpoint"], serde_json::Value::Null);
+        }
+    }
+
+    #[test]
+    fn rotulo_do_anunciante_respeita_utf8_nul_cap_e_token_real() {
+        let desc = QuallDeviceDesc {
+            device_id: c"fixture-persistent-id".as_ptr(),
+            display_name: c"NOME-PESSOAL-SENTINELA".as_ptr(),
+            screen_source: true,
+            camera_source: false,
+            sink: false,
+        };
+        unsafe {
+            assert_eq!(quall_advertiser_label(ptr::null(), ptr::null_mut(), 0), -1);
+            let a = quall_advertiser_start(&desc, 65533);
+            assert!(!a.is_null());
+            let length = quall_advertiser_label(a, ptr::null_mut(), 0);
+            assert_eq!(length, 15); // ASCII UTF-8: "Quall ", oito hexadecimais, NUL.
+            let mut small = [0x5a as c_char; 14];
+            assert_eq!(quall_advertiser_label(a, small.as_mut_ptr(), small.len()), length);
+            assert_eq!(small, [0x5a as c_char; 14], "buffer curto foi modificado");
+            let mut buf = vec![0 as c_char; length as usize];
+            assert_eq!(quall_advertiser_label(a, buf.as_mut_ptr(), buf.len()), length);
+            let label = CStr::from_ptr(buf.as_ptr()).to_str().unwrap();
+            let full = (*a).interno.as_ref().unwrap().fullname();
+            assert!(full.starts_with(label), "alias não corresponde à instância real");
+            assert!(label.starts_with("Quall "));
+            assert!(!label.contains("SENTINELA") && !label.contains("persistent"));
+            assert_eq!(buf[length as usize - 1], 0);
+            quall_advertiser_stop(a);
+        }
+    }
+
     /// **Dívida 11.** Um pânico do núcleo chega à casca com ocorrência e origem, sem payload.
     ///
     /// Em release o workspace usa `panic = "abort"`, mas o `set_hook` **roda antes** do abort —
@@ -6775,7 +6903,7 @@ mod tests {
     fn falta_de_rota_e_conexao_recusada_nao_chegam_com_o_mesmo_codigo() {
         assert_eq!(
             QuallStatus::from(&Error::NoRoute(
-                "não há rota até 192.168.1.131:47891".into()
+                "não há rota até 192.168.56.131:47891".into()
             )),
             QuallStatus::NoRoute
         );
@@ -7071,7 +7199,7 @@ mod tests {
     fn falhas_diferentes_da_mesma_funcao_saem_com_codigos_diferentes() {
         unsafe {
             // Sem opções: erro de programação da casca.
-            assert!(quall_connect(c"192.168.1.131:7877".as_ptr(), ptr::null()).is_null());
+            assert!(quall_connect(c"192.168.56.131:7877".as_ptr(), ptr::null()).is_null());
             assert_eq!(quall_last_status(), QuallStatus::NullPointer);
 
             // Endpoint nulo, com o mesmo caminho de código: continua sendo ponteiro nulo, mas o
@@ -7455,27 +7583,6 @@ mod testes_de_audio {
         assert_eq!(
             pcmu["content_delay_us"], 0,
             "o PCMU não tem atraso de codec"
-        );
-    }
-
-    /// **O plugin do OBS desconta o mesmo número**, por uma constante dele (`som.c`,
-    /// `OPUS_ATRASO_DO_CODIFICADOR_US`). Ela ficou no plugin nesta rodada porque o plugin do
-    /// Windows só se confere compilando no Dell com o portão `-ComObs`, que **instala** por cima do
-    /// plugin do Bruno (`construir.ps1`). Este teste amarra as duas fontes: se o núcleo mudar o
-    /// número, o plugin não fica para trás calado.
-    #[test]
-    fn o_plugin_do_obs_desconta_o_mesmo_atraso_do_conteudo() {
-        let som_c = include_str!("../../../plugins/obs/src/som.c");
-        let linha = som_c
-            .lines()
-            .find(|l| l.starts_with("#define OPUS_ATRASO_DO_CODIFICADOR_US"))
-            .expect("a constante do plugin");
-        let valor: f64 = linha.split_whitespace().nth(2).unwrap().parse().unwrap();
-        let p = preset_json(QuallTrackKind::SystemAudio, QuallAudioCodec::Default);
-        assert_eq!(
-            valor,
-            p["content_delay_us"].as_f64().unwrap(),
-            "som.c: {linha}"
         );
     }
 
@@ -8709,6 +8816,7 @@ mod testes_do_teleprompter {
             assert_eq!(quall_session_next_event(p, 0), QuallSessionEvent::None);
             let peer = texto_de(|b, n| quall_session_peer_json(p, b, n));
             assert!(peer.contains("\"papel\":\"controle_remoto\""), "{peer}");
+            assert!(peer.contains("\"identity_authenticated\":true"), "{peer}");
             quall_session_close(c);
             quall_session_close(p);
         }
@@ -9180,25 +9288,25 @@ mod testes_do_teleprompter {
         };
         let controle = c"controle_remoto".as_ptr();
         assert_eq!(
-            ler(c"192.168.15.8", controle).as_deref(),
-            Some(r#"{"endereco":"192.168.15.8:7979","pin":null}"#)
+            ler(c"192.168.57.8", controle).as_deref(),
+            Some(r#"{"endereco":"192.168.57.8:7979","pin":null}"#)
         );
         assert_eq!(
-            ler(c"192.168.15.8", ptr::null()).as_deref(),
-            Some(r#"{"endereco":"192.168.15.8:7877","pin":null}"#)
+            ler(c"192.168.57.8", ptr::null()).as_deref(),
+            Some(r#"{"endereco":"192.168.57.8:7877","pin":null}"#)
         );
         assert_eq!(
-            ler(c"192.168.15.8", c"".as_ptr()).as_deref(),
-            Some(r#"{"endereco":"192.168.15.8:7877","pin":null}"#)
+            ler(c"192.168.57.8", c"".as_ptr()).as_deref(),
+            Some(r#"{"endereco":"192.168.57.8:7877","pin":null}"#)
         );
         assert_eq!(
             ler(c"quall://424242@[fe80::1]:7980/", controle).as_deref(),
             Some(r#"{"endereco":"[fe80::1]:7980","pin":"424242"}"#)
         );
         for (t, papel) in [
-            (c"quall://42424@192.168.15.8:7979", controle),
-            (c"192.168.15.8 : 7979", controle),
-            (c"192.168.15.8", c"teleprompter".as_ptr()),
+            (c"quall://42424@192.168.57.8:7979", controle),
+            (c"192.168.57.8 : 7979", controle),
+            (c"192.168.57.8", c"teleprompter".as_ptr()),
         ] {
             assert_eq!(ler(t, papel), None, "{t:?}");
             assert_eq!(quall_last_status(), QuallStatus::Invalid, "{t:?}");

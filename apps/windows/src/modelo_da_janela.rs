@@ -428,6 +428,7 @@ pub struct LinhaDeReceptor {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TelaVarios {
+    pub nome_da_espera: String,
     pub receptores: Vec<LinhaDeReceptor>,
     /// PIN e endereço da espera aberta para mais um.
     pub mais_um: Option<(String, String)>,
@@ -561,6 +562,11 @@ fn aviso_do_espelhar(e: &EstadoDaTela) -> Option<Aviso> {
 // =============================================================================================
 // As frases
 // =============================================================================================
+
+/// A label from a previous wait must never be shown next to the next wait's PIN/address.
+pub fn rotulo_da_espera(porta: Option<u16>, anunciado: Option<&(u16, String)>) -> Option<&str> {
+    anunciado.filter(|(p, nome)| Some(*p) == porta && !nome.is_empty()).map(|(_, nome)| nome.as_str())
+}
 
 /// A instrução da espera (§6.4 com a emenda da §11.5): o nome e "Exibir" em destaque, e a origem.
 pub fn instrucao_da_espera(e: &TelaEspera) -> Vec<Trecho> {
@@ -770,7 +776,7 @@ fn barra(q: &mut Quadro, e: &EstadoDaTela) {
     if let Some(s) = &e.sessao {
         q.mais(texto(lugar::NOTA_DA_SESSAO, s.nota.clone(), F_LEGENDA, TEXTO3).quebra().item());
     }
-    q.mais(texto(lugar::NOME_ROTULO, t("Este computador aparece como"), F_LEGENDA_11, TEXTO3).meio().item());
+    q.mais(texto(lugar::NOME_ROTULO, t("Nome deste computador"), F_LEGENDA_11, TEXTO3).meio().item());
     q.mais(texto(lugar::NOME, e.nome_do_aparelho.clone(), F_CORPO_FORTE, TEXTO).meio().item());
     q.controle(Controle::Item(Painel::Ajustes), lugar::ITEM_AJUSTES);
 }
@@ -787,7 +793,7 @@ fn painel_espelhar(q: &mut Quadro, e: &EstadoDaTela) {
     #[cfg(not(feature = "tela-estendida-futura"))]
     let explicacao = t("Uma tela existente ou uma câmera. Quem exibe escolhe este computador na lista.");
     let _ = explicacao;
-    cabecalho(q, t("Estender a área de trabalho"), t("Crie um monitor novo para cada aparelho conectado. No outro aparelho, escolha Exibir."));
+    cabecalho(q, t("Estender a área de trabalho"), t("Até 8 aparelhos, cada um com um monitor. No outro aparelho, escolha Exibir."));
     let com_interruptor = s.alguma_escolhida;
     let aviso_ = aviso_do_espelhar(e);
     let altura_do_aviso = aviso_.as_ref().map(|a| altura_do_aviso(&a.texto, lugar::L));
@@ -979,7 +985,7 @@ fn frase_do_driver(e: &EstadoDaTela) -> (Tom, String) {
 fn cena_esperando(q: &mut Quadro, e: &EstadoDaTela) {
     let s = &e.espera;
     q.mais(Item::Pilula { ancora: Ancora::Centro(lugar::CX), y: lugar::PILULA_Y, luz: Luz::Aguardando, texto: t("Aguardando").into() });
-    q.mais(texto(lugar::TITULO_DA_SESSAO, t("Pronto para espelhar"), F_TITULO_GRANDE, TEXTO).centro().meio().item());
+    q.mais(texto(lugar::TITULO_DA_SESSAO, t("Pronto para estender"), F_TITULO_GRANDE, TEXTO).centro().meio().item());
     q.mais(rico(lugar::INSTRUCAO, instrucao_da_espera(s), F_CORPO, TEXTO2).centro().quebra().item());
     let chip_l = largura_do_chip(&s.endereco);
     if !s.ha_pares {
@@ -1063,7 +1069,7 @@ fn controles_da_camera(q: &mut Quadro, c: &ControlesDaCamera) {
 fn cena_no_ar(q: &mut Quadro, e: &EstadoDaTela) {
     let s = &e.no_ar;
     q.mais(Item::Pilula { ancora: Ancora::Esquerda(lugar::X), y: lugar::PILULA_Y, luz: Luz::NoAr, texto: t("No ar").into() });
-    q.mais(texto(lugar::ESPELHANDO_PARA, t("Espelhando para"), F_CORPO, TEXTO2).meio().item());
+    q.mais(texto(lugar::ESPELHANDO_PARA, t("Estendendo para"), F_CORPO, TEXTO2).meio().item());
     let par = if s.par.is_empty() { t("o outro aparelho").to_string() } else { s.par.clone() };
     q.mais(texto(lugar::PAR, par, F_PAR, TEXTO).meio().item());
     let cartoes = lugar::cartoes_de_numero();
@@ -1088,7 +1094,7 @@ fn cena_varios(q: &mut Quadro, e: &EstadoDaTela) {
     let s = &e.varios;
     q.mais(Item::Pilula { ancora: Ancora::Esquerda(lugar::X), y: lugar::PILULA_Y, luz: Luz::NoAr, texto: t("No ar").into() });
     let n = s.receptores.len();
-    let titulo_ = if n == 1 { t("Espelhando para 1 aparelho").to_string() } else { tf("Espelhando para {} aparelhos", &[&n]) };
+    let titulo_ = if n == 1 { t("Estendendo para 1 aparelho").to_string() } else { tf("Estendendo para {} aparelhos", &[&n]) };
     q.mais(texto(lugar::TITULO_DOS_VARIOS, titulo_, F_TITULO, TEXTO).meio().item());
     let linhas = lugar::linhas_dos_varios(n.min(MAX_RECEPTORES));
     for (r, x) in linhas.iter().zip(&s.receptores) {
@@ -1119,7 +1125,14 @@ fn cena_varios(q: &mut Quadro, e: &EstadoDaTela) {
     let valor = Ret::new(c.x + 16.0, c.y + 30.0, c.l - 32.0, 24.0);
     match &s.mais_um {
         Some((pin, endereco)) => q.mais(
-            rico(valor, vec![Trecho::simples("PIN "), Trecho::mono(pin_em_grupos(pin)), Trecho::simples("  ·  "), Trecho::mono(endereco.clone())], F_ENDERECO, TEXTO)
+            rico(valor, {
+                let mut partes = vec![Trecho::simples("PIN "), Trecho::mono(pin_em_grupos(pin))];
+                if !s.nome_da_espera.is_empty() {
+                    partes.extend([Trecho::simples("  ·  "), Trecho::forte(s.nome_da_espera.clone())]);
+                }
+                partes.extend([Trecho::simples("  ·  "), Trecho::mono(endereco.clone())]);
+                partes
+            }, F_ENDERECO, TEXTO)
                 .meio()
                 .item(),
         ),
@@ -1135,7 +1148,7 @@ fn cena_conectando(q: &mut Quadro, e: &EstadoDaTela) {
     q.mais(
         texto(
             lugar::PARAGRAFO_DA_CONEXAO,
-            t("O outro aparelho precisa já ter clicado em Espelhar: quem exibe só entra depois de quem transmite estar esperando."),
+            t("O outro aparelho precisa já ter clicado em Estender: quem exibe só entra depois de quem transmite estar esperando."),
             F_CORPO,
             TEXTO2,
         )
@@ -1599,7 +1612,7 @@ fn sessao_de_exemplo(item: Painel, luz: Luz, rotulo: &str) -> Option<SessaoNaBar
 }
 
 /// A nota da barra com uma sessão de pé (as mesmas da janela).
-pub const NOTA_DO_EMISSOR: &str = "Um papel por vez. Pare de espelhar para usar os outros."; // i18n: chave
+pub const NOTA_DO_EMISSOR: &str = "Pare de estender para exibir outra tela ou abrir os Ajustes."; // i18n: chave
 pub const NOTA_DO_RECEPTOR: &str = "Um papel por vez. Pare de exibir para usar os outros."; // i18n: chave
 
 /// **Os estados de exemplo**, um por tela e estado da §7 (nome do arquivo, estado).
@@ -1698,6 +1711,7 @@ pub fn exemplos() -> Vec<(&'static str, EstadoDaTela)> {
 
     let mut e = EstadoDaTela { cena: Cena::Varios, painel: Painel::Espelhar, sessao: sessao_de_exemplo(Painel::Espelhar, Luz::NoAr, t("Espelhando")), ..b.clone() };
     e.varios = TelaVarios {
+        nome_da_espera: "Quall 12ab34cd".into(), // i18n: fora (ephemeral example label)
         receptores: vec![
             LinhaDeReceptor { nome: "iPad do Bruno".into(), monitor: "2360 × 1640, índice 1".into(), resumo: "912 quadros · 1 IDR · 3,9 ms".into() }, // i18n: fora (dados de exemplo)
             LinhaDeReceptor { nome: "iPhone X".into(), monitor: "2436 × 1124, índice 2".into(), resumo: "905 quadros · 1 IDR · 4,1 ms".into() }, // i18n: fora (dados de exemplo)
@@ -1752,6 +1766,17 @@ pub fn marcado_no_exemplo(c: Controle, e: &EstadoDaTela) -> bool {
 #[cfg(test)]
 mod testes {
     use super::*;
+
+    #[test]
+    fn a_instrucao_usa_apenas_o_rotulo_do_anuncio_da_espera_atual() {
+        let anterior = (40000, "Quall a1b2c3d4".to_string());
+        let atual = (40001, "Quall b2c3d4e5".to_string());
+        assert_eq!(rotulo_da_espera(Some(40000), Some(&anterior)), Some("Quall a1b2c3d4"));
+        assert_eq!(rotulo_da_espera(Some(40001), Some(&anterior)), None, "a espera mudou antes do anúncio");
+        assert_eq!(rotulo_da_espera(Some(40001), Some(&atual)), Some("Quall b2c3d4e5"));
+        assert_eq!(rotulo_da_espera(None, Some(&atual)), None, "no limite de oito não há espera");
+        assert_eq!(rotulo_da_espera(Some(40001), None), None, "multicast bloqueado usa endereço");
+    }
 
     #[test]
     fn privacidade_e_suporte_seguem_o_idioma_e_ficam_nos_ajustes() {

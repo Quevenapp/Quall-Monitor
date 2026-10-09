@@ -224,6 +224,7 @@ pub mod instancia;
 pub mod estilo;
 /// A tradução EN/PT (02/10): a tabela português → inglês e o idioma de agora.
 pub mod idioma;
+pub mod opcoes_do_monitor;
 pub mod modelo_da_janela;
 // **A tela estendida no produto** (R10, 02/10): o SudoVDA que a pessoa instalar, detectado e nunca
 // embutido. As regras (o ladrilho apagado, quem espelha) são puras, testadas em qualquer máquina.

@@ -158,12 +158,12 @@ pub fn pares_conhecidos() -> PairedPeers {
     }
 }
 
-/// Existe **algum** par salvo?
+/// Existe algum par v3 que pode retomar sem PIN? Legacy records need a new pairing.
 ///
 /// `docs/ux-m6.md` §1.2: é este estado, e não "reconheço quem está chegando agora", que decide a
 /// manchete da tela de espera. A casca não tem como saber a segunda coisa antes de alguém tentar.
 pub fn ha_pares_conhecidos() -> bool {
-    !pares_conhecidos().is_empty()
+    pares_conhecidos().has_secure_peers()
 }
 
 /// Junta `novos` ao que está no disco e grava.

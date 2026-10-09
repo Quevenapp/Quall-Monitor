@@ -1,76 +1,111 @@
-//! Pareamento por PIN — uma vez por par de aparelhos, nunca por sessão.
+//! Pareamento v3 por OPAQUE-3DH (RFC 9807), seguido de confirmação bilateral
+//! cifrada. Nenhuma identidade persistente participa das mensagens públicas.
 //!
-//! Sem conta, sem login: o vínculo é entre dois [`DeviceId`] e é o que dispensa o segundo
-//! pareamento. O QR code do M6 vai carregar exatamente o mesmo PIN, só que sem digitação.
-//!
-//! # Por que não é só "manda o PIN e compara"
-//!
-//! Um PIN de seis dígitos tem cerca de 20 bits. Se a confirmação fosse `HMAC(pin, transcrição)`,
-//! qualquer um na LAN capturaria a mensagem e testaria os 10⁶ PINs **offline**, em menos de um
-//! segundo — e com o PIN na mão derivaria o segredo de longo prazo, que é o que dispensa o
-//! pareamento seguinte. O ataque não é teórico: a sinalização é HTTP simples numa LAN que pode
-//! ter um convidado no mesmo Wi-Fi.
-//!
-//! Por isso a chave de confirmação sai de **X25519 mais o PIN**, não do PIN sozinho:
-//!
-//! ```text
-//! ikm       = X25519(sk_meu, pk_dele) || pin
-//! prk       = HKDF-Extract(salt = transcrição, ikm)
-//! confirmar = HKDF-Expand(prk, "quall/pair/confirm/v1", 32)
-//! segredo   = HKDF-Expand(prk, "quall/pair/secret/v1",  32)
-//! ```
-//!
-//! Um bisbilhoteiro passivo não tem o segredo X25519, então adivinhar o PIN não lhe dá nada.
-//! Um atacante ativo, no meio da sinalização, tem **uma** tentativa: se errar o PIN, o MAC não
-//! confere, a conexão morre e o emissor gera outro PIN. A chance é 1 em 10⁶ por tentativa.
-//!
-//! O segredo de longo prazo **nunca trafega**: os dois lados derivam o mesmo valor da mesma
-//! transcrição. Não há transporte de chave para interceptar.
-//!
-//! # O que este módulo ainda não faz
-//!
-//! A transcrição não inclui a *fingerprint* DTLS do SDP. Enquanto o pareamento acontece antes da
-//! oferta, e o mesmo canal WebSocket carrega os dois, um atacante que já esteja no meio da
-//! sinalização é detectado no pareamento — mas amarrar as duas coisas explicitamente é mais
-//! forte, e é o que fecha o caso quando a sinalização passar a aceitar reconexão. Anotado como
-//! dívida, não como pronto.
-//!
-//! [`DeviceId`]: crate::protocol::DeviceId
-
-use std::collections::HashMap;
-
-use hkdf::Hkdf;
-use hmac::{Hmac, Mac};
-use serde::{Deserialize, Serialize};
-use sha2::Sha256;
-use subtle::ConstantTimeEq;
-use x25519_dalek::{PublicKey, StaticSecret};
+//! O registro OPAQUE é criado localmente no Host, que já conhece o PIN/segredo;
+//! só o login atravessa a LAN. A biblioteca tem avaliação histórica de 2021,
+//! que não equivale a auditoria desta versão ou desta composição.
+//! PIN curto continua exigindo limite online por espera, inclusive quando um
+//! candidato fecha depois de receber KE2. O protocolo antigo DH+PIN não é PAKE
+//! e não é aceito como fallback. Vínculos antigos são preservados para novo PIN.
 
 use crate::error::{hex_decode, hex_encode, Error, Result};
-use crate::protocol::{DeviceId, PROTOCOL_VERSION};
+use crate::protocol::DeviceId;
+use crate::secure_channel::{SecureChannel, SECURE_VERSION};
+use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
+use opaque_ke::{
+    CipherSuite, ClientLogin, ClientLoginFinishParameters, ClientRegistration,
+    ClientRegistrationFinishParameters, CredentialFinalization, CredentialRequest,
+    CredentialResponse, Identifiers, ServerLogin, ServerLoginParameters, ServerRegistration,
+    ServerSetup,
+};
+use rand::rngs::OsRng;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256, Sha512};
+use std::collections::HashMap;
+use std::sync::Mutex;
+use subtle::ConstantTimeEq;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 type HmacSha256 = Hmac<Sha256>;
-
-/// Quantos dígitos o usuário digita. Seis é o limite do que se lê de uma tela e se digita em
-/// outra sem errar; a segurança vem do X25519, não do tamanho do PIN.
 pub const PIN_DIGITS: usize = 6;
-
-/// Tamanho do segredo de longo prazo guardado por par de aparelhos.
 pub const PAIR_SECRET_LEN: usize = 32;
-
 const NONCE_LEN: usize = 16;
-const MAC_LEN: usize = 32;
+const RESUME_SLOTS: usize = 128;
+const MAX_HANDSHAKE_HEX: usize = 8192;
+const MAX_ID_LEN: usize = 256;
 
-const ROTULO_CONFIRMAR: &[u8] = b"quall/pair/confirm/v1";
-const ROTULO_SEGREDO: &[u8] = b"quall/pair/secret/v1";
-const ROTULO_TRANSCRICAO: &[u8] = b"quall/pair/transcript/v1";
-const ROTULO_RETOMADA: &[u8] = b"quall/pair/resume/v1";
+struct Suite;
+impl CipherSuite for Suite {
+    type OprfCs = opaque_ke::Ristretto255;
+    type KeyExchange = opaque_ke::TripleDh<opaque_ke::Ristretto255, Sha512>;
+    type Ksf = ModeKsf;
+}
+
+// Somente uma área de Argon2 por processo, inclusive entre hosts paralelos.
+// Não há redução negociável de parâmetros e poison falha fechado.
+static ARGON2_GATE: Mutex<()> = Mutex::new(());
+#[derive(Default)]
+enum ModeKsf {
+    #[default]
+    Pin,
+    Resume,
+}
+impl opaque_ke::ksf::Ksf for ModeKsf {
+    fn hash<L: opaque_ke::generic_array::ArrayLength<u8>>(
+        &self,
+        input: opaque_ke::generic_array::GenericArray<u8, L>,
+    ) -> std::result::Result<
+        opaque_ke::generic_array::GenericArray<u8, L>,
+        opaque_ke::errors::InternalError,
+    > {
+        use opaque_ke::errors::InternalError;
+        match self {
+            Self::Resume => opaque_ke::ksf::Identity.hash(input),
+            Self::Pin => {
+                let _guard = ARGON2_GATE.lock().map_err(|_| InternalError::KsfError)?;
+                let input = Zeroizing::new(input);
+                let params = argon2::Params::new(19 * 1024, 2, 1, None)
+                    .map_err(|_| InternalError::KsfError)?;
+                let argon = argon2::Argon2::new(
+                    argon2::Algorithm::Argon2id,
+                    argon2::Version::V0x13,
+                    params,
+                );
+                let mut blocks = Vec::new();
+                blocks
+                    .try_reserve_exact(19 * 1024)
+                    .map_err(|_| InternalError::KsfError)?;
+                blocks.resize(19 * 1024, argon2::Block::default());
+                let mut blocks = Zeroizing::new(blocks);
+                let mut output = Zeroizing::new(opaque_ke::generic_array::GenericArray::default());
+                argon
+                    .hash_password_into_with_memory(
+                        &input,
+                        &[0; argon2::RECOMMENDED_SALT_LEN],
+                        &mut output,
+                        blocks.as_mut_slice(),
+                    )
+                    .map_err(|_| InternalError::KsfError)?;
+                Ok((*output).clone())
+            }
+        }
+    }
+}
+impl PairMode {
+    fn ksf(self) -> ModeKsf {
+        match self {
+            Self::Pin => ModeKsf::Pin,
+            Self::Resume => ModeKsf::Resume,
+        }
+    }
+}
 
 /// PIN mostrado pelo emissor e digitado no receptor.
 ///
 /// Guarda os dígitos, não o texto: `"012345"` e `"12345"` são coisas diferentes e confundir os
 /// dois é o tipo de bug que só aparece um em dez pareamentos.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct Pin([u8; PIN_DIGITS]);
 
 impl Pin {
@@ -126,8 +161,8 @@ impl Pin {
         self.0.iter().map(|d| (b'0' + d) as char).collect()
     }
 
-    fn bytes(&self) -> [u8; PIN_DIGITS] {
-        self.0
+    fn bytes(&self) -> Zeroizing<[u8; PIN_DIGITS]> {
+        Zeroizing::new(self.0)
     }
 }
 
@@ -138,127 +173,103 @@ impl core::fmt::Debug for Pin {
     }
 }
 
-/// Papel na troca. Quem hospeda a sinalização mostra o PIN; quem conecta digita.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
-    /// Hospeda a sinalização e mostra o PIN na tela.
     Host,
-    /// Conecta e digita o PIN.
     Guest,
 }
 
-impl Role {
-    fn tag(self) -> u8 {
+#[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
+pub struct KnownPeer {
+    #[zeroize(skip)]
+    pub id: DeviceId,
+    pub secret: [u8; PAIR_SECRET_LEN],
+}
+impl core::fmt::Debug for KnownPeer {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("KnownPeer([oculto])")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PairMode {
+    Pin,
+    Resume,
+}
+impl PairMode {
+    fn code(self) -> u8 {
         match self {
-            Role::Host => b'H',
-            Role::Guest => b'G',
+            Self::Pin => 0,
+            Self::Resume => 1,
         }
     }
 }
 
-/// Par já conhecido: quem é e qual o segredo guardado para ele.
-#[derive(Clone, PartialEq, Eq)]
-pub struct KnownPeer {
-    pub id: DeviceId,
-    pub secret: [u8; PAIR_SECRET_LEN],
-}
-
-impl core::fmt::Debug for KnownPeer {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("KnownPeer")
-            .field("id", &"[oculto]")
-            .field("secret", &"[oculto]")
-            .finish()
-    }
-}
-
-/// Mensagens do pareamento, transportadas dentro da sinalização.
-///
-/// Bytes viajam em hex porque a sinalização é JSON, e porque assim dá para acompanhar a troca
-/// com um cliente WebSocket qualquer quando algo não fecha na bancada.
+/// Mensagens públicas contêm material PAKE/aleatório. A identidade nas duas
+/// confirmações está dentro de AEAD, com counters que são transferidos ao Link.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "p", rename_all = "snake_case")]
+#[serde(tag = "p", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PairFrame {
-    /// Convidado abre: quem sou eu, minha chave efêmera, meu nonce.
+    Probe {
+        version: u16,
+        guest_nonce: String,
+        guest_role: u8,
+    },
+    Challenge {
+        version: u16,
+        token: String,
+        host_nonce: String,
+        host_role: u8,
+        resume_hints: Vec<String>,
+    },
     Hello {
-        device_id: DeviceId,
-        public_key: String,
-        nonce: String,
+        mode: PairMode,
+        hint: Option<String>,
+        ke1: String,
     },
-    /// Anfitrião responde com os dele.
     Ack {
-        device_id: DeviceId,
-        public_key: String,
-        nonce: String,
+        ke2: String,
     },
-    /// Convidado prova que sabe o PIN.
-    Confirm { mac: String },
-    /// Anfitrião prova de volta. Só depois disso o convidado guarda o segredo.
-    ConfirmAck { mac: String },
-
-    /// Já pareado: convidado pede para retomar sem PIN.
-    Resume { device_id: DeviceId, nonce: String },
-    /// Anfitrião desafia com o segredo guardado.
-    ResumeChallenge { nonce: String, mac: String },
-    /// Convidado responde ao desafio.
-    ResumeProof { mac: String },
-    /// Anfitrião aceita.
-    Ok,
-
-    /// **Não reconheço este aparelho: comece de novo pelo PIN.** (dívida 22)
-    ///
-    /// É a diferença entre um beco sem saída e uma segunda chance. Antes, um [`PairFrame::Resume`]
-    /// de aparelho desconhecido morria em "aparelho não está pareado aqui" e a conexão caía — o
-    /// usuário via "funcionou ontem, hoje não funciona" sem nenhuma forma de digitar o PIN outra
-    /// vez. Agora o anfitrião convida a recomeçar, na **mesma** conexão.
-    ///
-    /// Não é uma tentativa a mais contra o PIN: quem recebe isto ainda não provou nada, e o
-    /// caminho do PIN que vem a seguir continua valendo uma tentativa por conexão.
+    Confirm {
+        ke3: String,
+        identity_ciphertext: String,
+    },
+    ConfirmAck {
+        identity_ciphertext: String,
+    },
     NeedsPin,
-
-    /// Recusa, com motivo legível.
-    Fail { motivo: String },
+    Fail {
+        motivo: String,
+    },
 }
-
-// Debug é diagnóstico, não exportação do quadro de autenticação. Mesmo chave pública,
-// nonce/prova e texto recebido do par não precisam aparecer num diário do produto.
 impl core::fmt::Debug for PairFrame {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let tipo = match self {
+        f.write_str(match self {
+            Self::Probe { .. } => "Probe",
+            Self::Challenge { .. } => "Challenge",
             Self::Hello { .. } => "Hello",
             Self::Ack { .. } => "Ack",
             Self::Confirm { .. } => "Confirm",
             Self::ConfirmAck { .. } => "ConfirmAck",
-            Self::Resume { .. } => "Resume",
-            Self::ResumeChallenge { .. } => "ResumeChallenge",
-            Self::ResumeProof { .. } => "ResumeProof",
-            Self::Ok => "Ok",
             Self::NeedsPin => "NeedsPin",
             Self::Fail { .. } => "Fail",
-        };
-        f.write_str(tipo)
+        })
     }
 }
 
-/// Resultado de um passo da máquina de estados.
 #[derive(Debug)]
 pub struct Step {
-    /// O que mandar para a outra ponta, se houver.
     pub reply: Option<PairFrame>,
-    /// Se o pareamento terminou com sucesso, o segredo do par e quem é o par.
     pub done: Option<PairOutcome>,
 }
-
-/// O que sobra de um pareamento bem-sucedido.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct PairOutcome {
+    #[zeroize(skip)]
     pub peer: DeviceId,
-    /// Segredo de longo prazo. A casca persiste; o núcleo não escreve em disco.
     pub secret: [u8; PAIR_SECRET_LEN],
-    /// `true` quando este pareamento nasceu de um PIN, `false` quando foi retomada.
     pub novo: bool,
 }
-
 impl core::fmt::Debug for PairOutcome {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PairOutcome")
@@ -269,511 +280,595 @@ impl core::fmt::Debug for PairOutcome {
     }
 }
 
-/// Máquina de estados do pareamento, sem rede e sem relógio — por isso testável inteira.
-///
-/// Um lado é `Host`, o outro é `Guest`. Quem chama alimenta [`Pairing::step`] com o que chegou
-/// e manda o que sair. Uma falha aqui derruba a sinalização: pareamento é uma tentativa só, e
-/// deixar tentar de novo na mesma conexão transformaria 1 em 10⁶ em força bruta.
+#[derive(Clone)]
+struct Context {
+    token: [u8; NONCE_LEN],
+    guest_nonce: [u8; NONCE_LEN],
+    host_nonce: [u8; NONCE_LEN],
+    guest_role: u8,
+    host_role: u8,
+}
+impl Context {
+    fn bytes(&self, mode: Option<PairMode>) -> Vec<u8> {
+        let mut b = b"quall/opaque-3dh-ristretto255-sha512/v3".to_vec();
+        b.extend_from_slice(&SECURE_VERSION.to_le_bytes());
+        b.extend_from_slice(&[self.guest_role, self.host_role]);
+        b.extend_from_slice(&self.token);
+        b.extend_from_slice(&self.guest_nonce);
+        b.extend_from_slice(&self.host_nonce);
+        if let Some(mode) = mode {
+            b.push(mode.code());
+            b.extend_from_slice(match mode {
+                PairMode::Pin => b"ksf=argon2id-v19-m19456-t2-p1".as_slice(),
+                PairMode::Resume => b"ksf=identity-secret32-v3".as_slice(),
+            });
+        }
+        b
+    }
+}
+
+enum State {
+    Initial,
+    GuestChallenge,
+    HostHello,
+    GuestAck(ClientLogin<Suite>),
+    HostConfirm(ServerLogin<Suite>),
+    GuestConfirmAck,
+    Done,
+    Failed,
+}
+
+/// Máquina sem I/O. A aplicação deve consumir a tentativa após KE1 aceito,
+/// impor deadline/teto de conexões e encerrar em qualquer erro de autenticação.
 pub struct Pairing {
     role: Role,
     eu: DeviceId,
     pin: Option<Pin>,
-    /// Par já guardado, quando existe. É o que habilita a retomada sem PIN.
-    conhecido: Option<KnownPeer>,
-    sk: StaticSecret,
-    pk: PublicKey,
+    known: Vec<KnownPeer>,
+    selected: Option<KnownPeer>,
+    password: Option<Zeroizing<Vec<u8>>>,
+    local_role: Option<u8>,
     nonce: [u8; NONCE_LEN],
-    estado: Estado,
+    token: [u8; NONCE_LEN],
+    context: Option<Context>,
+    mode: Option<PairMode>,
+    state: State,
+    channel: Option<SecureChannel>,
+    pair_secret: Zeroizing<[u8; PAIR_SECRET_LEN]>,
+    attempted: bool,
 }
-
-#[derive(Debug, PartialEq, Eq)]
-enum Estado {
-    Inicio,
-    /// Convidado mandou `Hello` e espera `Ack`.
-    EsperandoAck,
-    /// Anfitrião mandou `Ack` e espera `Confirm`.
-    EsperandoConfirm {
-        chave: Chaves,
-        par: DeviceId,
-    },
-    /// Convidado mandou `Confirm` e espera `ConfirmAck`.
-    EsperandoConfirmAck {
-        chave: Chaves,
-        par: DeviceId,
-    },
-    /// Convidado mandou `Resume` e espera o desafio.
-    EsperandoDesafio,
-    /// Anfitrião mandou o desafio e espera a prova.
-    EsperandoProva {
-        par: DeviceId,
-        segredo: [u8; PAIR_SECRET_LEN],
-        nonce_guest: [u8; NONCE_LEN],
-        nonce_host: [u8; NONCE_LEN],
-    },
-    /// Convidado mandou a prova e espera o `Ok`.
-    EsperandoOk {
-        par: DeviceId,
-        segredo: [u8; PAIR_SECRET_LEN],
-    },
-    Pronto,
-    Falhou,
-}
-
-#[derive(PartialEq, Eq)]
-struct Chaves {
-    confirmar: [u8; 32],
-    segredo: [u8; PAIR_SECRET_LEN],
-    transcricao: Vec<u8>,
-}
-
-impl core::fmt::Debug for Chaves {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("Chaves([oculto])")
-    }
-}
-
 impl Pairing {
-    /// Cria a máquina de estados.
-    ///
-    /// `pin` é obrigatório quando não há segredo guardado; com segredo, ele é ignorado e a
-    /// troca vira retomada. `conhecido` é o que a casca leu do disco para este par — no lado
-    /// anfitrião, o `DeviceId` do par só é conhecido quando o `Hello` chega, então passe a
-    /// tabela inteira por [`Pairing::with_store`].
     pub fn new(
         role: Role,
         eu: DeviceId,
         pin: Option<Pin>,
         conhecido: Option<KnownPeer>,
     ) -> Result<Self> {
-        let mut semente = [0u8; 32];
-        getrandom::fill(&mut semente)
-            .map_err(|e| Error::Pairing(format!("sem entropia do sistema: {e}")))?;
-        let sk = StaticSecret::from(semente);
-        let pk = PublicKey::from(&sk);
-
-        let mut nonce = [0u8; NONCE_LEN];
-        getrandom::fill(&mut nonce)
-            .map_err(|e| Error::Pairing(format!("sem entropia do sistema: {e}")))?;
-
-        Ok(Pairing {
+        validate_id(&eu)?;
+        Ok(Self {
             role,
             eu,
             pin,
-            conhecido,
-            sk,
-            pk,
-            nonce,
-            estado: Estado::Inicio,
+            known: conhecido.into_iter().collect(),
+            selected: None,
+            password: None,
+            local_role: None,
+            nonce: random()?,
+            token: random()?,
+            context: None,
+            mode: None,
+            state: State::Initial,
+            channel: None,
+            pair_secret: Zeroizing::new([0; PAIR_SECRET_LEN]),
+            attempted: false,
         })
     }
-
-    /// Primeira mensagem, que só o `Guest` manda. O `Host` fica esperando.
-    pub fn open(&mut self) -> Result<PairFrame> {
-        if self.role != Role::Guest {
-            return Err(Error::Pairing("só o convidado abre o pareamento".into()));
-        }
-        if self.estado != Estado::Inicio {
-            return Err(Error::Pairing("pareamento já começou".into()));
-        }
-        // **PIN digitado tem precedência sobre a retomada, e isso é o conserto de um beco sem
-        // saída medido em 31/08/2026.**
-        //
-        // Antes, a existência de um segredo guardado decidia sozinha: havia segredo, retomava, e o
-        // PIN nunca era olhado. Isso mata o par para sempre quando os dois lados **discordam** do
-        // segredo — cada um tem um, e são diferentes. O convidado recebe um `ResumeChallenge` com
-        // MAC que não confere, cai em "o aparelho do outro lado não é o que foi pareado", e a
-        // conexão morre. Com o PIN certo na mão e sem nenhum efeito, porque este `if` nunca chegava
-        // nele.
-        //
-        // Acontece de verdade e não é caso de laboratório: o receptor guarda **um** segredo por
-        // par, então espelhar do PC, depois do celular, e voltar para o PC basta. Foi assim que
-        // isto apareceu — o iPad guardou o segredo do pareamento com o Dell e o Android de bancada
-        // ainda tinha o antigo. A dívida 22 já tinha consertado a **outra** metade do beco ("o
-        // anfitrião não me conhece", que vira convite a recomeçar); esta é a metade que faltava:
-        // "nós dois nos conhecemos e discordamos".
-        //
-        // **Não é enfraquecimento.** O PIN só está aqui porque uma pessoa o digitou nesta
-        // tentativa, olhando para a tela do outro aparelho: digitar o PIN *é* dizer "pareie agora".
-        // O caminho contrário — MAC de retomada inválido virar convite a digitar PIN — continua
-        // proibido de propósito, e tem teste que falha se alguém o abrir
-        // (`mac_de_retomada_invalido_continua_sendo_recusa_e_nao_convite`): lá quem falha é o outro
-        // lado, aqui quem decide é o dono do aparelho.
-        //
-        // Custo: uma reconexão que carregue um PIN antigo num campo de texto vira pareamento novo
-        // em vez de retomada — um aperto de mão a mais, medido em ~94 ms (1502 contra 1408 ms), e
-        // nenhuma perda de função.
-        if self.pin.is_some() {
-            self.estado = Estado::EsperandoAck;
-            return Ok(PairFrame::Hello {
-                device_id: self.eu.clone(),
-                public_key: hex_encode(self.pk.as_bytes()),
-                nonce: hex_encode(&self.nonce),
-            });
-        }
-        if self.conhecido.is_some() {
-            self.estado = Estado::EsperandoDesafio;
-            Ok(PairFrame::Resume {
-                device_id: self.eu.clone(),
-                nonce: hex_encode(&self.nonce),
-            })
-        } else {
-            if self.pin.is_none() {
-                return Err(Error::Pairing(
-                    "aparelho desconhecido e sem PIN: não dá para parear".into(),
-                ));
-            }
-            self.estado = Estado::EsperandoAck;
-            Ok(PairFrame::Hello {
-                device_id: self.eu.clone(),
-                public_key: hex_encode(self.pk.as_bytes()),
-                nonce: hex_encode(&self.nonce),
-            })
-        }
+    pub fn new_with_store(
+        role: Role,
+        eu: DeviceId,
+        pin: Option<Pin>,
+        store: &PairedPeers,
+    ) -> Result<Self> {
+        let mut p = Self::new(role, eu, pin, None)?;
+        p.known = store.eligible();
+        Ok(p)
     }
-
-    /// Consome uma mensagem da outra ponta.
-    pub fn step(&mut self, quadro: PairFrame) -> Result<Step> {
-        let r = self.step_interno(quadro);
-        if r.is_err() {
-            self.estado = Estado::Falhou;
-        }
-        r
-    }
-
-    fn step_interno(&mut self, quadro: PairFrame) -> Result<Step> {
-        if let PairFrame::Fail { motivo } = quadro {
-            return Err(Error::Pairing(format!("a outra ponta recusou: {motivo}")));
-        }
-
-        match (
-            self.role,
-            core::mem::replace(&mut self.estado, Estado::Falhou),
-            quadro,
-        ) {
-            // ---- caminho do PIN ----
-            (
-                Role::Host,
-                Estado::Inicio,
-                PairFrame::Hello {
-                    device_id,
-                    public_key,
-                    nonce,
-                },
-            ) => {
-                let pin = self
-                    .pin
-                    .clone()
-                    .ok_or_else(|| Error::Pairing("o anfitrião não tem PIN ativo".into()))?;
-                let pk_guest: [u8; 32] = hex_decode(&public_key)?;
-                let nonce_guest: [u8; NONCE_LEN] = hex_decode(&nonce)?;
-
-                let chave = derivar(
-                    &self.sk,
-                    &pk_guest,
-                    &pin,
-                    // A transcrição é sempre na mesma ordem, independente do papel: convidado
-                    // primeiro. Sem isso, os dois lados derivariam chaves diferentes.
-                    &Partes {
-                        guest_id: &device_id,
-                        host_id: &self.eu,
-                        pk_guest: &pk_guest,
-                        pk_host: self.pk.as_bytes(),
-                        nonce_guest: &nonce_guest,
-                        nonce_host: &self.nonce,
-                    },
-                )?;
-
-                self.estado = Estado::EsperandoConfirm {
-                    chave,
-                    par: device_id,
-                };
-                Ok(Step {
-                    reply: Some(PairFrame::Ack {
-                        device_id: self.eu.clone(),
-                        public_key: hex_encode(self.pk.as_bytes()),
-                        nonce: hex_encode(&self.nonce),
-                    }),
-                    done: None,
-                })
-            }
-
-            (
-                Role::Guest,
-                Estado::EsperandoAck,
-                PairFrame::Ack {
-                    device_id,
-                    public_key,
-                    nonce,
-                },
-            ) => {
-                let pin = self
-                    .pin
-                    .clone()
-                    .ok_or_else(|| Error::Pairing("sem PIN para confirmar".into()))?;
-                let pk_host: [u8; 32] = hex_decode(&public_key)?;
-                let nonce_host: [u8; NONCE_LEN] = hex_decode(&nonce)?;
-
-                let chave = derivar(
-                    &self.sk,
-                    &pk_host,
-                    &pin,
-                    &Partes {
-                        guest_id: &self.eu,
-                        host_id: &device_id,
-                        pk_guest: self.pk.as_bytes(),
-                        pk_host: &pk_host,
-                        nonce_guest: &self.nonce,
-                        nonce_host: &nonce_host,
-                    },
-                )?;
-
-                let mac = confirmacao(&chave, Role::Guest);
-                self.estado = Estado::EsperandoConfirmAck {
-                    chave,
-                    par: device_id,
-                };
-                Ok(Step {
-                    reply: Some(PairFrame::Confirm {
-                        mac: hex_encode(&mac),
-                    }),
-                    done: None,
-                })
-            }
-
-            (Role::Host, Estado::EsperandoConfirm { chave, par }, PairFrame::Confirm { mac }) => {
-                let recebido: [u8; MAC_LEN] = hex_decode(&mac)?;
-                let esperado = confirmacao(&chave, Role::Guest);
-                if recebido.ct_eq(&esperado).unwrap_u8() != 1 {
-                    // Sem "tente de novo": uma tentativa por conexão é o que mantém a chance
-                    // em 1/10⁶. Quem chama derruba a sinalização e gera outro PIN.
-                    //
-                    // **Dívida 29.** Este é o **único** ponto do núcleo em que o PIN de fato não
-                    // confere, e agora é o único que produz `Error::WrongPin`. Todo o resto do
-                    // módulo que devolvia `Error::Pairing` continua devolvendo — e é isso que
-                    // torna o status confiável: quem receber `WrongPin` sabe que foi o PIN.
-                    return Err(Error::WrongPin("o PIN não conferiu".into()));
-                }
-                let resposta = confirmacao(&chave, Role::Host);
-                let segredo = chave.segredo;
-                self.estado = Estado::Pronto;
-                Ok(Step {
-                    reply: Some(PairFrame::ConfirmAck {
-                        mac: hex_encode(&resposta),
-                    }),
-                    done: Some(PairOutcome {
-                        peer: par,
-                        secret: segredo,
-                        novo: true,
-                    }),
-                })
-            }
-
-            (
-                Role::Guest,
-                Estado::EsperandoConfirmAck { chave, par },
-                PairFrame::ConfirmAck { mac },
-            ) => {
-                let recebido: [u8; MAC_LEN] = hex_decode(&mac)?;
-                let esperado = confirmacao(&chave, Role::Host);
-                if recebido.ct_eq(&esperado).unwrap_u8() != 1 {
-                    return Err(Error::Pairing(
-                        "o outro aparelho não provou saber o PIN".into(),
-                    ));
-                }
-                let segredo = chave.segredo;
-                self.estado = Estado::Pronto;
-                Ok(Step {
-                    reply: None,
-                    done: Some(PairOutcome {
-                        peer: par,
-                        secret: segredo,
-                        novo: true,
-                    }),
-                })
-            }
-
-            // ---- caminho da retomada ----
-            //
-            // **Dívida 22.** Um `Resume` de aparelho que este anfitrião não conhece não é
-            // recusa: é o caso em que o segredo se perdeu de um lado só — troca de aparelho,
-            // reinstalação, ou a dessincronia do `pares.json` da dívida 23. Cair aqui deixava o
-            // usuário sem saída, porque o produto não oferece "digitar o PIN de novo".
-            //
-            // Então o anfitrião convida a recomeçar pelo PIN, **na mesma conexão**, e volta ao
-            // estado inicial para receber o `Hello` que vem a seguir.
-            (Role::Host, Estado::Inicio, PairFrame::Resume { device_id, nonce })
-                if self.conhecido.is_none() =>
-            {
-                let _ = nonce;
-                if self.pin.is_none() {
-                    return Err(Error::NeedsPin(format!(
-                        "o aparelho {} não está pareado aqui e não há PIN ativo para recomeçar",
-                        device_id.0
-                    )));
-                }
-                self.estado = Estado::Inicio;
-                Ok(Step {
-                    reply: Some(PairFrame::NeedsPin),
-                    done: None,
-                })
-            }
-
-            (Role::Host, Estado::Inicio, PairFrame::Resume { device_id, nonce }) => {
-                let conhecido = self.conhecido.clone().ok_or_else(|| {
-                    Error::Pairing(format!("aparelho {} não está pareado aqui", device_id.0))
-                })?;
-                if conhecido.id != device_id {
-                    return Err(Error::Pairing(format!(
-                        "segredo carregado é do aparelho {}, não de {}",
-                        conhecido.id.0, device_id.0
-                    )));
-                }
-                let segredo = conhecido.secret;
-                let nonce_guest: [u8; NONCE_LEN] = hex_decode(&nonce)?;
-                let mac = retomada(&segredo, Role::Host, &nonce_guest, &self.nonce);
-                self.estado = Estado::EsperandoProva {
-                    par: device_id,
-                    segredo,
-                    nonce_guest,
-                    nonce_host: self.nonce,
-                };
-                Ok(Step {
-                    reply: Some(PairFrame::ResumeChallenge {
-                        nonce: hex_encode(&self.nonce),
-                        mac: hex_encode(&mac),
-                    }),
-                    done: None,
-                })
-            }
-
-            (Role::Guest, Estado::EsperandoDesafio, PairFrame::ResumeChallenge { nonce, mac }) => {
-                let conhecido = self
-                    .conhecido
-                    .clone()
-                    .ok_or_else(|| Error::Pairing("sem segredo guardado".into()))?;
-                let segredo = conhecido.secret;
-                let nonce_host: [u8; NONCE_LEN] = hex_decode(&nonce)?;
-                let recebido: [u8; MAC_LEN] = hex_decode(&mac)?;
-                let esperado = retomada(&segredo, Role::Host, &self.nonce, &nonce_host);
-                if recebido.ct_eq(&esperado).unwrap_u8() != 1 {
-                    return Err(Error::Pairing(
-                        "o aparelho do outro lado não é o que foi pareado".into(),
-                    ));
-                }
-                let prova = retomada(&segredo, Role::Guest, &self.nonce, &nonce_host);
-                self.estado = Estado::EsperandoOk {
-                    par: conhecido.id,
-                    segredo,
-                };
-                Ok(Step {
-                    reply: Some(PairFrame::ResumeProof {
-                        mac: hex_encode(&prova),
-                    }),
-                    done: None,
-                })
-            }
-
-            (
-                Role::Host,
-                Estado::EsperandoProva {
-                    par,
-                    segredo,
-                    nonce_guest,
-                    nonce_host,
-                },
-                PairFrame::ResumeProof { mac },
-            ) => {
-                let recebido: [u8; MAC_LEN] = hex_decode(&mac)?;
-                let esperado = retomada(&segredo, Role::Guest, &nonce_guest, &nonce_host);
-                if recebido.ct_eq(&esperado).unwrap_u8() != 1 {
-                    return Err(Error::Pairing("prova de retomada inválida".into()));
-                }
-                self.estado = Estado::Pronto;
-                Ok(Step {
-                    reply: Some(PairFrame::Ok),
-                    done: Some(PairOutcome {
-                        peer: par,
-                        secret: segredo,
-                        novo: false,
-                    }),
-                })
-            }
-
-            // **Dívida 22, o outro lado.** O anfitrião não nos conhece mais. Se o usuário já tem
-            // o PIN na mão, a retomada vira pareamento novo sem que ninguém precise reconectar;
-            // se não tem, o erro é [`Error::NeedsPin`] — que a casca traduz em "peça o PIN",
-            // não em "falhou".
-            (Role::Guest, Estado::EsperandoDesafio, PairFrame::NeedsPin) => {
-                if self.pin.is_none() {
-                    self.conhecido = None;
-                    return Err(Error::NeedsPin(
-                        "o outro aparelho não reconhece mais este pareamento; peça o PIN de novo"
-                            .into(),
-                    ));
-                }
-                // O segredo guardado não vale mais nada: seguir com ele seria tentar a retomada
-                // outra vez, no meio do caminho do PIN.
-                self.conhecido = None;
-                self.estado = Estado::EsperandoAck;
-                Ok(Step {
-                    reply: Some(PairFrame::Hello {
-                        device_id: self.eu.clone(),
-                        public_key: hex_encode(self.pk.as_bytes()),
-                        nonce: hex_encode(&self.nonce),
-                    }),
-                    done: None,
-                })
-            }
-
-            (Role::Guest, Estado::EsperandoOk { par, segredo }, PairFrame::Ok) => {
-                self.estado = Estado::Pronto;
-                Ok(Step {
-                    reply: None,
-                    done: Some(PairOutcome {
-                        peer: par,
-                        secret: segredo,
-                        novo: false,
-                    }),
-                })
-            }
-
-            (_, estado, quadro) => Err(Error::Pairing(format!(
-                "mensagem fora de ordem: {quadro:?} em {estado:?}"
-            ))),
-        }
-    }
-
-    pub fn is_done(&self) -> bool {
-        self.estado == Estado::Pronto
-    }
-}
-
-impl Pairing {
-    /// Versão para o anfitrião, que só descobre com quem fala quando o `Hello`/`Resume` chega.
-    ///
-    /// Espia o primeiro quadro para achar o segredo guardado do par antes de decidir se a troca
-    /// é por PIN ou por retomada.
     pub fn with_store(
         role: Role,
         eu: DeviceId,
         pin: Option<Pin>,
         store: &PairedPeers,
-        primeiro: &PairFrame,
+        _primeiro: &PairFrame,
     ) -> Result<Self> {
-        let par = match primeiro {
-            PairFrame::Hello { device_id, .. } | PairFrame::Resume { device_id, .. } => {
-                Some(device_id)
-            }
-            _ => None,
-        };
-        let conhecido = par.and_then(|id| {
-            store.get(id).map(|secret| KnownPeer {
-                id: id.clone(),
-                secret,
-            })
-        });
-        Pairing::new(role, eu, pin, conhecido)
+        Self::new_with_store(role, eu, pin, store)
     }
+    pub fn guest(
+        eu: DeviceId,
+        pin: Option<Pin>,
+        store: &PairedPeers,
+        local_role: u8,
+    ) -> Result<Self> {
+        let mut p = Self::new_with_store(Role::Guest, eu, pin, store)?;
+        p.bind_local_role(local_role)?;
+        Ok(p)
+    }
+    pub fn host(
+        eu: DeviceId,
+        pin: Option<Pin>,
+        store: &PairedPeers,
+        token: &str,
+        local_role: u8,
+    ) -> Result<Self> {
+        let mut p = Self::new_with_store(Role::Host, eu, pin, store)?;
+        p.token = hex_decode(token).map_err(|_| invalid())?;
+        p.bind_local_role(local_role)?;
+        Ok(p)
+    }
+    pub fn bind_local_role(&mut self, role: u8) -> Result<()> {
+        if !matches!(self.state, State::Initial) || self.local_role.is_some() {
+            return Err(invalid());
+        }
+        validate_role(role)?;
+        self.local_role = Some(role);
+        Ok(())
+    }
+    pub fn peer_role(&self) -> Result<u8> {
+        if !self.is_done() {
+            return Err(invalid());
+        }
+        let ctx = self.context.as_ref().ok_or_else(invalid)?;
+        Ok(match self.role {
+            Role::Host => ctx.guest_role,
+            Role::Guest => ctx.host_role,
+        })
+    }
+    pub fn attempt_started(&self) -> bool {
+        self.attempted
+    }
+    pub fn is_done(&self) -> bool {
+        matches!(self.state, State::Done)
+    }
+    pub fn take_secure_channel(&mut self) -> Result<SecureChannel> {
+        if !self.is_done() {
+            return Err(invalid());
+        }
+        self.channel.take().ok_or_else(invalid)
+    }
+    pub fn open(&mut self) -> Result<PairFrame> {
+        if self.role != Role::Guest || !matches!(self.state, State::Initial) {
+            return Err(invalid());
+        }
+        let guest_role = self.local_role.ok_or_else(invalid)?;
+        self.state = State::GuestChallenge;
+        Ok(PairFrame::Probe {
+            version: SECURE_VERSION,
+            guest_nonce: hex_encode(&self.nonce),
+            guest_role,
+        })
+    }
+    pub fn step(&mut self, frame: PairFrame) -> Result<Step> {
+        let result = self.step_inner(frame);
+        if result.is_err() {
+            self.state = State::Failed;
+            self.clear_sensitive();
+            self.channel = None;
+        }
+        result
+    }
+    fn clear_sensitive(&mut self) {
+        self.pin = None;
+        self.password = None;
+        self.known.clear();
+        self.selected = None;
+        self.pair_secret.zeroize();
+    }
+    fn step_inner(&mut self, frame: PairFrame) -> Result<Step> {
+        let local_role = self.local_role.ok_or_else(invalid)?;
+        if matches!(frame, PairFrame::NeedsPin) {
+            return Err(Error::NeedsPin(
+                "pareamento atualizado requer PIN explícito".into(),
+            ));
+        }
+        if matches!(frame, PairFrame::Fail { .. }) {
+            return Err(invalid());
+        }
+        let state = core::mem::replace(&mut self.state, State::Failed);
+        match (self.role, state, frame) {
+            (
+                Role::Host,
+                State::Initial,
+                PairFrame::Probe {
+                    version,
+                    guest_nonce,
+                    guest_role,
+                },
+            ) => {
+                validate_version(version)?;
+                validate_role(guest_role)?;
+                let context = Context {
+                    token: self.token,
+                    guest_nonce: hex_decode(&guest_nonce).map_err(|_| invalid())?,
+                    host_nonce: self.nonce,
+                    guest_role,
+                    host_role: local_role,
+                };
+                let mut hints = Vec::with_capacity(RESUME_SLOTS);
+                for known in &self.known {
+                    hints.push(hex_encode(&resume_hint(&known.secret, &context)?));
+                }
+                while hints.len() < RESUME_SLOTS {
+                    hints.push(hex_encode(&random::<32>()?));
+                }
+                self.context = Some(context);
+                self.state = State::HostHello;
+                Ok(Step {
+                    reply: Some(PairFrame::Challenge {
+                        version: SECURE_VERSION,
+                        token: hex_encode(&self.token),
+                        host_nonce: hex_encode(&self.nonce),
+                        host_role: local_role,
+                        resume_hints: hints,
+                    }),
+                    done: None,
+                })
+            }
+            (
+                Role::Guest,
+                State::GuestChallenge,
+                PairFrame::Challenge {
+                    version,
+                    token,
+                    host_nonce,
+                    host_role,
+                    resume_hints,
+                },
+            ) => {
+                validate_version(version)?;
+                validate_role(host_role)?;
+                if resume_hints.len() != RESUME_SLOTS {
+                    return Err(invalid());
+                }
+                let context = Context {
+                    token: hex_decode(&token).map_err(|_| invalid())?,
+                    guest_nonce: self.nonce,
+                    host_nonce: hex_decode(&host_nonce).map_err(|_| invalid())?,
+                    guest_role: local_role,
+                    host_role,
+                };
+                let hints: Vec<[u8; 32]> = resume_hints
+                    .iter()
+                    .map(|h| hex_decode(h).map_err(|_| invalid()))
+                    .collect::<Result<_>>()?;
+                let (mode, hint, password) = if let Some(pin) = &self.pin {
+                    (PairMode::Pin, None, Zeroizing::new(pin.bytes().to_vec()))
+                } else {
+                    let mut selected = None;
+                    for known in &self.known {
+                        let expected = resume_hint(&known.secret, &context)?;
+                        let mut found = 0u8;
+                        for candidate in &hints {
+                            found |= expected.ct_eq(candidate).unwrap_u8();
+                        }
+                        if found == 1 && selected.is_none() {
+                            selected = Some((known.clone(), expected));
+                        }
+                    }
+                    let (known, hint) = selected.ok_or_else(|| {
+                        Error::NeedsPin("novo PIN necessário para este vínculo".into())
+                    })?;
+                    let password = Zeroizing::new(known.secret.to_vec());
+                    self.selected = Some(known);
+                    (PairMode::Resume, Some(hex_encode(&hint)), password)
+                };
+                let login =
+                    ClientLogin::<Suite>::start(&mut OsRng, &password).map_err(|_| invalid())?;
+                self.context = Some(context);
+                self.mode = Some(mode);
+                self.password = Some(password);
+                self.pin = None;
+                self.known.clear();
+                self.attempted = true;
+                self.state = State::GuestAck(login.state);
+                Ok(Step {
+                    reply: Some(PairFrame::Hello {
+                        mode,
+                        hint,
+                        ke1: hex_encode(&login.message.serialize()),
+                    }),
+                    done: None,
+                })
+            }
+            (Role::Host, State::HostHello, PairFrame::Hello { mode, hint, ke1 }) => {
+                let context = self.context.as_ref().ok_or_else(invalid)?;
+                let password = match mode {
+                    PairMode::Pin => {
+                        if hint.is_some() {
+                            return Err(invalid());
+                        }
+                        Zeroizing::new(
+                            self.pin
+                                .as_ref()
+                                .ok_or_else(|| Error::NeedsPin("PIN não ativo".into()))?
+                                .bytes()
+                                .to_vec(),
+                        )
+                    }
+                    PairMode::Resume => {
+                        let received: [u8; 32] = hex_decode(hint.as_deref().ok_or_else(invalid)?)
+                            .map_err(|_| invalid())?;
+                        let mut selected = None;
+                        for known in &self.known {
+                            if resume_hint(&known.secret, context)?
+                                .ct_eq(&received)
+                                .unwrap_u8()
+                                == 1
+                                && selected.is_none()
+                            {
+                                selected = Some(known.clone());
+                            }
+                        }
+                        let selected = selected
+                            .ok_or_else(|| Error::NeedsPin("vínculo não reconhecido".into()))?;
+                        let password = Zeroizing::new(selected.secret.to_vec());
+                        self.selected = Some(selected);
+                        password
+                    }
+                };
+                let ke1 = CredentialRequest::<Suite>::deserialize(&decode(&ke1)?)
+                    .map_err(|_| invalid())?;
+                let binding = context.bytes(Some(mode));
+                self.attempted = true;
+                let setup = ServerSetup::<Suite>::new(&mut OsRng);
+                // Registro somente local: seus dados nunca entram em PairFrame.
+                let registration = ClientRegistration::<Suite>::start(&mut OsRng, &password)
+                    .map_err(|_| invalid())?;
+                let response =
+                    ServerRegistration::<Suite>::start(&setup, registration.message, &binding)
+                        .map_err(|_| invalid())?;
+                let mut record = registration
+                    .state
+                    .finish(
+                        &mut OsRng,
+                        &password,
+                        response.message,
+                        ClientRegistrationFinishParameters {
+                            identifiers: identifiers(),
+                            ksf: Some(&mode.ksf()),
+                        },
+                    )
+                    .map_err(|_| invalid())?;
+                record.export_key.zeroize();
+                let file = ServerRegistration::<Suite>::finish(record.message);
+                let login = ServerLogin::<Suite>::start(
+                    &mut OsRng,
+                    &setup,
+                    Some(file),
+                    ke1,
+                    &binding,
+                    ServerLoginParameters {
+                        context: Some(&binding),
+                        identifiers: identifiers(),
+                    },
+                )
+                .map_err(|_| invalid())?;
+                self.mode = Some(mode);
+                self.pin = None;
+                self.known.clear();
+                self.state = State::HostConfirm(login.state);
+                Ok(Step {
+                    reply: Some(PairFrame::Ack {
+                        ke2: hex_encode(&login.message.serialize()),
+                    }),
+                    done: None,
+                })
+            }
+            (Role::Guest, State::GuestAck(login), PairFrame::Ack { ke2 }) => {
+                let mode = self.mode.ok_or_else(invalid)?;
+                let binding = self.context.as_ref().ok_or_else(invalid)?.bytes(Some(mode));
+                let password = self.password.take().ok_or_else(invalid)?;
+                let response = CredentialResponse::<Suite>::deserialize(&decode(&ke2)?)
+                    .map_err(|_| invalid())?;
+                let mut result = login
+                    .finish(
+                        &mut OsRng,
+                        &password,
+                        response,
+                        ClientLoginFinishParameters {
+                            context: Some(&binding),
+                            identifiers: identifiers(),
+                            ksf: Some(&mode.ksf()),
+                        },
+                    )
+                    .map_err(|_| authentication_error(mode))?;
+                result.export_key.zeroize();
+                let session_key = Zeroizing::new(result.session_key);
+                self.install_keys(&session_key, &binding, mode)?;
+                let identity_ciphertext = hex_encode(
+                    &self
+                        .channel
+                        .as_mut()
+                        .ok_or_else(invalid)?
+                        .seal(self.eu.0.as_bytes())?,
+                );
+                self.state = State::GuestConfirmAck;
+                Ok(Step {
+                    reply: Some(PairFrame::Confirm {
+                        ke3: hex_encode(&result.message.serialize()),
+                        identity_ciphertext,
+                    }),
+                    done: None,
+                })
+            }
+            (
+                Role::Host,
+                State::HostConfirm(login),
+                PairFrame::Confirm {
+                    ke3,
+                    identity_ciphertext,
+                },
+            ) => {
+                let mode = self.mode.ok_or_else(invalid)?;
+                let binding = self.context.as_ref().ok_or_else(invalid)?.bytes(Some(mode));
+                let finalization = CredentialFinalization::<Suite>::deserialize(&decode(&ke3)?)
+                    .map_err(|_| invalid())?;
+                let result = login
+                    .finish(
+                        finalization,
+                        ServerLoginParameters {
+                            context: Some(&binding),
+                            identifiers: identifiers(),
+                        },
+                    )
+                    .map_err(|_| authentication_error(mode))?;
+                let session_key = Zeroizing::new(result.session_key);
+                self.install_keys(&session_key, &binding, mode)?;
+                let peer = self.read_identity(&identity_ciphertext)?;
+                let identity_ciphertext = hex_encode(
+                    &self
+                        .channel
+                        .as_mut()
+                        .ok_or_else(invalid)?
+                        .seal(self.eu.0.as_bytes())?,
+                );
+                let outcome = self.finish(peer, mode);
+                Ok(Step {
+                    reply: Some(PairFrame::ConfirmAck {
+                        identity_ciphertext,
+                    }),
+                    done: Some(outcome),
+                })
+            }
+            (
+                Role::Guest,
+                State::GuestConfirmAck,
+                PairFrame::ConfirmAck {
+                    identity_ciphertext,
+                },
+            ) => {
+                let peer = self.read_identity(&identity_ciphertext)?;
+                let mode = self.mode.ok_or_else(invalid)?;
+                let outcome = self.finish(peer, mode);
+                Ok(Step {
+                    reply: None,
+                    done: Some(outcome),
+                })
+            }
+            _ => Err(invalid()),
+        }
+    }
+    fn install_keys(&mut self, session_key: &[u8], context: &[u8], mode: PairMode) -> Result<()> {
+        self.channel = Some(SecureChannel::from_session(
+            self.role,
+            session_key,
+            context,
+        )?);
+        if mode == PairMode::Resume {
+            *self.pair_secret = self.selected.as_ref().ok_or_else(invalid)?.secret;
+        } else {
+            let salt = Sha256::digest(context);
+            Hkdf::<Sha256>::new(Some(&salt), session_key)
+                .expand(b"quall/v3/pair/long-term-secret", &mut *self.pair_secret)
+                .map_err(|_| invalid())?;
+        }
+        Ok(())
+    }
+    fn read_identity(&mut self, ciphertext: &str) -> Result<DeviceId> {
+        let bytes = self
+            .channel
+            .as_mut()
+            .ok_or_else(invalid)?
+            .open(&decode(ciphertext)?)?;
+        let text = String::from_utf8(bytes).map_err(|_| invalid())?;
+        let peer = DeviceId(text);
+        validate_id(&peer)?;
+        if peer == self.eu {
+            return Err(invalid());
+        }
+        if let Some(selected) = &self.selected {
+            if peer != selected.id {
+                return Err(invalid());
+            }
+        }
+        Ok(peer)
+    }
+    fn finish(&mut self, peer: DeviceId, mode: PairMode) -> PairOutcome {
+        let outcome = PairOutcome {
+            peer,
+            secret: *self.pair_secret,
+            novo: mode == PairMode::Pin,
+        };
+        self.clear_sensitive();
+        self.state = State::Done;
+        outcome
+    }
+}
+
+fn identifiers() -> Identifiers<'static> {
+    Identifiers {
+        client: Some(b"quall/v3/guest"),
+        server: Some(b"quall/v3/host"),
+    }
+}
+fn invalid() -> Error {
+    Error::Pairing("autenticação segura inválida".into())
+}
+fn authentication_error(mode: PairMode) -> Error {
+    match mode {
+        PairMode::Pin => Error::WrongPin("PIN ou autenticação não conferiu".into()),
+        PairMode::Resume => invalid(),
+    }
+}
+fn validate_version(version: u16) -> Result<()> {
+    if version != SECURE_VERSION {
+        Err(Error::Protocol(
+            "atualize o Quall nos dois aparelhos".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+fn validate_role(role: u8) -> Result<()> {
+    if role <= 2 {
+        Ok(())
+    } else {
+        Err(invalid())
+    }
+}
+fn validate_id(id: &DeviceId) -> Result<()> {
+    if id.0.is_empty() || id.0.len() > MAX_ID_LEN || id.0.chars().any(char::is_control) {
+        Err(invalid())
+    } else {
+        Ok(())
+    }
+}
+fn random<const N: usize>() -> Result<[u8; N]> {
+    let mut value = [0u8; N];
+    getrandom::fill(&mut value).map_err(|_| Error::Pairing("sem entropia do sistema".into()))?;
+    Ok(value)
+}
+fn resume_hint(secret: &[u8; 32], context: &Context) -> Result<[u8; 32]> {
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(secret).map_err(|_| invalid())?;
+    mac.update(b"quall/v3/resume-hint");
+    mac.update(&context.bytes(None));
+    Ok(mac.finalize().into_bytes().into())
+}
+fn decode(text: &str) -> Result<Vec<u8>> {
+    if text.len() > MAX_HANDSHAKE_HEX || text.len() % 2 != 0 {
+        return Err(invalid());
+    }
+    let mut out = Vec::with_capacity(text.len() / 2);
+    for bytes in text.as_bytes().chunks_exact(2) {
+        let digit = |b: u8| -> Result<u8> {
+            match b {
+                b'0'..=b'9' => Ok(b - b'0'),
+                b'a'..=b'f' => Ok(b - b'a' + 10),
+                b'A'..=b'F' => Ok(b - b'A' + 10),
+                _ => Err(invalid()),
+            }
+        };
+        out.push((digit(bytes[0])? << 4) | digit(bytes[1])?);
+    }
+    Ok(out)
 }
 
 /// Uma entrada da tabela de pares.
@@ -788,13 +883,18 @@ impl Pairing {
 /// O que **não** acontece é o contrário: um binário do núcleo anterior a esta mudança não lê o
 /// formato com carimbo. Não é problema em campo, porque a casca e o núcleo vão no mesmo pacote,
 /// mas está dito aqui para ninguém descobrir isso num downgrade.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 #[serde(untagged)]
 enum Entrada {
     /// Formato do M0 ao M3: só o segredo em hex.
     Simples(String),
     /// Formato com carimbo de quando o pareamento foi feito, em milissegundos desde a época.
-    Datada { secret: String, updated_ms: u64 },
+    Datada {
+        secret: String,
+        updated_ms: u64,
+        #[serde(default)]
+        security_version: u16,
+    },
 }
 
 impl Entrada {
@@ -864,7 +964,47 @@ impl PairedPeers {
 
     pub fn get(&self, peer: &DeviceId) -> Option<[u8; PAIR_SECRET_LEN]> {
         let entrada = self.pares.get(&peer.0)?;
+        if !matches!(
+            entrada,
+            Entrada::Datada {
+                security_version: SECURE_VERSION,
+                ..
+            }
+        ) {
+            return None;
+        }
         hex_decode::<PAIR_SECRET_LEN>(entrada.secret()).ok()
+    }
+
+    /// O vínculo antigo permanece no arquivo, mas exige novo PIN explícito.
+    pub fn requires_repair(&self, peer: &DeviceId) -> bool {
+        self.pares.contains_key(&peer.0) && self.get(peer).is_none()
+    }
+
+    /// Há pelo menos um vínculo v3 válido que pode tentar retomada segura.
+    /// Não conta entradas antigas, futuras ou com material malformado.
+    pub fn has_secure_peers(&self) -> bool {
+        self.pares.values().any(|entrada| {
+            matches!(
+                entrada,
+                Entrada::Datada {
+                    security_version: SECURE_VERSION,
+                    ..
+                }
+            ) && hex_decode::<PAIR_SECRET_LEN>(entrada.secret()).is_ok()
+        })
+    }
+
+    fn eligible(&self) -> Vec<KnownPeer> {
+        let mut ids: Vec<_> = self.pares.keys().collect();
+        ids.sort();
+        ids.into_iter()
+            .filter_map(|id| {
+                let id = DeviceId(id.clone());
+                self.get(&id).map(|secret| KnownPeer { id, secret })
+            })
+            .take(RESUME_SLOTS)
+            .collect()
     }
 
     pub fn insert(&mut self, resultado: &PairOutcome) {
@@ -873,6 +1013,7 @@ impl PairedPeers {
             Entrada::Datada {
                 secret: hex_encode(&resultado.secret),
                 updated_ms: agora_ms(),
+                security_version: SECURE_VERSION,
             },
         );
     }
@@ -897,7 +1038,19 @@ impl PairedPeers {
     pub fn merge(&mut self, outro: &PairedPeers) {
         for (id, entrada) in &outro.pares {
             let manter = match self.pares.get(id) {
-                Some(minha) => entrada.quando() > minha.quando(),
+                Some(minha) => {
+                    let secure = |e: &Entrada| {
+                        matches!(
+                            e,
+                            Entrada::Datada {
+                                security_version: SECURE_VERSION,
+                                ..
+                            }
+                        )
+                    };
+                    (secure(entrada) && !secure(minha))
+                        || (secure(entrada) == secure(minha) && entrada.quando() > minha.quando())
+                }
                 None => true,
             };
             if manter {
@@ -923,809 +1076,589 @@ impl PairedPeers {
     }
 }
 
-struct Partes<'a> {
-    guest_id: &'a DeviceId,
-    host_id: &'a DeviceId,
-    pk_guest: &'a [u8; 32],
-    pk_host: &'a [u8; 32],
-    nonce_guest: &'a [u8; NONCE_LEN],
-    nonce_host: &'a [u8; NONCE_LEN],
-}
-
-/// Transcrição: tudo que os dois lados viram, na mesma ordem dos dois lados.
-///
-/// Os ids entram com o tamanho na frente (`u16` little-endian). Sem isso, `("ab","c")` e
-/// `("a","bc")` dariam a mesma transcrição — a ambiguidade clássica de concatenar campos de
-/// tamanho variável, e um caminho para um atacante casar duas trocas diferentes.
-fn transcricao(partes: &Partes<'_>) -> Vec<u8> {
-    let mut t = Vec::with_capacity(160);
-    t.extend_from_slice(ROTULO_TRANSCRICAO);
-    t.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
-    for id in [partes.guest_id, partes.host_id] {
-        let bytes = id.0.as_bytes();
-        // Truncar em 65535 é seguro: um `DeviceId` maior que isso já é entrada absurda, e o
-        // `as u16` sem checagem esconderia o problema em vez de mostrá-lo.
-        let n = u16::try_from(bytes.len()).unwrap_or(u16::MAX);
-        t.extend_from_slice(&n.to_le_bytes());
-        t.extend_from_slice(&bytes[..usize::from(n)]);
-    }
-    t.extend_from_slice(partes.pk_guest);
-    t.extend_from_slice(partes.pk_host);
-    t.extend_from_slice(partes.nonce_guest);
-    t.extend_from_slice(partes.nonce_host);
-    t
-}
-
-fn derivar(
-    sk: &StaticSecret,
-    pk_outro: &[u8; 32],
-    pin: &Pin,
-    partes: &Partes<'_>,
-) -> Result<Chaves> {
-    let compartilhado = sk.diffie_hellman(&PublicKey::from(*pk_outro));
-    // Chave pública de ordem baixa faz o X25519 devolver zero: o "segredo" seria público e o
-    // pareamento inteiro cairia para a força bruta do PIN. Recusar é o comportamento certo.
-    if !compartilhado.was_contributory() {
-        return Err(Error::Pairing(
-            "chave pública inválida (resultado X25519 degenerado)".into(),
-        ));
-    }
-
-    let t = transcricao(partes);
-
-    let mut ikm = Vec::with_capacity(32 + PIN_DIGITS);
-    ikm.extend_from_slice(compartilhado.as_bytes());
-    ikm.extend_from_slice(&pin.bytes());
-
-    let hk = Hkdf::<Sha256>::new(Some(&t), &ikm);
-
-    let mut confirmar = [0u8; 32];
-    let mut segredo = [0u8; PAIR_SECRET_LEN];
-    hk.expand(ROTULO_CONFIRMAR, &mut confirmar)
-        .map_err(|_| Error::Pairing("HKDF recusou o tamanho da chave".into()))?;
-    hk.expand(ROTULO_SEGREDO, &mut segredo)
-        .map_err(|_| Error::Pairing("HKDF recusou o tamanho da chave".into()))?;
-
-    Ok(Chaves {
-        confirmar,
-        segredo,
-        transcricao: t,
-    })
-}
-
-fn confirmacao(chave: &Chaves, quem: Role) -> [u8; MAC_LEN] {
-    let mut mac = HmacSha256::new_from_slice(&chave.confirmar)
-        .expect("HMAC-SHA256 aceita chave de qualquer tamanho");
-    mac.update(&[quem.tag()]);
-    mac.update(&chave.transcricao);
-    mac.finalize().into_bytes().into()
-}
-
-fn retomada(
-    segredo: &[u8; PAIR_SECRET_LEN],
-    quem: Role,
-    nonce_guest: &[u8; NONCE_LEN],
-    nonce_host: &[u8; NONCE_LEN],
-) -> [u8; MAC_LEN] {
-    let mut mac =
-        HmacSha256::new_from_slice(segredo).expect("HMAC-SHA256 aceita chave de qualquer tamanho");
-    mac.update(ROTULO_RETOMADA);
-    mac.update(&[quem.tag()]);
-    mac.update(nonce_guest);
-    mac.update(nonce_host);
-    mac.finalize().into_bytes().into()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    fn machines(
+        pin_g: Option<Pin>,
+        pin_h: Option<Pin>,
+        known_g: Option<KnownPeer>,
+        known_h: Option<KnownPeer>,
+    ) -> (Pairing, Pairing) {
+        let mut g = Pairing::new(
+            Role::Guest,
+            DeviceId("guest-private".into()),
+            pin_g,
+            known_g,
+        )
+        .unwrap();
+        let mut h =
+            Pairing::new(Role::Host, DeviceId("host-private".into()), pin_h, known_h).unwrap();
+        g.bind_local_role(2).unwrap();
+        h.bind_local_role(1).unwrap();
+        (g, h)
+    }
+    fn exchange(g: &mut Pairing, h: &mut Pairing) -> Result<(PairOutcome, PairOutcome)> {
+        let probe = g.open()?;
+        let challenge = h.step(probe)?.reply.ok_or_else(invalid)?;
+        let hello = g.step(challenge)?.reply.ok_or_else(invalid)?;
+        let ack = h.step(hello)?.reply.ok_or_else(invalid)?;
+        let confirm = g.step(ack)?.reply.ok_or_else(invalid)?;
+        let done_h = h.step(confirm)?;
+        let done_g = g.step(done_h.reply.ok_or_else(invalid)?)?;
+        Ok((
+            done_g.done.ok_or_else(invalid)?,
+            done_h.done.ok_or_else(invalid)?,
+        ))
+    }
+    fn pin() -> Pin {
+        Pin::parse("012345").unwrap()
+    }
     #[test]
-    fn debug_de_pareamento_nao_expoe_segredos_nem_identidade() {
-        let secreto = "a1".repeat(PAIR_SECRET_LEN);
-        for entrada in [
-            serde_json::json!(secreto),
-            serde_json::json!({"secret": secreto, "updated_ms": 123}),
-        ] {
-            let json = serde_json::json!({"pares": {"pessoa-device": entrada}}).to_string();
-            let pares: PairedPeers = serde_json::from_str(&json).expect("formato de armazenamento");
-            assert_eq!(format!("{pares:?}"), "PairedPeers { quantidade: 1 }");
-            // Diagnóstico não modifica o formato persistido: hex é representação, não cifra.
-            assert_eq!(
-                serde_json::to_value(&pares).unwrap(),
-                serde_json::from_str::<serde_json::Value>(&json).unwrap()
+    fn pin_mutuo_confirma_identidades_apenas_na_cifra_e_canal_transferido() {
+        let (mut g, mut h) = machines(Some(pin()), Some(pin()), None, None);
+        let probe = g.open().unwrap();
+        let mut frames = vec![probe.clone()];
+        let challenge = h.step(probe).unwrap().reply.unwrap();
+        frames.push(challenge.clone());
+        let hello = g.step(challenge).unwrap().reply.unwrap();
+        frames.push(hello.clone());
+        let ack = h.step(hello).unwrap().reply.unwrap();
+        frames.push(ack.clone());
+        let confirm = g.step(ack).unwrap().reply.unwrap();
+        frames.push(confirm.clone());
+        assert!(!g.is_done());
+        let rh = h.step(confirm).unwrap();
+        frames.push(rh.reply.clone().unwrap());
+        let rg = g.step(rh.reply.unwrap()).unwrap().done.unwrap();
+        let rh = rh.done.unwrap();
+        assert_eq!(rg.secret, rh.secret);
+        assert!(rg.novo && rh.novo);
+        assert_eq!(rg.peer.0, "host-private");
+        assert_eq!(rh.peer.0, "guest-private");
+        assert_eq!(g.peer_role().unwrap(), 1);
+        assert_eq!(h.peer_role().unwrap(), 2);
+        for frame in frames {
+            let json = serde_json::to_string(&frame).unwrap();
+            assert!(!json.contains("private"));
+            assert!(!json.contains("device_id"));
+        }
+        let mut cg = g.take_secure_channel().unwrap();
+        let mut ch = h.take_secure_channel().unwrap();
+        assert_eq!(
+            ch.open(&cg.seal(b"announcement").unwrap()).unwrap(),
+            b"announcement"
+        );
+        assert_eq!(cg.open(&ch.seal(b"welcome").unwrap()).unwrap(), b"welcome");
+        assert!(g.take_secure_channel().is_err());
+    }
+    #[test]
+    fn pin_errado_e_tamper_ke2_falham_sem_confirm_e_sem_chaves() {
+        for tamper in [false, true] {
+            let (mut g, mut h) = machines(
+                Some(if tamper {
+                    pin()
+                } else {
+                    Pin::parse("999999").unwrap()
+                }),
+                Some(pin()),
+                None,
+                None,
+            );
+            let challenge = h.step(g.open().unwrap()).unwrap().reply.unwrap();
+            let hello = g.step(challenge).unwrap().reply.unwrap();
+            let mut ack = h.step(hello).unwrap().reply.unwrap();
+            assert!(h.attempt_started());
+            if tamper {
+                if let PairFrame::Ack { ke2 } = &mut ack {
+                    let mut bytes = decode(ke2).unwrap();
+                    *bytes.last_mut().unwrap() ^= 1;
+                    *ke2 = hex_encode(&bytes);
+                }
+            }
+            assert!(g.step(ack).is_err());
+            assert!(!g.is_done());
+            assert!(g.take_secure_channel().is_err());
+        }
+    }
+    #[test]
+    fn retomada_usa_pake_e_conserva_segredo_com_chaves_novas() {
+        let secret = [42; 32];
+        let known_g = KnownPeer {
+            id: DeviceId("host-private".into()),
+            secret,
+        };
+        let known_h = KnownPeer {
+            id: DeviceId("guest-private".into()),
+            secret,
+        };
+        let mut encrypted = Vec::new();
+        for _ in 0..2 {
+            let (mut g, mut h) = machines(None, None, Some(known_g.clone()), Some(known_h.clone()));
+            let (rg, rh) = exchange(&mut g, &mut h).unwrap();
+            assert_eq!(rg.secret, secret);
+            assert_eq!(rh.secret, secret);
+            assert!(!rg.novo && !rh.novo);
+            encrypted.push(g.take_secure_channel().unwrap().seal(b"same").unwrap());
+        }
+        assert_ne!(encrypted[0], encrypted[1]);
+    }
+    #[test]
+    fn desafio_vincula_roles_noncess_e_versao_e_reflexao() {
+        for attack in 0..4 {
+            let (mut g, mut h) = machines(Some(pin()), Some(pin()), None, None);
+            let probe = g.open().unwrap();
+            let mut challenge = h.step(probe.clone()).unwrap().reply.unwrap();
+            if attack == 3 {
+                assert!(g.step(probe).is_err());
+                continue;
+            }
+            if let PairFrame::Challenge {
+                version,
+                host_role,
+                host_nonce,
+                ..
+            } = &mut challenge
+            {
+                match attack {
+                    0 => *version = 2,
+                    1 => *host_role = 0,
+                    2 => *host_nonce = hex_encode(&[9; 16]),
+                    _ => unreachable!(),
+                }
+            }
+            match g.step(challenge) {
+                Err(_) => assert_eq!(attack, 0),
+                Ok(step) => {
+                    let ack = h.step(step.reply.unwrap()).unwrap().reply.unwrap();
+                    assert!(g.step(ack).is_err());
+                }
+            }
+        }
+    }
+    #[test]
+    fn confirmacao_corrompida_nao_finaliza_e_replay_nao_reabre() {
+        let (mut g, mut h) = machines(Some(pin()), Some(pin()), None, None);
+        let challenge = h.step(g.open().unwrap()).unwrap().reply.unwrap();
+        let hello = g.step(challenge).unwrap().reply.unwrap();
+        let ack = h.step(hello).unwrap().reply.unwrap();
+        let mut confirm = g.step(ack).unwrap().reply.unwrap();
+        if let PairFrame::Confirm {
+            identity_ciphertext,
+            ..
+        } = &mut confirm
+        {
+            let mut b = decode(identity_ciphertext).unwrap();
+            *b.last_mut().unwrap() ^= 1;
+            *identity_ciphertext = hex_encode(&b);
+        }
+        assert!(h.step(confirm).is_err());
+        assert!(h.take_secure_channel().is_err());
+        let (mut g, mut h) = machines(Some(pin()), Some(pin()), None, None);
+        exchange(&mut g, &mut h).unwrap();
+        assert!(g.open().is_err());
+        assert!(h.step(PairFrame::NeedsPin).is_err());
+    }
+    #[test]
+    fn pin_explicito_tem_precedencia_e_segredos_novos_nao_dependem_apenas_do_pin() {
+        let mut secrets = Vec::new();
+        for _ in 0..2 {
+            let (mut g, mut h) = machines(
+                Some(pin()),
+                Some(pin()),
+                Some(KnownPeer {
+                    id: DeviceId("wrong".into()),
+                    secret: [1; 32],
+                }),
+                None,
+            );
+            let (rg, _) = exchange(&mut g, &mut h).unwrap();
+            assert!(rg.novo);
+            secrets.push(rg.secret);
+        }
+        assert_ne!(secrets[0], secrets[1]);
+    }
+    #[test]
+    fn store_preserva_legado_mas_exige_pin_e_nao_rebaixa_por_merge() {
+        let old=serde_json::json!({"pares":{"old-id":"11".repeat(32),"dated":{"secret":"22".repeat(32),"updated_ms":9999999999999u64}}}).to_string();
+        let mut store = PairedPeers::from_json(&old).unwrap();
+        assert_eq!(store.len(), 2);
+        assert!(!store.has_secure_peers());
+        assert!(store.requires_repair(&DeviceId("old-id".into())));
+        assert!(store.get(&DeviceId("dated".into())).is_none());
+        assert!(store.to_json().unwrap().contains("old-id"));
+        store.insert(&PairOutcome {
+            peer: DeviceId("dated".into()),
+            secret: [3; 32],
+            novo: true,
+        });
+        assert!(store.has_secure_peers());
+        store.merge(&PairedPeers::from_json(&old).unwrap());
+        assert_eq!(store.get(&DeviceId("dated".into())), Some([3; 32]));
+        let round = PairedPeers::from_json(&store.to_json().unwrap()).unwrap();
+        assert_eq!(round.get(&DeviceId("dated".into())), Some([3; 32]));
+        assert!(!format!("{round:?}").contains("old-id"));
+    }
+    #[test]
+    fn maquinas_exigem_binding_e_pin_valido() {
+        let mut g = Pairing::new(Role::Guest, DeviceId("guest".into()), Some(pin()), None).unwrap();
+        assert!(g.open().is_err());
+        assert!(g.bind_local_role(3).is_err());
+        assert!(Pin::parse("12345").is_err());
+        assert_eq!(Pin::parse("012 345").unwrap(), pin());
+        assert_eq!(format!("{:?}", pin()), "Pin(******)");
+        let generated = Pin::generate().unwrap();
+        assert_eq!(generated.to_display().len(), 6);
+    }
+
+    fn secure_store(entries: &[(&str, u8, u64)]) -> PairedPeers {
+        let mut peers = serde_json::Map::new();
+        for (id, byte, timestamp) in entries {
+            peers.insert(
+                (*id).into(),
+                serde_json::json!({
+                    "secret": hex_encode(&[*byte; PAIR_SECRET_LEN]),
+                    "updated_ms": timestamp,
+                    "security_version": SECURE_VERSION,
+                }),
             );
         }
-        let quadro = PairFrame::Hello {
-            device_id: DeviceId("pessoa-device".into()),
-            public_key: secreto.clone(),
-            nonce: "nonce-privado".into(),
-        };
-        assert_eq!(format!("{quadro:?}"), "Hello");
-        assert!(serde_json::to_string(&quadro).unwrap().contains(&secreto));
-        for quadro in [
-            PairFrame::Confirm {
-                mac: secreto.clone(),
-            },
-            PairFrame::Fail {
-                motivo: "PIN livre 901234".into(),
-            },
-        ] {
-            let log = format!("{quadro:?}");
-            assert!(!log.contains(&secreto) && !log.contains("901234"));
-        }
-        let resultado = PairOutcome {
-            peer: DeviceId("pessoa-device".into()),
-            secret: [0xa1; PAIR_SECRET_LEN],
-            novo: true,
-        };
-        let conhecido = KnownPeer {
-            id: resultado.peer.clone(),
-            secret: resultado.secret,
-        };
-        assert!(!format!("{resultado:?} {conhecido:?}").contains("pessoa-device"));
-        assert_eq!(
-            format!("{:?}", Pin::parse("901234").unwrap()),
-            "Pin(******)"
-        );
+        PairedPeers::from_json(&serde_json::json!({"pares": peers}).to_string()).unwrap()
     }
 
-    fn ids() -> (DeviceId, DeviceId) {
-        (
-            DeviceId("guest-macbook".into()),
-            DeviceId("host-dell-g3".into()),
-        )
-    }
-
-    /// Roda a troca inteira entre duas máquinas de estado, sem rede.
-    fn trocar(
-        guest: &mut Pairing,
-        host: &mut Pairing,
-    ) -> Result<(Option<PairOutcome>, Option<PairOutcome>)> {
-        let mut do_guest = Some(guest.open()?);
-        let mut do_host: Option<PairFrame> = None;
-        let mut r_guest = None;
-        let mut r_host = None;
-
-        for _ in 0..8 {
-            if let Some(q) = do_guest.take() {
-                let passo = host.step(q)?;
-                if let Some(o) = passo.done {
-                    r_host = Some(o);
-                }
-                do_host = passo.reply;
-            }
-            if let Some(q) = do_host.take() {
-                let passo = guest.step(q)?;
-                if let Some(o) = passo.done {
-                    r_guest = Some(o);
-                }
-                do_guest = passo.reply;
-            }
-            if do_guest.is_none() && do_host.is_none() {
-                break;
-            }
-        }
-        Ok((r_guest, r_host))
-    }
-
-    #[test]
-    fn pin_correto_deriva_o_mesmo_segredo_dos_dois_lados() {
-        let (g, h) = ids();
-        let pin = Pin::generate().expect("pin");
-        let mut guest = Pairing::new(Role::Guest, g, Some(pin.clone()), None).expect("guest");
-        let mut host = Pairing::new(Role::Host, h, Some(pin), None).expect("host");
-
-        let (rg, rh) = trocar(&mut guest, &mut host).expect("troca");
-        let rg = rg.expect("convidado conclui");
-        let rh = rh.expect("anfitrião conclui");
-
-        assert_eq!(
-            rg.secret, rh.secret,
-            "os dois lados derivam o mesmo segredo"
-        );
-        assert!(rg.novo && rh.novo);
-        assert_eq!(rg.peer.0, "host-dell-g3");
-        assert_eq!(rh.peer.0, "guest-macbook");
-        assert!(guest.is_done() && host.is_done());
-    }
-
-    #[test]
-    fn pin_errado_e_recusado() {
-        let (g, h) = ids();
-        let mut guest = Pairing::new(
-            Role::Guest,
-            g,
-            Some(Pin::parse("123456").expect("pin")),
-            None,
-        )
-        .expect("guest");
-        let mut host = Pairing::new(
-            Role::Host,
-            h,
-            Some(Pin::parse("654321").expect("pin")),
-            None,
-        )
-        .expect("host");
-
-        let erro = trocar(&mut guest, &mut host).expect_err("tem de falhar");
-        // **Dívida 29.** Era `Error::Pairing`, o balaio. Agora é o único caso do núcleo em que o
-        // PIN de fato não confere, e é o único que pode dizer "digite de novo".
-        assert!(matches!(erro, Error::WrongPin(_)), "erro foi {erro:?}");
-    }
-
-    /// **Dívida 29, o caso que a frente do Windows exercitou.**
-    ///
-    /// O convidado pede retomada com o segredo guardado; o anfitrião já esqueceu o par **e não
-    /// tem PIN ativo** para convidar a recomeçar. O conselho certo é "peça um PIN novo no outro
-    /// aparelho" — o **oposto** de "digite o PIN de novo".
-    ///
-    /// Repare no que este teste fixa: o erro do anfitrião **não** é `WrongPin` nem `Pairing`. O
-    /// PIN nunca foi digitado nesta troca; dizer que ele não conferiu seria falso, e foi
-    /// exatamente o texto que a frente do Windows viu com o PIN certo.
-    #[test]
-    fn par_esquecido_sem_pin_ativo_nao_e_pin_errado() {
-        let (g, h) = ids();
-        let fantasma = KnownPeer {
-            id: h.clone(),
-            secret: [7u8; PAIR_SECRET_LEN],
-        };
-        let mut guest = Pairing::new(Role::Guest, g, None, Some(fantasma)).expect("guest");
-        // Anfitrião sem par guardado e **sem PIN ativo**.
-        let mut host = Pairing::new(Role::Host, h, None, None).expect("host");
-
-        let erro = trocar(&mut guest, &mut host).expect_err("tem de falhar");
-        assert!(matches!(erro, Error::NeedsPin(_)), "erro foi {erro:?}");
-        assert!(
-            !matches!(erro, Error::WrongPin(_) | Error::Pairing(_)),
-            "o PIN não foi digitado nesta troca; chamá-lo de errado é o defeito da dívida 29"
-        );
-    }
-
-    /// **Dívida 29, nota de segurança.** MAC de retomada inválido **não** vira convite a
-    /// recomeçar por PIN.
-    ///
-    /// Um anfitrião que falha a prova de retomada pode ser um impostor. Devolver `NeedsPin` ali
-    /// ofereceria um caminho de rebaixamento: o convidado passaria a digitar um PIN mostrado pelo
-    /// **impostor**. Só quem admite não conhecer o par convida a recomeçar.
-    #[test]
-    fn mac_de_retomada_invalido_continua_sendo_recusa_e_nao_convite() {
-        let (g, h) = ids();
-        // Os dois lados "se conhecem", com segredos diferentes: a prova não vai fechar.
-        let do_guest = KnownPeer {
-            id: h.clone(),
-            secret: [1u8; PAIR_SECRET_LEN],
-        };
-        let do_host = KnownPeer {
-            id: g.clone(),
-            secret: [2u8; PAIR_SECRET_LEN],
-        };
-        let mut guest = Pairing::new(Role::Guest, g, None, Some(do_guest)).expect("guest");
-        let mut host = Pairing::new(Role::Host, h, None, Some(do_host)).expect("host");
-
-        let erro = trocar(&mut guest, &mut host).expect_err("tem de falhar");
-        assert!(
-            matches!(erro, Error::Pairing(_)),
-            "esperava recusa genérica, veio {erro:?}"
-        );
-    }
-
-    /// **Dívida 22.** Retomada falhada não pode ser beco sem saída.
-    ///
-    /// O convidado acha que está pareado; o anfitrião perdeu o segredo (troca de aparelho,
-    /// reinstalação, ou a dessincronia do `pares.json` da dívida 23). Antes, isto morria em
-    /// "aparelho não está pareado aqui" e o usuário ficava sem forma de digitar o PIN de novo.
-    #[test]
-    fn retomada_de_aparelho_desconhecido_cai_de_volta_no_pin() {
-        let (g, h) = ids();
-        let pin = Pin::parse("246810").expect("pin");
-        // O convidado tem um segredo que o anfitrião nunca viu.
-        let fantasma = KnownPeer {
-            id: h.clone(),
-            secret: [7u8; PAIR_SECRET_LEN],
-        };
-
-        let mut guest =
-            Pairing::new(Role::Guest, g, Some(pin.clone()), Some(fantasma)).expect("guest");
-        let mut host = Pairing::new(Role::Host, h, Some(pin), None).expect("host");
-
-        let (rg, rh) = trocar(&mut guest, &mut host).expect("a troca tinha de se recuperar");
-        let rg = rg.expect("convidado conclui");
-        let rh = rh.expect("anfitrião conclui");
-
-        assert_eq!(
-            rg.secret, rh.secret,
-            "depois da volta ao PIN os dois lados têm de derivar o mesmo segredo"
-        );
-        assert!(
-            rg.novo && rh.novo,
-            "o pareamento nasceu de um PIN, então é novo dos dois lados — e é isso que faz a \
-             casca gravar por cima do segredo velho"
-        );
-        assert_ne!(
-            rg.secret, [7u8; PAIR_SECRET_LEN],
-            "o segredo velho não podia sobreviver"
-        );
-    }
-
-    /// Sem PIN na mão, o convidado não tem como recomeçar sozinho — mas o erro precisa dizer
-    /// **o que fazer**, e não só que falhou. É o que a casca usa para abrir a tela do PIN.
-    #[test]
-    fn retomada_falhada_sem_pin_pede_o_pin_em_vez_de_so_falhar() {
-        let (g, h) = ids();
-        let fantasma = KnownPeer {
-            id: h.clone(),
-            secret: [7u8; PAIR_SECRET_LEN],
-        };
-
-        let mut guest = Pairing::new(Role::Guest, g, None, Some(fantasma)).expect("guest");
-        let mut host = Pairing::new(
-            Role::Host,
-            h,
-            Some(Pin::parse("135791").expect("pin")),
-            None,
-        )
-        .expect("host");
-
-        let erro = trocar(&mut guest, &mut host).expect_err("não tinha como fechar");
-        assert!(
-            matches!(erro, Error::NeedsPin(_)),
-            "esperava NeedsPin, veio {erro:?}"
-        );
-    }
-
-    /// A retomada que **funciona** continua funcionando: o caminho novo não pode virar desvio
-    /// para quem já está pareado dos dois lados.
-    /// **O beco sem saída dos dois segredos que discordam, medido em bancada em 31/08/2026.**
-    ///
-    /// O iPad guardava o segredo do pareamento com o Dell; o Android de bancada ainda tinha o
-    /// segredo antigo do iPad. Os dois lados se conheciam, e discordavam. A corrida morria em
-    /// "o aparelho do outro lado não é o que foi pareado" — **com `--pin` na linha de comando**,
-    /// porque `open()` decidia pela existência do segredo e nunca olhava o PIN.
-    ///
-    /// Não é caso de laboratório: o receptor guarda um segredo por par, então espelhar do PC,
-    /// depois do celular, e voltar para o PC é suficiente para produzir isto.
-    #[test]
-    fn segredos_que_discordam_nao_matam_o_par_quando_ha_pin() {
-        let (g, h) = ids();
-        let pin = Pin::parse("314159").expect("pin");
-
-        let mut guest = Pairing::new(
-            Role::Guest,
-            g.clone(),
-            Some(pin.clone()),
-            Some(KnownPeer {
-                id: h.clone(),
-                secret: [1u8; PAIR_SECRET_LEN],
-            }),
-        )
-        .expect("guest");
-        let mut host = Pairing::new(
-            Role::Host,
-            h,
-            Some(pin),
-            Some(KnownPeer {
-                id: g,
-                // **Diferente do que o convidado guardou.** É o caso real.
-                secret: [2u8; PAIR_SECRET_LEN],
-            }),
-        )
-        .expect("host");
-
-        let (rg, rh) = trocar(&mut guest, &mut host).expect("o PIN tem de resgatar o par");
-        let rg = rg.expect("guest");
-        let rh = rh.expect("host");
-        assert_eq!(
-            rg.secret, rh.secret,
-            "os dois lados saem com o mesmo segredo"
-        );
-        assert!(rh.novo, "é pareamento novo, não retomada");
-        assert_ne!(
-            rg.secret, [1u8; PAIR_SECRET_LEN],
-            "o segredo velho do convidado foi substituído"
-        );
-        assert_ne!(
-            rg.secret, [2u8; PAIR_SECRET_LEN],
-            "o segredo velho do anfitrião foi substituído"
-        );
-    }
-
-    /// PIN digitado significa "pareie agora", e por isso o primeiro quadro é `Hello` e não
-    /// `Resume`, mesmo havendo segredo guardado. Se alguém inverter a precedência outra vez, este
-    /// teste falha antes de a bancada perder um dia.
-    #[test]
-    fn pin_digitado_tem_precedencia_sobre_a_retomada() {
-        let (g, h) = ids();
-        let mut guest = Pairing::new(
-            Role::Guest,
-            g,
-            Some(Pin::parse("314159").expect("pin")),
-            Some(KnownPeer {
-                id: h,
-                secret: [42u8; PAIR_SECRET_LEN],
-            }),
-        )
-        .expect("guest");
-
-        match guest.open().expect("abre") {
-            PairFrame::Hello { .. } => {}
-            outro => panic!("com PIN digitado o convidado tem de mandar Hello, veio {outro:?}"),
-        }
-    }
-
-    #[test]
-    fn retomada_com_segredo_certo_continua_dispensando_o_pin() {
-        let (g, h) = ids();
-        let segredo = [42u8; PAIR_SECRET_LEN];
-
-        let mut guest = Pairing::new(
-            Role::Guest,
-            g.clone(),
-            None,
-            Some(KnownPeer {
-                id: h.clone(),
-                secret: segredo,
-            }),
-        )
-        .expect("guest");
-        let mut host = Pairing::new(
-            Role::Host,
-            h,
-            None,
-            Some(KnownPeer {
-                id: g,
-                secret: segredo,
-            }),
-        )
-        .expect("host");
-
-        let (rg, rh) = trocar(&mut guest, &mut host).expect("retomada");
-        assert_eq!(rg.expect("guest").secret, segredo);
-        let rh = rh.expect("host");
-        assert_eq!(rh.secret, segredo);
-        assert!(!rh.novo, "retomada não é pareamento novo");
-    }
-
-    /// **Dívida 23, o caso ruim inteiro.** Duas origens do mesmo aparelho pareiam com o mesmo
-    /// receptor, derivam segredos diferentes, e a atualização de uma se perde.
-    ///
-    /// O receptor guarda **um** segredo por `DeviceId`, o do pareamento mais recente. A fusão
-    /// tem de convergir para ele — senão a origem que perdeu a corrida fica com um segredo que
-    /// ninguém mais reconhece.
     #[test]
     fn a_fusao_converge_para_o_segredo_mais_recente() {
-        let par = DeviceId("receptor-macbook".into());
-
-        // A extension pareou primeiro.
-        let mut extension = PairedPeers::new();
-        extension.insert(&PairOutcome {
-            peer: par.clone(),
-            secret: [1u8; PAIR_SECRET_LEN],
-            novo: true,
-        });
-        // ...e o app pareou depois, que é o segredo que o receptor guardou.
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        let mut app = PairedPeers::new();
-        app.insert(&PairOutcome {
-            peer: par.clone(),
-            secret: [2u8; PAIR_SECRET_LEN],
-            novo: true,
-        });
-
-        // A extension escreve fundindo, em vez de sobrescrever.
-        let mut fundido = extension.clone();
-        fundido.merge(&app);
-        assert_eq!(
-            fundido.get(&par),
-            Some([2u8; PAIR_SECRET_LEN]),
-            "a fusão tinha de ficar com o pareamento mais recente"
-        );
-
-        // E na ordem contrária dá o mesmo resultado: fusão não pode depender de quem escreve.
-        let mut ao_contrario = app;
-        ao_contrario.merge(&extension);
-        assert_eq!(ao_contrario.get(&par), Some([2u8; PAIR_SECRET_LEN]));
+        let peer = DeviceId("peer-fixture".into());
+        // Carimbos explícitos evitam sleep e dependência do relógio da máquina.
+        let extension = secure_store(&[("peer-fixture", 1, 100)]);
+        let app = secure_store(&[("peer-fixture", 2, 200)]);
+        let mut first = extension.clone();
+        first.merge(&app);
+        let mut reverse = app;
+        reverse.merge(&extension);
+        assert_eq!(first.get(&peer), Some([2; PAIR_SECRET_LEN]));
+        assert_eq!(reverse.get(&peer), first.get(&peer));
+        assert_eq!(first.len(), 1);
     }
 
-    /// A parte fácil, e que a casca perdia toda vez: chaves **diferentes** têm de sobreviver às
-    /// duas escritas.
     #[test]
     fn a_fusao_nao_perde_par_que_so_um_lado_conhece() {
-        let mut a = PairedPeers::new();
-        a.insert(&PairOutcome {
-            peer: DeviceId("mac".into()),
-            secret: [1u8; PAIR_SECRET_LEN],
-            novo: true,
-        });
-        let mut b = PairedPeers::new();
-        b.insert(&PairOutcome {
-            peer: DeviceId("dell".into()),
-            secret: [2u8; PAIR_SECRET_LEN],
-            novo: true,
-        });
-
-        a.merge(&b);
-        assert_eq!(a.len(), 2);
-        assert_eq!(a.get(&DeviceId("mac".into())), Some([1u8; PAIR_SECRET_LEN]));
-        assert_eq!(
-            a.get(&DeviceId("dell".into())),
-            Some([2u8; PAIR_SECRET_LEN])
-        );
+        let original = secure_store(&[("peer-a", 1, 100), ("common", 2, 100)]);
+        let other = secure_store(&[("peer-b", 3, 200), ("common", 4, 200)]);
+        let mut first = original.clone();
+        first.merge(&other);
+        let mut reverse = other;
+        reverse.merge(&original);
+        for merged in [first, reverse] {
+            assert_eq!(merged.len(), 3);
+            for (id, byte) in [("peer-a", 1), ("peer-b", 3), ("common", 4)] {
+                assert_eq!(
+                    merged.get(&DeviceId(id.into())),
+                    Some([byte; PAIR_SECRET_LEN])
+                );
+            }
+        }
     }
 
-    /// Um `pares.json` gravado antes do carimbo tem de continuar carregando — é o arquivo que
-    /// está no aparelho de todo mundo hoje.
-    #[test]
-    fn arquivo_do_formato_antigo_continua_sendo_lido() {
-        let antigo = r#"{"pares":{"mac":"0101010101010101010101010101010101010101010101010101010101010101"}}"#;
-        let lido = PairedPeers::from_json(antigo).expect("formato antigo");
-        assert_eq!(
-            lido.get(&DeviceId("mac".into())),
-            Some([1u8; PAIR_SECRET_LEN])
-        );
-
-        // E perde para qualquer entrada com carimbo, porque veio de antes de existir carimbo.
-        let mut novo = PairedPeers::new();
-        novo.insert(&PairOutcome {
-            peer: DeviceId("mac".into()),
-            secret: [9u8; PAIR_SECRET_LEN],
-            novo: true,
-        });
-        let mut fundido = lido;
-        fundido.merge(&novo);
-        assert_eq!(
-            fundido.get(&DeviceId("mac".into())),
-            Some([9u8; PAIR_SECRET_LEN])
-        );
-    }
-
-    /// Esquecer um par é o que a casca oferece como "parear de novo" (dívida 22).
     #[test]
     fn esquecer_um_par_apaga_so_ele() {
-        let mut p = PairedPeers::new();
-        for (id, s) in [("mac", 1u8), ("dell", 2u8)] {
-            p.insert(&PairOutcome {
-                peer: DeviceId(id.into()),
-                secret: [s; PAIR_SECRET_LEN],
-                novo: true,
-            });
-        }
-        p.remove(&DeviceId("mac".into()));
-        assert_eq!(p.len(), 1);
-        assert!(p.get(&DeviceId("mac".into())).is_none());
+        let mut store = secure_store(&[("peer-a", 1, 100), ("peer-b", 2, 100)]);
+        store.remove(&DeviceId("peer-a".into()));
+        store.remove(&DeviceId("missing".into()));
+        assert_eq!(store.len(), 1);
+        assert!(!store.is_empty());
+        assert!(store.get(&DeviceId("peer-a".into())).is_none());
+        assert!(!store.requires_repair(&DeviceId("peer-a".into())));
         assert_eq!(
-            p.get(&DeviceId("dell".into())),
-            Some([2u8; PAIR_SECRET_LEN])
+            store.get(&DeviceId("peer-b".into())),
+            Some([2; PAIR_SECRET_LEN])
+        );
+        store.remove(&DeviceId("peer-b".into()));
+        assert!(store.is_empty());
+        assert!(!store.has_secure_peers());
+    }
+
+    #[test]
+    fn store_sobrevive_ida_e_volta_por_json() {
+        let mut store = secure_store(&[("peer-a", 1, 0), ("peer-b", 2, u64::MAX)]);
+        store.insert(&PairOutcome {
+            peer: DeviceId("peer-c".into()),
+            secret: [3; PAIR_SECRET_LEN],
+            novo: true,
+        });
+        let serialized = store.to_json().unwrap();
+        let restored = PairedPeers::from_json(&serialized).unwrap();
+        assert_eq!(restored.len(), 3);
+        assert!(restored.has_secure_peers());
+        for (id, byte) in [("peer-a", 1), ("peer-b", 2), ("peer-c", 3)] {
+            assert_eq!(
+                restored.get(&DeviceId(id.into())),
+                Some([byte; PAIR_SECRET_LEN])
+            );
+            assert!(!restored.requires_repair(&DeviceId(id.into())));
+        }
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&serialized).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&restored.to_json().unwrap()).unwrap()
         );
     }
 
     #[test]
-    fn dois_pareamentos_com_o_mesmo_pin_dao_segredos_diferentes() {
-        // Se não dessem, um segredo vazado comprometeria toda sessão futura com o mesmo PIN.
-        let (g, h) = ids();
-        let pin = Pin::parse("111111").expect("pin");
-
-        let mut a1 = Pairing::new(Role::Guest, g.clone(), Some(pin.clone()), None).expect("g1");
-        let mut b1 = Pairing::new(Role::Host, h.clone(), Some(pin.clone()), None).expect("h1");
-        let (r1, _) = trocar(&mut a1, &mut b1).expect("troca 1");
-
-        let mut a2 = Pairing::new(Role::Guest, g, Some(pin.clone()), None).expect("g2");
-        let mut b2 = Pairing::new(Role::Host, h, Some(pin), None).expect("h2");
-        let (r2, _) = trocar(&mut a2, &mut b2).expect("troca 2");
-
-        assert_ne!(r1.expect("r1").secret, r2.expect("r2").secret);
+    fn arquivo_do_formato_antigo_continua_preservado_mas_exige_novo_pin() {
+        for entry in [
+            serde_json::json!("01".repeat(32)),
+            serde_json::json!({"secret":"01".repeat(32),"updated_ms":100}),
+        ] {
+            let old = serde_json::json!({"pares":{"peer-old":entry}});
+            let read = PairedPeers::from_json(&old.to_string()).unwrap();
+            let peer = DeviceId("peer-old".into());
+            assert_eq!(read.len(), 1);
+            assert_eq!(read.get(&peer), None);
+            assert!(read.requires_repair(&peer));
+            assert!(!read.has_secure_peers());
+            let saved: serde_json::Value = serde_json::from_str(&read.to_json().unwrap()).unwrap();
+            let before = &old["pares"]["peer-old"];
+            let after = &saved["pares"]["peer-old"];
+            if before.is_string() {
+                assert_eq!(before, after);
+            } else {
+                assert_eq!(before["secret"], after["secret"]);
+                assert_eq!(before["updated_ms"], after["updated_ms"]);
+            }
+            let mut modern = secure_store(&[("peer-old", 9, 0)]);
+            modern.merge(&read);
+            assert_eq!(modern.get(&peer), Some([9; PAIR_SECRET_LEN]));
+            let mut opposite = read;
+            opposite.merge(&modern);
+            assert_eq!(opposite.get(&peer), modern.get(&peer));
+        }
     }
 
     #[test]
-    fn retomada_dispensa_o_pin() {
-        let (g, h) = ids();
-        let pin = Pin::generate().expect("pin");
-        let mut guest = Pairing::new(Role::Guest, g.clone(), Some(pin.clone()), None).expect("g");
-        let mut host = Pairing::new(Role::Host, h.clone(), Some(pin), None).expect("h");
-        let (rg, rh) = trocar(&mut guest, &mut host).expect("primeiro pareamento");
-        let segredo = rg.expect("rg").secret;
-        assert_eq!(segredo, rh.expect("rh").secret);
-
-        // Segunda sessão: nenhum dos dois tem PIN, os dois têm o segredo.
-        let mut guest2 = Pairing::new(
-            Role::Guest,
-            g.clone(),
-            None,
-            Some(KnownPeer {
-                id: h.clone(),
-                secret: segredo,
-            }),
+    fn fusao_carimbo_zero_rollback_e_empate_preservam_regra_sem_rebaixar_v3() {
+        let peer = DeviceId("peer".into());
+        let zero = secure_store(&[("peer", 1, 0)]);
+        assert_eq!(zero.get(&peer), Some([1; PAIR_SECRET_LEN]));
+        let later = secure_store(&[("peer", 2, 200)]);
+        let rollback = secure_store(&[("peer", 3, 100)]);
+        let mut merged = zero;
+        merged.merge(&later);
+        merged.merge(&rollback);
+        assert_eq!(merged.get(&peer), Some([2; PAIR_SECRET_LEN]));
+        // Relógio que retrocede não prova recência: continua vencendo o maior carimbo.
+        // Empate mantém a entrada existente; não alegamos convergência para secrets divergentes.
+        merged.merge(&secure_store(&[("peer", 4, 200)]));
+        assert_eq!(merged.get(&peer), Some([2; PAIR_SECRET_LEN]));
+        let legacy = PairedPeers::from_json(
+            &serde_json::json!({"pares":{"peer":{
+                "secret":"05".repeat(32), "updated_ms":u64::MAX
+            }}})
+            .to_string(),
         )
-        .expect("g2");
-        let mut host2 = Pairing::new(
-            Role::Host,
-            h,
-            None,
-            Some(KnownPeer {
-                id: g,
-                secret: segredo,
-            }),
-        )
-        .expect("h2");
-        let (rg2, rh2) = trocar(&mut guest2, &mut host2).expect("retomada");
-        let rg2 = rg2.expect("rg2");
-        let rh2 = rh2.expect("rh2");
-        assert!(!rg2.novo && !rh2.novo);
-        assert_eq!(rg2.secret, segredo);
-        assert_eq!(rh2.secret, segredo);
+        .unwrap();
+        merged.merge(&legacy);
+        assert_eq!(merged.get(&peer), Some([2; PAIR_SECRET_LEN]));
+        let mut reverse = legacy;
+        reverse.merge(&secure_store(&[("peer", 1, 0)]));
+        assert_eq!(reverse.get(&peer), Some([1; PAIR_SECRET_LEN]));
     }
 
     #[test]
-    fn retomada_com_segredo_errado_e_recusada() {
-        let (g, h) = ids();
-        let mut guest = Pairing::new(
-            Role::Guest,
-            g.clone(),
-            None,
-            Some(KnownPeer {
-                id: h.clone(),
-                secret: [1u8; 32],
-            }),
-        )
-        .expect("g");
-        let mut host = Pairing::new(
-            Role::Host,
-            h,
-            None,
-            Some(KnownPeer {
-                id: g,
-                secret: [2u8; 32],
-            }),
-        )
-        .expect("h");
-        assert!(trocar(&mut guest, &mut host).is_err());
-    }
-
-    #[test]
-    fn convidado_sem_pin_e_sem_segredo_nao_abre() {
-        let (g, _) = ids();
-        let mut guest = Pairing::new(Role::Guest, g, None, None).expect("g");
-        assert!(guest.open().is_err());
-    }
-
-    #[test]
-    fn anfitriao_nao_abre_a_troca() {
-        let (_, h) = ids();
-        let mut host =
-            Pairing::new(Role::Host, h, Some(Pin::generate().expect("pin")), None).expect("h");
-        assert!(host.open().is_err());
-    }
-
-    #[test]
-    fn mensagem_fora_de_ordem_falha() {
-        let (g, _) = ids();
-        let mut guest =
-            Pairing::new(Role::Guest, g, Some(Pin::generate().expect("pin")), None).expect("g");
-        // `ConfirmAck` antes de qualquer coisa.
-        assert!(guest
-            .step(PairFrame::ConfirmAck {
-                mac: hex_encode(&[0u8; 32])
-            })
-            .is_err());
-    }
-
-    #[test]
-    fn fail_da_outra_ponta_vira_erro() {
-        let (g, _) = ids();
-        let mut guest =
-            Pairing::new(Role::Guest, g, Some(Pin::generate().expect("pin")), None).expect("g");
-        let erro = guest
-            .step(PairFrame::Fail {
-                motivo: "sem PIN ativo".into(),
-            })
-            .expect_err("tem de falhar");
-        assert!(format!("{erro}").contains("sem PIN ativo"));
-    }
-
-    #[test]
-    fn chave_publica_de_ordem_baixa_e_recusada() {
-        let (g, h) = ids();
-        let pin = Pin::generate().expect("pin");
-        let mut host = Pairing::new(Role::Host, h, Some(pin), None).expect("h");
-        // Todo-zeros é o ponto de ordem baixa clássico: o X25519 devolve zero.
-        let erro = host
-            .step(PairFrame::Hello {
-                device_id: g,
-                public_key: hex_encode(&[0u8; 32]),
-                nonce: hex_encode(&[0u8; NONCE_LEN]),
-            })
-            .expect_err("tem de recusar");
-        assert!(format!("{erro}").contains("degenerado"), "erro: {erro}");
+    fn has_secure_peers_nao_confunde_legado_futuro_ou_material_invalido() {
+        for entry in [
+            serde_json::json!("01".repeat(32)),
+            serde_json::json!({"secret":"01".repeat(32),"updated_ms":0,"security_version":4}),
+            serde_json::json!({"secret":"invalid","updated_ms":0,"security_version":3}),
+        ] {
+            let store =
+                PairedPeers::from_json(&serde_json::json!({"pares":{"peer":entry}}).to_string())
+                    .unwrap();
+            assert!(!store.has_secure_peers());
+            assert!(store.get(&DeviceId("peer".into())).is_none());
+            assert!(store.requires_repair(&DeviceId("peer".into())));
+            assert_eq!(store.len(), 1);
+        }
+        assert!(secure_store(&[("peer", 7, 0)]).has_secure_peers());
     }
 
     #[test]
     fn pin_gerado_tem_digitos_validos() {
         for _ in 0..64 {
-            let p = Pin::generate().expect("pin");
-            let texto = p.to_display();
-            assert_eq!(texto.len(), PIN_DIGITS);
-            assert!(texto.chars().all(|c| c.is_ascii_digit()));
-            assert_eq!(Pin::parse(&texto).expect("reparse"), p);
+            let generated = Pin::generate().unwrap();
+            let text = generated.to_display();
+            assert_eq!(text.len(), PIN_DIGITS);
+            assert!(text.bytes().all(|b| b.is_ascii_digit()));
+            assert_eq!(Pin::parse(&text).unwrap(), generated);
         }
     }
 
     #[test]
     fn pin_aceita_separadores_e_recusa_tamanho_errado() {
-        assert_eq!(
-            Pin::parse("123 456").expect("com espaço"),
-            Pin::parse("123456").expect("sem")
+        assert_eq!(Pin::parse("012 345").unwrap(), pin());
+        assert_eq!(Pin::parse("0.1-2 3.4-5").unwrap(), pin());
+        for malformed in ["", "12345", "1234567", "12a456", "12345💡"] {
+            assert!(Pin::parse(malformed).is_err());
+        }
+        assert!(
+            Pin::parse("12345").is_err(),
+            "zero inicial não pode desaparecer"
         );
-        assert!(Pin::parse("12345").is_err());
-        assert!(Pin::parse("1234567").is_err());
-        assert!(Pin::parse("12a456").is_err());
     }
 
     #[test]
-    fn pin_nao_vaza_no_debug() {
-        let p = Pin::parse("987654").expect("pin");
-        assert_eq!(format!("{p:?}"), "Pin(******)");
-        assert!(!format!("{p:?}").contains("987654"));
-    }
-
-    #[test]
-    fn transcricao_nao_e_ambigua_entre_ids() {
-        let pk = [7u8; 32];
-        let n = [9u8; NONCE_LEN];
-        let a = transcricao(&Partes {
-            guest_id: &DeviceId("ab".into()),
-            host_id: &DeviceId("c".into()),
-            pk_guest: &pk,
-            pk_host: &pk,
-            nonce_guest: &n,
-            nonce_host: &n,
-        });
-        let b = transcricao(&Partes {
-            guest_id: &DeviceId("a".into()),
-            host_id: &DeviceId("bc".into()),
-            pk_guest: &pk,
-            pk_host: &pk,
-            nonce_guest: &n,
-            nonce_host: &n,
-        });
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn store_sobrevive_ida_e_volta_por_json() {
-        let mut store = PairedPeers::new();
-        store.insert(&PairOutcome {
-            peer: DeviceId("dell".into()),
-            secret: [42u8; PAIR_SECRET_LEN],
+    fn debug_de_pareamento_nao_expoe_segredos_nem_identidade() {
+        let secret = "a1".repeat(PAIR_SECRET_LEN);
+        for entry in [
+            serde_json::json!(secret),
+            serde_json::json!({"secret":secret,"updated_ms":123}),
+            serde_json::json!({"secret":secret,"updated_ms":123,"security_version":3}),
+        ] {
+            let store = PairedPeers::from_json(
+                &serde_json::json!({"pares":{"private-person-id":entry}}).to_string(),
+            )
+            .unwrap();
+            assert_eq!(format!("{store:?}"), "PairedPeers { quantidade: 1 }");
+        }
+        let frames = [
+            PairFrame::Probe {
+                version: 3,
+                guest_nonce: secret.clone(),
+                guest_role: 0,
+            },
+            PairFrame::Challenge {
+                version: 3,
+                token: secret.clone(),
+                host_nonce: secret.clone(),
+                host_role: 1,
+                resume_hints: vec![secret.clone()],
+            },
+            PairFrame::Hello {
+                mode: PairMode::Pin,
+                hint: Some(secret.clone()),
+                ke1: secret.clone(),
+            },
+            PairFrame::Ack {
+                ke2: secret.clone(),
+            },
+            PairFrame::Confirm {
+                ke3: secret.clone(),
+                identity_ciphertext: secret.clone(),
+            },
+            PairFrame::ConfirmAck {
+                identity_ciphertext: secret.clone(),
+            },
+            PairFrame::NeedsPin,
+            PairFrame::Fail {
+                motivo: "private-person-id PIN901234".into(),
+            },
+        ];
+        for frame in frames {
+            let log = format!("{frame:?}");
+            assert!(!log.contains(&secret));
+            assert!(!log.contains("private-person-id"));
+            assert!(!log.contains("901234"));
+        }
+        let result = PairOutcome {
+            peer: DeviceId("private-person-id".into()),
+            secret: [0xa1; 32],
             novo: true,
-        });
-        let texto = store.to_json().expect("json");
-        let voltou = PairedPeers::from_json(&texto).expect("volta");
+        };
+        let known = KnownPeer {
+            id: result.peer.clone(),
+            secret: result.secret,
+        };
+        let log = format!("{result:?} {known:?}");
+        assert!(!log.contains("private-person-id"));
+        assert!(!log.contains(&secret));
         assert_eq!(
-            voltou.get(&DeviceId("dell".into())),
-            Some([42u8; PAIR_SECRET_LEN])
+            format!("{:?}", Pin::parse("901234").unwrap()),
+            "Pin(******)"
         );
-        assert_eq!(voltou.len(), 1);
     }
-
     #[test]
-    fn anfitriao_recusa_retomada_de_outro_aparelho() {
-        let (g, h) = ids();
-        let mut host = Pairing::new(
-            Role::Host,
-            h,
+    fn ksf_pin_equivale_ao_argon2_publicado_e_resume_so_usa_identity_no_modo_forte() {
+        use opaque_ke::ksf::Ksf;
+        let input: opaque_ke::generic_array::GenericArray<
+            u8,
+            opaque_ke::generic_array::typenum::U64,
+        > = opaque_ke::generic_array::GenericArray::clone_from_slice(&[7u8; 64]);
+        let expected = argon2::Argon2::default().hash(input.clone()).unwrap();
+        assert_eq!(ModeKsf::Pin.hash(input.clone()).unwrap(), expected);
+        assert_eq!(ModeKsf::Resume.hash(input.clone()).unwrap(), input);
+    }
+    #[test]
+    fn mutacao_pin_para_resume_e_hint_copiado_nao_autenticam() {
+        let secret = [42; 32];
+        let (mut g, mut h) = machines(
+            Some(pin()),
+            Some(pin()),
             None,
             Some(KnownPeer {
-                id: DeviceId("outro-aparelho".into()),
-                secret: [3u8; 32],
+                id: DeviceId("guest-private".into()),
+                secret,
             }),
-        )
-        .expect("h");
-        let erro = host
-            .step(PairFrame::Resume {
-                device_id: g,
-                nonce: hex_encode(&[0u8; NONCE_LEN]),
-            })
-            .expect_err("tem de recusar");
-        assert!(format!("{erro}").contains("outro-aparelho"), "erro: {erro}");
+        );
+        let challenge = h.step(g.open().unwrap()).unwrap().reply.unwrap();
+        let copied = match &challenge {
+            PairFrame::Challenge { resume_hints, .. } => resume_hints[0].clone(),
+            _ => unreachable!(),
+        };
+        let mut hello = g.step(challenge).unwrap().reply.unwrap();
+        if let PairFrame::Hello { mode, hint, .. } = &mut hello {
+            *mode = PairMode::Resume;
+            *hint = Some(copied);
+        }
+        let ack = h.step(hello).unwrap().reply.unwrap();
+        assert!(g.step(ack).is_err());
+        assert!(g.take_secure_channel().is_err());
+        assert!(h.take_secure_channel().is_err());
+    }
+    #[test]
+    #[ignore = "benchmark local solicitado; executar com time -l e test-threads=2"]
+    fn benchmark_pake_memoria_e_latencia() {
+        for label in ["pin", "wrong_pin", "resume"] {
+            let start = std::time::Instant::now();
+            let (mut g, mut h) = match label {
+                "pin" => machines(Some(pin()), Some(pin()), None, None),
+                "wrong_pin" => {
+                    machines(Some(Pin::parse("999999").unwrap()), Some(pin()), None, None)
+                }
+                _ => machines(
+                    None,
+                    None,
+                    Some(KnownPeer {
+                        id: DeviceId("host-private".into()),
+                        secret: [42; 32],
+                    }),
+                    Some(KnownPeer {
+                        id: DeviceId("guest-private".into()),
+                        secret: [42; 32],
+                    }),
+                ),
+            };
+            let result = exchange(&mut g, &mut h);
+            assert_eq!(result.is_ok(), label != "wrong_pin");
+            println!(
+                "{{\"case\":\"{label}\",\"elapsed_ms\":{}}}",
+                start.elapsed().as_millis()
+            );
+        }
+    }
+    #[test]
+    #[ignore = "benchmark concorrente solicitado; executar com time -l"]
+    fn benchmark_pake_duas_sessoes_pin() {
+        std::thread::scope(|scope| {
+            for worker in 0..2 {
+                scope.spawn(move || {
+                    let start = std::time::Instant::now();
+                    let (mut g, mut h) = machines(Some(pin()), Some(pin()), None, None);
+                    exchange(&mut g, &mut h).unwrap();
+                    println!(
+                        "{{\"case\":\"pin_parallel\",\"worker\":{worker},\"elapsed_ms\":{}}}",
+                        start.elapsed().as_millis()
+                    );
+                });
+            }
+        });
     }
 }

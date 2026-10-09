@@ -2,6 +2,7 @@
 param(
     [Parameter(Mandatory=$true)][string]$Pacote,
     [Parameter(Mandatory=$true)][string]$Versao,
+    [ValidateSet('pt-BR','en-US')][string]$Idioma,
     [string]$Revisao,
     [string]$Estagio,
     [switch]$ExigirAssinatura,
@@ -40,7 +41,14 @@ try {
     $propriedades = @{}
     foreach ($linha in @(Linhas-Msi 'SELECT `Property`, `Value` FROM `Property`' 2)) { $propriedades[$linha[0]] = $linha[1] }
     if ($propriedades.ProductName -ne 'Quall Monitor' -or $propriedades.ProductVersion -ne $Versao) { throw 'ProductName/ProductVersion incorretos no MSI.' }
+    $cultura = switch ($propriedades.ProductLanguage) { '1046' { 'pt-BR' } '1033' { 'en-US' } default { throw 'Idioma de produto não suportado no MSI.' } }
+    if ($Idioma -and $cultura -ne $Idioma) { throw 'O MSI não está no idioma solicitado.' }
+    [xml]$localizacao = [IO.File]::ReadAllText((Join-Path $PSScriptRoot "QuallMonitor.$cultura.wxl"))
+    $textos = @{}
+    foreach ($item in $localizacao.WixLocalization.String) { $textos[$item.Id] = $item.Value }
     if ($propriedades.UpgradeCode -ne '{CF7A1B50-649C-45A5-A330-5B11B72F1AD9}') { throw 'UpgradeCode de outro produto.' }
+    $upgrades = @(Linhas-Msi 'SELECT `Language`, `ActionProperty` FROM `Upgrade`' 2)
+    if (-not ($upgrades | Where-Object { $_[1] -eq 'WIX_UPGRADE_DETECTED' }) -or ($upgrades | Where-Object { $_[0] })) { throw 'A atualização deve reconhecer o Monitor nos dois idiomas.' }
     if ($propriedades.ARPURLINFOABOUT -ne 'https://queven.com.br/quall-monitor/') { throw 'Página de produto incorreta no MSI.' }
     $esperados = @('quall-monitor.exe','driver-setup.ps1','LICENSE','LICENSE-SCOPE.md','NOTICE.txt','THIRD_PARTY_NOTICES.txt','SOURCE-REVISION.txt','SudoVDA-NOTICES.txt','WiX-NOTICES.txt')
     $arquivos = @{}
@@ -66,6 +74,7 @@ try {
     $consentimento = @($controles | Where-Object { $_[0] -eq 'MonitorDriverConsent' -and $_[2] -eq 'CheckBox' -and $_[3] -eq 'SUDOVDA_CONSENT' })
     $explicacao = @($controles | Where-Object { $_[0] -eq 'MonitorDriverConsent' -and $_[1] -eq 'Explanation' })
     if ($consentimento.Count -ne 1 -or $explicacao.Count -ne 1 -or $explicacao[0][4] -notmatch 'Root' -or $explicacao[0][4] -notmatch 'TrustedPublisher') { throw 'O diálogo deve explicar a confiança e exigir opção explícita.' }
+    if ($explicacao[0][4] -ne $textos.DriverExplanation -or $consentimento[0][4] -ne $textos.DriverConsent) { throw 'O consentimento deve estar traduzido no idioma do MSI.' }
     if ($propriedades.SUDOVDA_CONSENT) { throw 'O consentimento do driver não pode vir marcado por padrão.' }
 
     $extraidos = Join-Path $temporaria 'conteudo'
@@ -90,12 +99,18 @@ try {
     if (-not [Text.Encoding]::ASCII.GetString($bytes).Contains('quall-monitor-distribuicao: desktop-v1')) { throw 'Produto incorreto no executável extraído.' }
     $exeComExtensao = Join-Path $temporaria 'quall-monitor.exe'
     Copy-Item -LiteralPath $exe -Destination $exeComExtensao
+    $versaoExe = [Diagnostics.FileVersionInfo]::GetVersionInfo($exeComExtensao)
+    if ($versaoExe.ProductVersion -ne $Versao -or $versaoExe.FileVersion -ne $Versao -or $versaoExe.ProductName -ne 'Quall Monitor') { throw 'A versão ou produto dos recursos PE difere do MSI.' }
     $assinaturaExe = Get-AuthenticodeSignature -LiteralPath $exeComExtensao
     $assinaturaMsi = Get-AuthenticodeSignature -LiteralPath $Pacote
     if ($ExigirAssinatura -and ($assinaturaExe.Status -ne 'Valid' -or $assinaturaMsi.Status -ne 'Valid')) { throw 'O MSI e o executável devem ter assinaturas Authenticode válidas.' }
     [pscustomobject]@{
         ProductName = $propriedades.ProductName
         ProductVersion = $propriedades.ProductVersion
+        ProductLanguage = $propriedades.ProductLanguage
+        Culture = $cultura
+        ExeProductVersion = $versaoExe.ProductVersion
+        ExeFileVersion = $versaoExe.FileVersion
         SourceRevision = $fonte.Trim()
         MsiSha256 = (Get-FileHash -LiteralPath $Pacote -Algorithm SHA256).Hash.ToLowerInvariant()
         MsiAuthenticode = [string]$assinaturaMsi.Status

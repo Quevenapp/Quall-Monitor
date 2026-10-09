@@ -4,13 +4,14 @@
      xmlns:fire="http://wixtoolset.org/schemas/v4/wxs/firewall"
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
   <Package Name="Quall Monitor" Manufacturer="Veneri &amp; Quellis Ltda."
-           Version="$(var.Versao)" Language="1033" Codepage="1252" Scope="perMachine"
+           Version="$(var.Versao)" Language="!(loc.ProductLanguage)" Codepage="1252" Scope="perMachine"
            Compressed="yes" InstallerVersion="500"
            UpgradeCode="CF7A1B50-649C-45A5-A330-5B11B72F1AD9">
-    <MajorUpgrade Schedule="afterInstallInitialize" DowngradeErrorMessage="Uma versão mais nova do Quall Monitor já está instalada." />
+    <MajorUpgrade Schedule="afterInstallInitialize" IgnoreLanguage="yes" AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="!(loc.NewerVersionInstalled)" />
     <MediaTemplate EmbedCab="yes" />
     <Launch Condition="Installed OR (VersionNT64 AND WINDOWSBUILDNUMBER &gt;= 22000)"
-            Message="Quall Monitor requer Windows 11 x64, build 22000 ou mais recente." />
+            Message="!(loc.MinimumWindows)" />
     <Property Id="WINDOWSBUILDNUMBER" Secure="yes">
       <RegistrySearch Id="NativeWindowsBuild" Root="HKLM" Key="SOFTWARE\Microsoft\Windows NT\CurrentVersion" Name="CurrentBuildNumber" Type="raw" Bitness="always64" />
     </Property>
@@ -25,26 +26,26 @@
     </Property>
     <SetProperty Id="ARPINSTALLLOCATION" Value="[INSTALLFOLDER]" After="CostFinalize" />
     <util:CloseApplication Id="CloseQuallMonitor" Target="quall-monitor.exe" CloseMessage="yes"
-                          RebootPrompt="no" Description="Feche o Quall Monitor para continuar." />
+                          RebootPrompt="no" Description="!(loc.CloseMonitor)" />
     <ui:WixUI Id="WixUI_Minimal" />
     <WixVariable Id="WixUILicenseRtf" Value="$(var.Bin)\license.rtf" />
     <Property Id="WIXUI_EXITDIALOGOPTIONALTEXT"
-              Value="O driver SudoVDA acompanha o Quall Monitor. Se o Windows pedir, reinicie antes de usar. Detalhes em driver-setup.log na pasta do aplicativo." />
+              Value="!(loc.ExitNote)" />
     <UI>
-      <Dialog Id="MonitorDriverConsent" Width="370" Height="270" Title="Quall Monitor — driver SudoVDA">
+      <Dialog Id="MonitorDriverConsent" Width="370" Height="270" Title="!(loc.DriverDialogTitle)">
         <Control Id="Title" Type="Text" X="18" Y="18" Width="334" Height="22"
-                 Text="Driver de monitor virtual incluído" />
+                 Text="!(loc.DriverTitle)" />
         <Control Id="Explanation" Type="Text" X="18" Y="48" Width="334" Height="105"
-                 Text="Para criar monitores, o setup instala SudoVDA 1.10.9.289. Se o driver já existir, ele será preservado. O pacote incluído usa o certificado autoemitido CN=sudovda@su.mk. Ao marcar a confirmação abaixo, você autoriza adicionar esse certificado às lojas Root e TrustedPublisher da máquina. Isso concede confiança ao certificado. O setup remove somente o driver e a confiança que o Quall Monitor tiver instalado quando você desinstalar o aplicativo." />
+                 Text="!(loc.DriverExplanation)" />
         <Control Id="Consent" Type="CheckBox" X="18" Y="164" Width="334" Height="32"
                  Property="SUDOVDA_CONSENT" CheckBoxValue="1"
-                 Text="Aceito confiar no certificado para instalar o driver incluído." />
+                 Text="!(loc.DriverConsent)" />
         <Control Id="Note" Type="Text" X="18" Y="202" Width="334" Height="26"
-                 Text="Sem confirmação, a instalação só continua com driver ou confiança já existentes. Instalação silenciosa nunca adiciona confiança." />
-        <Control Id="Continue" Type="PushButton" X="245" Y="242" Width="105" Height="17" Default="yes" Text="Continuar">
+                 Text="!(loc.DriverNote)" />
+        <Control Id="Continue" Type="PushButton" X="245" Y="242" Width="105" Height="17" Default="yes" Text="!(loc.Continue)">
           <Publish Event="EndDialog" Value="Return" />
         </Control>
-        <Control Id="Cancel" Type="PushButton" X="155" Y="242" Width="80" Height="17" Cancel="yes" Text="Cancelar">
+        <Control Id="Cancel" Type="PushButton" X="155" Y="242" Width="80" Height="17" Cancel="yes" Text="!(loc.Cancel)">
           <Publish Event="EndDialog" Value="Exit" />
         </Control>
       </Dialog>

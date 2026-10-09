@@ -24,13 +24,14 @@ let package = Package(
         .systemLibrary(name: "CQuall"),
         .target(name: "QuallReceptorKit", dependencies: ["QuallIdiomaKit"]),
         .target(name: "QuallNetKit", dependencies: ["CQuall", "QuallReceptorKit"]),
+        .target(name: "QuallMonitorKit", dependencies: ["QuallCaptureKit", "QuallIdiomaKit"]),
         .executableTarget(name: "quall-monitor-display", dependencies: ["QuallCaptureKit"],
                           path: "Sources/quall-monitor-virtual", swiftSettings: screen),
         .executableTarget(name: "QuallMonitorApp",
-                          dependencies: ["QuallCaptureKit", "QuallNetKit", "QuallReceptorKit", "QuallIdiomaKit", "CQuall"],
+                          dependencies: ["QuallCaptureKit", "QuallNetKit", "QuallReceptorKit", "QuallIdiomaKit", "QuallMonitorKit", "CQuall"],
                           swiftSettings: screen,
                           linkerSettings: [.unsafeFlags([nucleus, "-lc++"])]),
-        .testTarget(name: "QuallMonitorTests", dependencies: ["QuallCaptureKit", "QuallReceptorKit"],
+        .testTarget(name: "QuallMonitorTests", dependencies: ["QuallCaptureKit", "QuallReceptorKit", "QuallMonitorKit", "QuallIdiomaKit"],
                     swiftSettings: screen)
     ]
 )

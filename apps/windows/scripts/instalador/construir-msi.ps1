@@ -1,7 +1,8 @@
 # MPL-2.0. Build Quall Monitor x64 for direct distribution; no Store or virtual-camera package.
 param(
-    [ValidatePattern('^\d+\.\d+\.\d+$')][string]$Versao = '0.1.0',
+    [ValidatePattern('^\d+\.\d+\.\d+$')][string]$Versao = '0.1.1',
     [string]$Destino,
+    [ValidateSet('pt-BR','en-US')][string]$Idioma = 'pt-BR',
     [switch]$SoEmpacotar
 )
 $ErrorActionPreference = 'Stop'
@@ -50,12 +51,14 @@ $sujo = [bool](& git -C $raiz status --porcelain)
 $texto = [IO.File]::ReadAllText((Join-Path $raiz 'LICENSE'))
 $texto = $texto.Replace('\','\\').Replace('{','\{').Replace('}','\}').Replace("`r",'').Replace("`n",'\par ')
 [IO.File]::WriteAllText((Join-Path $estagio 'license.rtf'), ('{\rtf1\ansi\deff0{\fonttbl{\f0 Segoe UI;}}\f0\fs18 ' + $texto + '}'), [Text.Encoding]::ASCII)
-$msi = Join-Path $Destino "Quall-Monitor-$Versao-windows-x64.msi"
-& wix build (Join-Path $PSScriptRoot 'QuallMonitor.wxs') -arch x64 -culture en-US `
+$sufixoIdioma = if ($Idioma -eq 'en-US') { '-en-US' } else { '' }
+$msi = Join-Path $Destino "Quall-Monitor-$Versao-windows-x64$sufixoIdioma.msi"
+& wix build (Join-Path $PSScriptRoot 'QuallMonitor.wxs') -arch x64 -culture $Idioma `
+    -loc (Join-Path $PSScriptRoot "QuallMonitor.$Idioma.wxl") `
     -ext WixToolset.Util.wixext -ext WixToolset.Firewall.wixext -ext WixToolset.UI.wixext `
     -d "Versao=$Versao" -d "Bin=$estagio" -o $msi
 if ($LASTEXITCODE -ne 0) { throw 'Falha ao construir MSI.' }
-& (Join-Path $PSScriptRoot 'verificar-msi.ps1') -Pacote $msi -Versao $Versao -Revisao $rev -Estagio $estagio | Set-Content -LiteralPath "$msi.validation.json" -Encoding UTF8
+& (Join-Path $PSScriptRoot 'verificar-msi.ps1') -Pacote $msi -Versao $Versao -Idioma $Idioma -Revisao $rev -Estagio $estagio | Set-Content -LiteralPath "$msi.validation.json" -Encoding UTF8
 $hash = (Get-FileHash -LiteralPath $msi -Algorithm SHA256).Hash.ToLowerInvariant()
 [IO.File]::WriteAllText("$msi.sha256", "$hash  $([IO.Path]::GetFileName($msi))`n", [Text.Encoding]::ASCII)
 Write-Output $msi

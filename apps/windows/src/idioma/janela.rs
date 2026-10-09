@@ -80,7 +80,7 @@ pub const TEXTOS: &[(&str, &str)] = &[
     ("Espelhando para {} aparelhos", "Mirroring to {} devices"),
     ("Mais um aparelho", "One more device"),
     ("Conectando", "Connecting"),
-    ("O outro aparelho precisa já ter clicado em Espelhar: quem exibe só entra depois de quem transmite estar esperando.", "The other device must have already clicked Mirror: the receiver can only join once the sender is waiting."),
+    ("O outro aparelho precisa já ter clicado em Espelhar: quem exibe só entra depois de quem transmite estar esperando.", "The other device must have already clicked Extend: the receiver can only join once the sender is waiting."),
     ("Conectado", "Connected"),
     ("do outro aparelho", "from the other device"),
     ("de {}", "from {}"),
@@ -169,7 +169,7 @@ pub const TEXTOS: &[(&str, &str)] = &[
     #[cfg(any(test, feature = "tela-estendida-futura"))]
     ("os monitores da vez anterior ainda estão saindo; espere alguns segundos", "the displays from last time are still being removed; wait a few seconds"),
     #[cfg(any(test, feature = "tela-estendida-futura"))]
-    ("A tela estendida não está disponível: {}. Toque em Espelhar para tentar de novo.", "The extended display isn't available: {}. Click Mirror to try again."),
+    ("A tela estendida não está disponível: {}. Toque em Estender para tentar de novo.", "The extended display isn't available: {}. Click Extend to try again."),
     #[cfg(any(test, feature = "tela-estendida-futura"))]
     ("nenhuma placa de vídeo de hardware foi encontrada", "no hardware graphics card was found"),
     #[cfg(any(test, feature = "tela-estendida-futura"))]
@@ -181,6 +181,6 @@ pub const TEXTOS: &[(&str, &str)] = &[
     ("{} saiu.", "{} left."),
     ("A conexão com {} caiu.", "The connection to {} dropped."),
     ("Um aparelho tentou entrar com o PIN errado. O PIN mudou: passe os seis dígitos novos — cada PIN vale uma tentativa por conexão.", "A device tried to join with the wrong PIN. The PIN changed: share the six new digits — each PIN is good for one try per connection."),
-    ("Um aparelho tentou entrar com o PIN errado. Clique em Espelhar de novo e passe os seis dígitos novos — cada PIN vale uma tentativa por conexão.", "A device tried to join with the wrong PIN. Click Mirror again and share the six new digits — each PIN is good for one try per connection."),
+    ("Um aparelho tentou entrar com o PIN errado. Clique em Estender de novo e passe os seis dígitos novos — cada PIN vale uma tentativa por conexão.", "A device tried to join with the wrong PIN. Click Extend again and share the six new digits — each PIN is good for one try per connection."),
     ("O pareamento de mais um aparelho não fechou. Ou o PIN não conferiu, ou o outro aparelho tentou entrar com um pareamento que este computador não reconhece mais. O PIN mudou: digite no outro aparelho o PIN novo que aparece aqui.", "Pairing one more device didn't complete. Either the PIN didn't match, or the other device tried to join with a pairing this computer no longer recognizes. The PIN changed: enter on the other device the new PIN shown here."),
 ];

@@ -1,3 +1,4 @@
+// Os identificadores e endereços de exemplos/fixtures são sintéticos; não identificam a bancada privada.
 //! Sinalização: mini servidor HTTP/WebSocket local, hospedado pelo emissor.
 //!
 //! Zero servidor online — sem STUN, sem TURN, sem intermediário. A troca de SDP e candidatos ICE
@@ -30,20 +31,23 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tungstenite::handshake::HandshakeError;
-use tungstenite::protocol::WebSocketConfig;
+#[cfg(any(feature = "webrtc", test))]
+use tungstenite::protocol::CloseFrame;
+use tungstenite::protocol::{frame::coding::CloseCode, WebSocketConfig};
 use tungstenite::{Message, WebSocket};
 
 use crate::cancel::Cancelamento;
 use crate::error::{Error, Result};
 use crate::pairing::PairFrame;
 use crate::protocol::{Announcement, PROTOCOL_VERSION};
+use crate::secure_channel::SecureChannel;
 
-/// Caminho do WebSocket. Versionado no caminho para que uma versão futura possa conviver com
-/// esta na mesma porta em vez de quebrar o aparelho antigo.
-pub const SIGNALING_PATH: &str = "/quall/v1";
+/// Caminho exclusivo da revisão autenticada. Caminhos v1/v2 são recusados sem fallback.
+pub const SIGNALING_PATH: &str = "/quall/v3";
 
 /// Teto de uma mensagem de sinalização.
 const MAX_MENSAGEM: usize = 256 * 1024;
+const MAX_PAREAMENTO: usize = 16 * 1024;
 /// Buffers de leitura e escrita por conexão.
 const BUFFER: usize = 8 * 1024;
 
@@ -321,12 +325,6 @@ where
     })
 }
 
-impl SignalMessage {
-    fn to_ws(&self) -> Result<Message> {
-        Ok(Message::Text(serde_json::to_string(self)?.into()))
-    }
-}
-
 /// Uma conexão de sinalização já estabelecida, dos dois lados igual.
 ///
 /// Quem chama fica dono da thread que roda [`Link::poll`]. As threads do libdatachannel não
@@ -335,10 +333,12 @@ impl SignalMessage {
 /// caminho quente.
 pub struct Link {
     ws: WebSocket<TcpStream>,
+    secure: Option<SecureChannel>,
     saida_tx: Sender<SignalMessage>,
     saida_rx: Receiver<SignalMessage>,
     peer: SocketAddr,
     fechado: bool,
+    invalido: bool,
 }
 
 /// Ponta de escrita da fila de saída. Clonável e `Send`: é o que vai para os callbacks do
@@ -360,10 +360,12 @@ impl Link {
         let (saida_tx, saida_rx) = mpsc::channel();
         Link {
             ws,
+            secure: None,
             saida_tx,
             saida_rx,
             peer,
             fechado: false,
+            invalido: false,
         }
     }
 
@@ -376,11 +378,61 @@ impl Link {
         LinkSender(self.saida_tx.clone())
     }
 
+    /// Transfere o canal autenticado do PAKE, preservando seus contadores. Não há downgrade.
+    pub fn enable_secure(&mut self, secure: SecureChannel) -> Result<()> {
+        if self.secure.is_some() || self.fechado || self.invalido {
+            return Err(Error::Protocol(
+                "canal seguro já instalado ou conexão indisponível".into(),
+            ));
+        }
+        self.secure = Some(secure);
+        Ok(())
+    }
+
+    fn codificar(&mut self, msg: &SignalMessage) -> Result<Message> {
+        if self.invalido || self.fechado {
+            return Err(Error::Closed);
+        }
+        if let Some(secure) = self.secure.as_mut() {
+            if matches!(msg, SignalMessage::Pair(_)) {
+                return Err(Error::Protocol("pareamento depois da autenticação".into()));
+            }
+            let plaintext = serde_json::to_vec(msg)?;
+            if plaintext.len() > MAX_MENSAGEM - 32 {
+                return Err(Error::Protocol("sinalização excede o limite".into()));
+            }
+            return Ok(Message::Binary(secure.seal(&plaintext)?.into()));
+        }
+        // Somente o protocolo PAKE sem identidade pública passa antes da autenticação.
+        if !matches!(msg, SignalMessage::Pair(_)) {
+            return Err(Error::Protocol(
+                "sinalização pessoal antes da autenticação".into(),
+            ));
+        }
+        let text = serde_json::to_string(msg)?;
+        if text.len() > MAX_PAREAMENTO {
+            return Err(Error::Protocol("pareamento excede o limite".into()));
+        }
+        Ok(Message::Text(text.into()))
+    }
+
     /// Escreve agora, sem passar pela fila. Use da própria thread do `poll`.
     pub fn send(&mut self, msg: &SignalMessage) -> Result<()> {
-        self.ws.send(msg.to_ws()?).map_err(traduzir)?;
-        self.ws.flush().map_err(traduzir)?;
-        Ok(())
+        let wire = self.codificar(msg)?;
+        let result = self.ws.send(wire).and_then(|()| self.ws.flush());
+        self.conferir_escrita(result)
+    }
+
+    fn conferir_escrita(
+        &mut self,
+        result: std::result::Result<(), tungstenite::Error>,
+    ) -> Result<()> {
+        result.map_err(|error| {
+            // O contador AEAD pode ter sido consumido antes de uma escrita parcial. A conexão
+            // inteira termina; tentar reutilizá-la criaria um salto de sequência ou duplicação.
+            self.invalido = true;
+            traduzir(error)
+        })
     }
 
     /// Drena a fila de saída para a rede, sem ler nada.
@@ -391,15 +443,19 @@ impl Link {
     pub fn flush(&mut self) -> Result<()> {
         loop {
             match self.saida_rx.try_recv() {
-                Ok(msg) => self.ws.send(msg.to_ws()?).map_err(traduzir)?,
+                Ok(msg) => {
+                    let wire = self.codificar(&msg)?;
+                    let result = self.ws.send(wire);
+                    self.conferir_escrita(result)?;
+                }
                 Err(TryRecvError::Empty) => break,
                 // O `Link` é dono de um `Sender`, então `Disconnected` não acontece enquanto ele
                 // existir. Tratar como fila vazia é o que resta de sensato.
                 Err(TryRecvError::Disconnected) => break,
             }
         }
-        self.ws.flush().map_err(traduzir)?;
-        Ok(())
+        let result = self.ws.flush();
+        self.conferir_escrita(result)
     }
 
     /// Drena a fila de saída e espera até `FATIA_DE_LEITURA` por uma mensagem.
@@ -444,6 +500,9 @@ impl Link {
     /// significa "sem prazo", que é o oposto da intenção. Quem pedia espera curta continua
     /// esperando o mesmo tanto.
     pub fn poll_por(&mut self, fatia: Duration) -> Result<Option<SignalMessage>> {
+        if self.invalido || self.fechado {
+            return Err(Error::Closed);
+        }
         self.flush()?;
 
         if fatia.is_zero() {
@@ -482,16 +541,50 @@ impl Link {
         &mut self,
         lido: std::result::Result<Message, tungstenite::Error>,
     ) -> Result<Option<SignalMessage>> {
+        let result = self.interpretar_inner(lido);
+        if result.is_err() {
+            self.invalido = true;
+        }
+        result
+    }
+
+    fn interpretar_inner(
+        &mut self,
+        lido: std::result::Result<Message, tungstenite::Error>,
+    ) -> Result<Option<SignalMessage>> {
         match lido {
-            Ok(Message::Text(texto)) => Ok(Some(serde_json::from_str(&texto)?)),
-            // Binário não faz parte do protocolo de sinalização. Recusar em vez de ignorar
-            // evita que uma divergência de versão vire silêncio.
-            Ok(Message::Binary(_)) => {
-                Err(Error::Signaling("mensagem binária na sinalização".into()))
+            Ok(Message::Text(texto)) => {
+                if self.secure.is_some() || texto.len() > MAX_PAREAMENTO {
+                    return Err(Error::Protocol("texto claro depois da autenticação".into()));
+                }
+                let msg: SignalMessage = serde_json::from_str(&texto)?;
+                if !matches!(msg, SignalMessage::Pair(_)) {
+                    return Err(Error::Protocol("mensagem sem autenticação".into()));
+                }
+                Ok(Some(msg))
             }
-            Ok(Message::Close(_)) => {
+            Ok(Message::Binary(bytes)) => {
+                let secure = self.secure.as_mut().ok_or_else(|| {
+                    Error::Protocol("registro cifrado antes da autenticação".into())
+                })?;
+                let plaintext = secure.open(&bytes)?;
+                let msg: SignalMessage = serde_json::from_slice(&plaintext)?;
+                if matches!(msg, SignalMessage::Pair(_)) {
+                    return Err(Error::Protocol("pareamento depois da autenticação".into()));
+                }
+                Ok(Some(msg))
+            }
+            Ok(Message::Close(frame)) => {
                 self.fechado = true;
-                Err(Error::Closed)
+                match frame.map(|f| f.code) {
+                    Some(CloseCode::Again) => Err(Error::Ocupado(
+                        "conexão indisponível; tente novamente em instantes".into(),
+                    )),
+                    Some(CloseCode::Policy) => Err(Error::Protocol(
+                        "papel funcional incompatível com esta sessão de teleprompter".into(),
+                    )),
+                    _ => Err(Error::Closed),
+                }
             }
             // Ping/Pong/Frame: o `tungstenite` já respondeu o que precisava.
             Ok(_) => Ok(None),
@@ -530,6 +623,35 @@ impl Link {
             motivo: motivo.to_string(),
         });
         let _ = self.ws.close(None);
+        let _ = self.ws.flush();
+        self.fechado = true;
+    }
+
+    /// Disponibilidade pública genérica, sem identidade, nome ou erro pessoal pré-autenticação.
+    #[cfg(any(feature = "webrtc", test))]
+    pub(crate) fn close_busy(&mut self) {
+        let _ = self
+            .ws
+            .get_ref()
+            .set_write_timeout(Some(PRAZO_DE_DESPEDIDA));
+        let _ = self.ws.close(Some(CloseFrame {
+            code: CloseCode::Again,
+            reason: "".into(),
+        }));
+        let _ = self.ws.flush();
+        self.fechado = true;
+    }
+
+    #[cfg(feature = "webrtc")]
+    pub(crate) fn close_role(&mut self) {
+        let _ = self
+            .ws
+            .get_ref()
+            .set_write_timeout(Some(PRAZO_DE_DESPEDIDA));
+        let _ = self.ws.close(Some(CloseFrame {
+            code: CloseCode::Policy,
+            reason: "".into(),
+        }));
         let _ = self.ws.flush();
         self.fechado = true;
     }
@@ -796,7 +918,7 @@ impl SignalingServer {
     /// ```text
     /// hospedar falhou: sinalização: IO error: Foi forçado o cancelamento de uma
     ///                  conexão existente pelo host remoto. (os error 10054)
-    /// mdns: sumiu G3BRUNO
+    /// mdns: sumiu COMPUTADOR-EXEMPLO
     /// ```
     ///
     /// Um `WSAECONNRESET` — o receptor que desiste ou o app que fecha no meio do handshake —
@@ -875,7 +997,7 @@ fn apertar_mao_do_cliente(fluxo: TcpStream, url: &str, fim: Instant) -> Result<O
         Ok((ws, _resp)) => return normalizar(ws).map(Some),
         Err(HandshakeError::Interrupted(m)) => m,
         Err(HandshakeError::Failure(e)) => {
-            return Err(Error::Signaling(format!("handshake WebSocket falhou: {e}")))
+            return Err(erro_de_handshake_cliente(e))
         }
     };
     loop {
@@ -887,9 +1009,23 @@ fn apertar_mao_do_cliente(fluxo: TcpStream, url: &str, fim: Instant) -> Result<O
             Ok((ws, _resp)) => return normalizar(ws).map(Some),
             Err(HandshakeError::Interrupted(m)) => m,
             Err(HandshakeError::Failure(e)) => {
-                return Err(Error::Signaling(format!("handshake WebSocket falhou: {e}")))
+                return Err(erro_de_handshake_cliente(e))
             }
         };
+    }
+}
+
+/// Uma recusa HTTP acontece antes de `Hello` e do pareamento: o PIN ainda não foi enviado.
+/// Não reproduz corpo nem cabeçalhos do servidor no diagnóstico.
+fn erro_de_handshake_cliente(erro: tungstenite::Error) -> Error {
+    match erro {
+        tungstenite::Error::Http(resposta) => Error::Signaling(format!(
+            "handshake WebSocket recusado (HTTP {}) em {SIGNALING_PATH}. \
+             Confira o endereço e a porta exibidos pelo emissor e a compatibilidade \
+             das versões dos aplicativos.",
+            resposta.status().as_u16()
+        )),
+        outro => Error::Signaling(format!("handshake WebSocket falhou: {outro}")),
     }
 }
 
@@ -951,7 +1087,7 @@ pub fn connect(destino: SocketAddr, limite: Duration) -> Result<Link> {
 ///
 /// O caso que torna isso concreto é o estúdio de câmeras por cabo. Cada Android ancorado por USB
 /// cria uma sub-rede própria, e **elas podem coincidir** — a ancoragem da Samsung entrega faixas
-/// como `192.168.42.0/24` e não há nada que impeça dois aparelhos de receberem a mesma. Com duas
+/// como `192.168.60.0/24` e não há nada que impeça dois aparelhos de receberem a mesma. Com duas
 /// rotas iguais, "por onde a rota mandar" deixa de ser pergunta com resposta: o SYN sai por uma
 /// interface e o aparelho que responde pode ser o outro.
 ///
@@ -1142,8 +1278,234 @@ pub fn conferir_anuncio(anuncio: &Announcement) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pairing::{PairedPeers, Pairing, Pin, Role};
     use crate::protocol::{Capabilities, DeviceId};
     use std::thread;
+
+    // Fixtures de tráfego apenas para testes do enquadramento/kernel. Os testes PAKE abaixo
+    // estabelecem o canal por autenticação real em TCP loopback.
+    fn proteger_io_fixture(link: &mut Link, role: Role) {
+        let channel = SecureChannel::from_session(role, &[0x37; 64], b"quall/test/io/v3").unwrap();
+        link.enable_secure(channel).unwrap();
+    }
+
+    fn autenticar_fixture(
+        link: &mut Link,
+        role: Role,
+        pin: &str,
+    ) -> Result<crate::pairing::PairOutcome> {
+        let id = match role {
+            Role::Host => "fixture-host-real",
+            Role::Guest => "fixture-guest-real",
+        };
+        let mut p = Pairing::new_with_store(
+            role,
+            DeviceId(id.into()),
+            Some(Pin::parse(pin)?),
+            &PairedPeers::default(),
+        )?;
+        p.bind_local_role(0)?;
+        if role == Role::Guest {
+            link.send(&SignalMessage::Pair(p.open()?))?;
+        }
+        let end = Instant::now() + Duration::from_secs(10);
+        let result = (|| loop {
+            if Instant::now() >= end {
+                return Err(Error::Timeout("fixture PAKE".into()));
+            }
+            if let Some(msg) = link.poll()? {
+                let public_frame = serde_json::to_string(&msg)?;
+                for identity in ["fixture-host-real", "fixture-guest-real"] {
+                    assert!(
+                        !public_frame.contains(identity),
+                        "identidade pública no PAKE"
+                    );
+                }
+                let SignalMessage::Pair(frame) = msg else {
+                    return Err(Error::Protocol("fixture PAKE".into()));
+                };
+                let step = p.step(frame)?;
+                if let Some(reply) = step.reply {
+                    link.send(&SignalMessage::Pair(reply))?;
+                }
+                if let Some(outcome) = step.done {
+                    link.enable_secure(p.take_secure_channel()?)?;
+                    return Ok(outcome);
+                }
+            }
+        })();
+        if result.is_err() {
+            link.close("fixture recusada");
+        }
+        result
+    }
+
+    #[test]
+    fn tcp_pake_cifra_identidade_sdp_e_recusa_replay() {
+        let server = SignalingServer::bind_em("127.0.0.1".parse().unwrap(), 0).unwrap();
+        let endpoint = SocketAddr::from(([127, 0, 0, 1], server.port().unwrap()));
+        let worker = thread::spawn(move || {
+            let mut link = server.accept(Duration::from_secs(10)).unwrap().unwrap();
+            let outcome = autenticar_fixture(&mut link, Role::Host, "012345").unwrap();
+            assert_eq!(outcome.peer.0, "fixture-guest-real");
+            let mut a = anuncio();
+            a.device_id = DeviceId("fixture-host-real".into());
+            a.display_name = "NOME-PESSOAL-SENTINELA-NAO-DEVE-APARECER-NO-WIRE".into();
+            link.send(&SignalMessage::Welcome { announcement: a })
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                assert!(Instant::now() < deadline, "SDP cifrado não chegou");
+                if let Some(msg) = link.poll().unwrap() {
+                    let SignalMessage::Description { sdp, .. } = msg else {
+                        panic!("SDP");
+                    };
+                    assert!(sdp.contains("ice-pwd:SEGREDO-SENTINELA"));
+                    return outcome.secret;
+                }
+            }
+        });
+        let mut guest = connect(endpoint, Duration::from_secs(10)).unwrap();
+        let outcome = autenticar_fixture(&mut guest, Role::Guest, "012345").unwrap();
+        assert_eq!(outcome.peer.0, "fixture-host-real");
+        guest
+            .ws
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let wire = guest.ws.read().unwrap();
+        let Message::Binary(bytes) = &wire else {
+            panic!("registro deve estar cifrado");
+        };
+        for forbidden in [
+            b"fixture-host-real".as_slice(),
+            b"NOME-PESSOAL-SENTINELA".as_slice(),
+        ] {
+            assert!(!bytes.windows(forbidden.len()).any(|w| w == forbidden));
+        }
+        let replay = wire.clone();
+        assert!(matches!(
+            guest.interpretar(Ok(wire)).unwrap(),
+            Some(SignalMessage::Welcome { .. })
+        ));
+        guest
+            .send(&SignalMessage::Description {
+                kind: "offer".into(),
+                sdp: "v=0\r\na=ice-pwd:SEGREDO-SENTINELA\r\na=fingerprint:sha-256 11:22\r\n".into(),
+            })
+            .unwrap();
+        assert_eq!(worker.join().unwrap(), outcome.secret);
+        assert!(guest.interpretar(Ok(replay)).is_err());
+        assert!(
+            guest.send(&SignalMessage::CandidatesDone).is_err(),
+            "erro invalida o Link"
+        );
+    }
+
+    #[test]
+    fn tcp_pin_incorreto_nao_autentica_nenhuma_ponta() {
+        let server = SignalingServer::bind(0).unwrap();
+        let endpoint = SocketAddr::from(([127, 0, 0, 1], server.port().unwrap()));
+        let worker = thread::spawn(move || {
+            let mut link = server.accept(Duration::from_secs(10)).unwrap().unwrap();
+            assert!(autenticar_fixture(&mut link, Role::Host, "012345").is_err());
+            assert!(link.secure.is_none());
+        });
+        let mut guest = connect(endpoint, Duration::from_secs(10)).unwrap();
+        assert!(matches!(
+            autenticar_fixture(&mut guest, Role::Guest, "012346"),
+            Err(Error::WrongPin(_))
+        ));
+        assert!(guest.secure.is_none());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn tcp_probe_v2_e_recusado_sem_canal_seguro() {
+        let server = SignalingServer::bind(0).unwrap();
+        let endpoint = SocketAddr::from(([127, 0, 0, 1], server.port().unwrap()));
+        let worker = thread::spawn(move || {
+            let mut link = server.accept(Duration::from_secs(5)).unwrap().unwrap();
+            assert!(matches!(
+                autenticar_fixture(&mut link, Role::Host, "012345"),
+                Err(Error::Protocol(_))
+            ));
+            assert!(link.secure.is_none());
+        });
+        let mut guest = connect(endpoint, Duration::from_secs(5)).unwrap();
+        guest
+            .send(&SignalMessage::Pair(PairFrame::Probe {
+                version: 2,
+                guest_nonce: "13".repeat(16),
+                guest_role: 0,
+            }))
+            .unwrap();
+        worker.join().unwrap();
+        assert!(guest.secure.is_none());
+    }
+
+    #[test]
+    fn tcp_anuncio_aberto_e_recusado_antes_da_autenticacao() {
+        let server = SignalingServer::bind(0).unwrap();
+        let endpoint = SocketAddr::from(([127, 0, 0, 1], server.port().unwrap()));
+        let worker = thread::spawn(move || {
+            let mut link = server.accept(Duration::from_secs(5)).unwrap().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                assert!(Instant::now() < deadline, "mensagem aberta não chegou");
+                match link.poll() {
+                    Ok(None) => {}
+                    Err(Error::Protocol(_)) => break,
+                    other => panic!("{other:?}"),
+                }
+            }
+            assert!(link
+                .send(&SignalMessage::Pair(PairFrame::NeedsPin))
+                .is_err());
+        });
+        let mut guest = connect(endpoint, Duration::from_secs(5)).unwrap();
+        let plain = serde_json::to_string(&SignalMessage::Hello {
+            announcement: anuncio(),
+        })
+        .unwrap();
+        guest.ws.send(Message::Text(plain.into())).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn fechamento_ocupado_nao_transporta_identidade() {
+        let server = SignalingServer::bind(0).unwrap();
+        let endpoint = SocketAddr::from(([127, 0, 0, 1], server.port().unwrap()));
+        let worker = thread::spawn(move || {
+            let mut link = server.accept(Duration::from_secs(5)).unwrap().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                assert!(Instant::now() < deadline, "Probe não chegou");
+                if link.poll().unwrap().is_some() {
+                    break;
+                }
+            }
+            link.close_busy();
+        });
+        let mut guest = connect(endpoint, Duration::from_secs(5)).unwrap();
+        guest
+            .send(&SignalMessage::Pair(PairFrame::Probe {
+                version: 3,
+                guest_nonce: "11".repeat(16),
+                guest_role: 0,
+            }))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(Instant::now() < deadline, "fechamento ocupado não chegou");
+            match guest.poll() {
+                Err(Error::Ocupado(_)) => break,
+                Ok(None) => {}
+                other => panic!("{other:?}"),
+            }
+        }
+        worker.join().unwrap();
+    }
 
     #[test]
     fn debug_da_sinalizacao_nao_reproduz_payloads() {
@@ -1245,7 +1607,7 @@ mod tests {
     // ---- Dívida 28: `NoRoute` alcançável na camada em que a rota de fato falta ----
 
     fn classificar(kind: ErrorKind) -> Error {
-        let destino: SocketAddr = "192.168.1.131:47891".parse().expect("endereço");
+        let destino: SocketAddr = "192.168.56.131:47891".parse().expect("endereço");
         classificar_falha_de_conexao(destino, &io::Error::from(kind))
     }
 
@@ -1293,7 +1655,7 @@ mod tests {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         let (ehostunreach, enetunreach, econnrefused) = (113, 101, 111);
 
-        let destino: SocketAddr = "192.168.1.131:47891".parse().expect("endereço");
+        let destino: SocketAddr = "192.168.56.131:47891".parse().expect("endereço");
         let de_errno = |n| classificar_falha_de_conexao(destino, &io::Error::from_raw_os_error(n));
 
         assert!(matches!(de_errno(ehostunreach), Error::NoRoute(_)));
@@ -1343,7 +1705,8 @@ mod tests {
     /// Medido em aparelho em 2026-08-31: com o A07 na versão 2 e o A10s na 1, o lado antigo
     /// mostrava `WebSocket protocol error: Connection reset without closing handshake` — a
     /// mensagem que manda caçar rede e cabo quando a resposta é "atualize o aplicativo". Ver
-    /// `dizer_por_que_antes_de_fechar`, em `session.rs`.
+    /// O protocolo v3 encerra sem payload pessoal antes da autenticação; a tradução local da
+    /// incompatibilidade continua diferenciada de um PIN incorreto.
     #[test]
     fn recusa_de_versao_chega_como_prosa_e_nao_como_pareamento() {
         let cru = r#"{"t":"error","motivo":"o outro aparelho fala a versão 1 do protocolo; este fala a 2","causa":"versao_incompativel"}"#;
@@ -1509,7 +1872,7 @@ mod tests {
                 sdp: "v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\n".into(),
             },
             SignalMessage::Candidate {
-                candidate: "candidate:1 1 UDP 2130706431 192.168.1.131 50000 typ host".into(),
+                candidate: "candidate:1 1 UDP 2130706431 192.168.56.131 50000 typ host".into(),
                 mid: "0".into(),
             },
             SignalMessage::CandidatesDone,
@@ -1545,6 +1908,7 @@ mod tests {
             let mut link = servidor
                 .accept(Duration::from_secs(5))?
                 .ok_or_else(|| Error::Timeout("ninguém conectou".into()))?;
+            proteger_io_fixture(&mut link, Role::Host);
             link.send(&SignalMessage::Welcome {
                 announcement: anuncio(),
             })?;
@@ -1558,6 +1922,7 @@ mod tests {
 
         let destino: SocketAddr = format!("127.0.0.1:{porta}").parse().expect("addr");
         let mut cliente = connect(destino, Duration::from_secs(5)).expect("conecta");
+        proteger_io_fixture(&mut cliente, Role::Guest);
 
         let mut boas_vindas = None;
         for _ in 0..250 {
@@ -1600,8 +1965,65 @@ mod tests {
             fluxo,
             Some(config()),
         );
-        assert!(erro.is_err(), "o servidor aceitou um caminho estranho");
+        assert!(
+            matches!(erro, Err(HandshakeError::Failure(tungstenite::Error::Http(ref resposta)))
+                if resposta.status() == tungstenite::http::StatusCode::NOT_FOUND),
+            "um caminho diferente tem de receber HTTP 404"
+        );
         lado_servidor.join().expect("thread");
+    }
+
+    #[test]
+    fn rotas_legadas_nao_sao_fallback_do_protocolo_v3() {
+        for caminho in ["/quall/v1", "/quall/v2"] {
+            let pedido = Request::builder().uri(caminho).body(()).unwrap();
+            let resposta = Response::builder()
+                .status(tungstenite::http::StatusCode::SWITCHING_PROTOCOLS)
+                .body(())
+                .unwrap();
+            let recusa = conferir_caminho(&pedido, resposta).expect_err("rota legada recusada");
+            assert_eq!(recusa.status(), tungstenite::http::StatusCode::NOT_FOUND);
+        }
+        let pedido = Request::builder().uri(SIGNALING_PATH).body(()).unwrap();
+        assert!(conferir_caminho(&pedido, Response::new(())).is_ok());
+    }
+
+    #[test]
+    fn servico_http_na_porta_errada_recusa_antes_do_pareamento() {
+        use std::io::{Read, Write};
+
+        let servidor = TcpListener::bind(("127.0.0.1", 0)).expect("bind HTTP");
+        let destino = servidor.local_addr().expect("endereço HTTP");
+        let responder = thread::spawn(move || {
+            let (mut fluxo, _) = servidor.accept().expect("accept HTTP");
+            fluxo
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .expect("prazo HTTP");
+            let mut pedido = Vec::new();
+            let mut parte = [0u8; 512];
+            while !pedido.windows(4).any(|p| p == b"\r\n\r\n") {
+                let n = fluxo.read(&mut parte).expect("pedido de upgrade");
+                assert!(n > 0 && pedido.len() < 8192, "pedido HTTP incompleto");
+                pedido.extend_from_slice(&parte[..n]);
+            }
+            assert!(pedido.starts_with(format!("GET {SIGNALING_PATH} HTTP/1.1\r\n").as_bytes()));
+            fluxo.write_all(
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 7\r\nX-Private: oculto\r\n\r\noculto!",
+            ).expect("resposta HTTP");
+        });
+
+        let erro = connect(destino, Duration::from_secs(3))
+            .err()
+            .expect("recusa HTTP");
+        responder.join().expect("thread HTTP");
+        assert!(matches!(erro, Error::Signaling(_)), "não é recusa de PIN");
+        let mensagem = erro.to_string();
+        assert!(mensagem.contains("HTTP 404") && mensagem.contains(SIGNALING_PATH));
+        assert!(mensagem.contains("endereço e a porta"));
+        assert!(
+            !mensagem.contains("oculto"),
+            "corpo e cabeçalhos não entram no diagnóstico"
+        );
     }
 
     #[test]
@@ -1649,6 +2071,7 @@ mod tests {
                     .accept(Duration::from_secs(2))
                     .unwrap()
                     .expect("cliente");
+                proteger_io_fixture(&mut link, Role::Host);
                 assert_eq!(link.peer_addr().is_ipv6(), ipv6);
                 let pedido = receber(&mut link);
                 assert_eq!(pedido, SignalMessage::CandidatesDone);
@@ -1670,6 +2093,7 @@ mod tests {
                 &Cancelamento::novo(),
             )
             .unwrap();
+            proteger_io_fixture(&mut link, Role::Guest);
             link.send(&SignalMessage::CandidatesDone).unwrap();
             assert_eq!(
                 receber(&mut link),
@@ -1702,7 +2126,7 @@ mod tests {
         use tungstenite::client::IntoClientRequest;
         let destino = "[fe80::1234%9]:7877".parse().unwrap();
         let url = url_de_sinalizacao(destino);
-        assert_eq!(url, "ws://[fe80::1234]:7877/quall/v1");
+        assert_eq!(url, "ws://[fe80::1234]:7877/quall/v3");
         let pedido = url.into_client_request().unwrap();
         assert_eq!(pedido.headers()["Host"], "[fe80::1234]:7877");
     }
@@ -1949,8 +2373,10 @@ mod tests {
         });
 
         let destino: SocketAddr = format!("127.0.0.1:{porta}").parse().expect("addr");
-        let cliente = connect(destino, Duration::from_secs(10)).expect("conecta");
-        let anfitriao = lado_servidor.join().expect("thread do anfitrião");
+        let mut cliente = connect(destino, Duration::from_secs(10)).expect("conecta");
+        let mut anfitriao = lado_servidor.join().expect("thread do anfitrião");
+        proteger_io_fixture(&mut cliente, Role::Guest);
+        proteger_io_fixture(&mut anfitriao, Role::Host);
         (anfitriao, cliente)
     }
 

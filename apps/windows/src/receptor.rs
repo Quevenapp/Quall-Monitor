@@ -1744,7 +1744,7 @@ impl Receptor {
                 e.conselho = t("O pareamento fechou, mas os dois aparelhos não acharam caminho um para o outro. Quase sempre é a rede: Wi-Fi de hóspede, isolamento entre aparelhos ou redes diferentes. Ponha os dois na mesma rede e tente de novo.").into();
             }
             Error::Timeout(_) => {
-                e.conselho = t("O outro aparelho não respondeu. Confira se ele já clicou em Espelhar — quem exibe só entra depois de quem transmite estar esperando.").into();
+                e.conselho = t("O outro aparelho não respondeu. Confira se ele já clicou em Estender — quem exibe só entra depois de quem transmite estar esperando.").into();
             }
             Error::Signaling(_) | Error::Io(_) => {
                 e.conselho = t("Não consegui falar com esse endereço. Confira o número e a porta, e se o outro aparelho está esperando.").into();

@@ -2,27 +2,10 @@ import CoreGraphics
 import Foundation
 import QuallIdiomaKit
 
-/// O monitor da tela estendida visto de dentro do app: um processo auxiliar, `quall-monitor-virtual`,
-/// que é o monitor enquanto vive.
-///
-/// # Por que não criar o monitor aqui mesmo
-///
-/// Porque dentro do app ele funcionaria **uma vez**. Duas limitações do `CGVirtualDisplay`, medidas
-/// neste Mac em processos isolados (`docs/tela-estendida.md`):
-///
-/// 1. um processo só consegue um monitor virtual na vida — o segundo nunca ganha modo, nem 3 s
-///    depois de o primeiro ser solto;
-/// 2. depois de uma troca de modo, soltar o objeto não tira o monitor; ele fica até o processo sair.
-///
-/// A primeira faria a segunda sessão da tarde falhar; a segunda deixaria um monitor fantasma depois
-/// de toda sessão em que alguém trocou 1x por 2x em Ajustes. Processo que sai tira o monitor sempre
-/// — limpo em ~40 ms, com `kill -9` em ~80 ms, medido.
-///
-/// # A vida do monitor é a vida da sessão
-///
-/// `subir` roda depois de o receptor conectar com o PIN; `soltar` roda depois de a captura parar. O
-/// stdin do auxiliar é um cano que só este objeto segura: fechá-lo encerra o auxiliar, e se o app
-/// morrer o sistema fecha o cano por ele — não sobra monitor para janela nenhuma cair.
+/// Um processo auxiliar por monitor isola o ciclo de vida da API CGVirtualDisplay.
+/// `subir` acontece depois do pareamento; `soltar` acontece depois de parar a captura.
+/// Fechar o stdin solicita o encerramento. A saída do processo e a ausência do display são
+/// verificadas separadamente; um prazo vencido não confirma a liberação da identidade.
 public final class MonitorVirtualAuxiliar: @unchecked Sendable {
     public static let nomeDoExecutavel = "quall-monitor-display"
 
@@ -53,6 +36,14 @@ public final class MonitorVirtualAuxiliar: @unchecked Sendable {
     private let entrada: Pipe
     private let trava = NSLock()
     private var solto = false
+    private var resultadoDaSaida: ResultadoDaSaida?
+
+    public struct ResultadoDaSaida: Sendable {
+        public let processoSaiu: Bool
+        public let monitorSumiu: Bool
+        public let relato: String
+        public var confirmado: Bool { processoSaiu && monitorSumiu }
+    }
 
     private init(modo: ModoDoMonitorVirtual, displayID: CGDirectDisplayID, relato: String,
                  processo: Process, entrada: Pipe) {
@@ -76,7 +67,7 @@ public final class MonitorVirtualAuxiliar: @unchecked Sendable {
     }
 
     /// Onde está o executável do auxiliar: dentro do `.app` (`Contents/MacOS`, ao lado do
-    /// `quall-app`) ou, fora dele, ao lado do executável que está rodando — que é o caso de
+    /// `quall-monitor-app`) ou, fora dele, ao lado do executável que está rodando — que é o caso de
     /// `.build/release/` para as sondas de bancada.
     public static func localizar() -> URL? {
         if let noBundle = Bundle.main.url(forAuxiliaryExecutable: nomeDoExecutavel),
@@ -92,8 +83,8 @@ public final class MonitorVirtualAuxiliar: @unchecked Sendable {
     /// A tela estendida pode ser oferecida: a API existe **e** o auxiliar está onde deveria.
     public static var disponivel: Bool { MonitorVirtual.disponivel && localizar() != nil }
 
-    /// Sobe o auxiliar e espera a linha dele. Se ela não vier em `prazo`, o auxiliar é morto —
-    /// e morto, ele leva o monitor que por acaso tenha criado.
+    /// Sobe o auxiliar e espera sua resposta. O prazo solicita encerramento com SIGTERM;
+    /// uma falha antes da resposta não permite confirmar qual display chegou a ser criado.
     /// `indice` escolhe a identidade do monitor (ver `MonitorVirtual.serie`). O 0 — o de uma sessão
     /// só — sobe o auxiliar com os mesmos argumentos de sempre.
     public static func subir(modo: ModoDoMonitorVirtual, nome: String, indice: Int = 0,
@@ -122,8 +113,7 @@ public final class MonitorVirtualAuxiliar: @unchecked Sendable {
             throw Falha.naoSubiu("\(error)")
         }
 
-        // O prazo é imposto matando o auxiliar: o stdout dele fecha, a leitura abaixo volta sem
-        // linha, e o erro diz quanto se esperou. Nenhum caminho deixa um auxiliar vivo para trás.
+        // O prazo solicita a saída do auxiliar para que a leitura de stdout termine.
         let vigiaDoPrazo = DispatchWorkItem { [processo] in
             if processo.isRunning { processo.terminate() }
         }
@@ -158,17 +148,22 @@ public final class MonitorVirtualAuxiliar: @unchecked Sendable {
             processo: processo, entrada: entrada)
     }
 
-    /// Encerra o auxiliar e espera o monitor sumir. Devolve uma linha para o registro.
+    /// Encerra o auxiliar e espera o monitor sumir. Uma falha na consulta não confirma a saída.
     ///
     /// Fecha o stdin primeiro (o caminho limpo); se o auxiliar não sair em 2 s, `SIGTERM`; se nem
     /// assim, `SIGKILL`. Idempotente.
     @discardableResult
-    public func soltar() async -> String {
+    public func soltar() async -> ResultadoDaSaida {
         let jaEstava = trava.withLock { () -> Bool in
             defer { solto = true }
             return solto
         }
-        if jaEstava { return "monitor virtual: já estava solto" }
+        if jaEstava {
+            return trava.withLock {
+                resultadoDaSaida ?? ResultadoDaSaida(processoSaiu: false, monitorSumiu: false,
+                    relato: "monitor virtual: encerramento ainda sem confirmação")
+            }
+        }
 
         let t0 = DispatchTime.now()
         try? entrada.fileHandleForWriting.close()
@@ -179,22 +174,30 @@ public final class MonitorVirtualAuxiliar: @unchecked Sendable {
             if !(await esperar(prazoMs: 1_000, { !self.processo.isRunning })) {
                 kill(processo.processIdentifier, SIGKILL)
                 como = "SIGKILL"
+                _ = await esperar(prazoMs: 1_000, { !self.processo.isRunning })
             }
         }
+        let processoSaiu = !processo.isRunning
         let msProcesso = ms(desde: t0)
-        let sumiu = await esperar(prazoMs: 2_000, { !MonitorVirtualAuxiliar.estaOnline(self.displayID) })
+        let sumiu = await esperar(prazoMs: 2_000, {
+            MonitorVirtualAuxiliar.estaOnline(self.displayID) == false
+        })
         let msMonitor = ms(desde: t0)
-        return "monitor virtual solto: id=\(displayID) auxiliar saiu por \(como) em \(msProcesso) ms, "
-            + (sumiu ? "monitor sumiu em \(msMonitor) ms" : "!! MONITOR CONTINUA ONLINE depois de \(msMonitor) ms")
+        let resultado = ResultadoDaSaida(processoSaiu: processoSaiu, monitorSumiu: sumiu,
+            relato: "monitor virtual: id=\(displayID) \(como) em \(msProcesso) ms; processoSaiu=\(processoSaiu); "
+                + (sumiu ? "monitor sumiu em \(msMonitor) ms" : "saída do monitor não confirmada depois de \(msMonitor) ms"))
+        trava.withLock { resultadoDaSaida = resultado }
+        return resultado
     }
 
     // MARK: - apoio
 
-    static func estaOnline(_ id: CGDirectDisplayID) -> Bool {
+    static func estaOnline(_ id: CGDirectDisplayID) -> Bool? {
         var contagem: UInt32 = 0
-        guard CGGetOnlineDisplayList(0, nil, &contagem) == .success, contagem > 0 else { return false }
+        guard CGGetOnlineDisplayList(0, nil, &contagem) == .success else { return nil }
+        guard contagem > 0 else { return false }
         var lista = [CGDirectDisplayID](repeating: 0, count: Int(contagem))
-        guard CGGetOnlineDisplayList(contagem, &lista, &contagem) == .success else { return false }
+        guard CGGetOnlineDisplayList(contagem, &lista, &contagem) == .success else { return nil }
         return lista.prefix(Int(contagem)).contains(id)
     }
 

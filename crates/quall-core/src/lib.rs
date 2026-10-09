@@ -28,6 +28,7 @@ pub mod portao;
 pub mod relogio;
 pub mod reproducao;
 pub mod rtp;
+pub mod secure_channel;
 pub mod session;
 pub mod signaling;
 // **Sem `///` aqui, e é de propósito.** Um comentário externo num `pub mod` que também tem `//!`

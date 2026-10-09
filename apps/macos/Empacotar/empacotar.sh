@@ -9,8 +9,8 @@ APP="$OUT/Quall Monitor.app"
 JOBS="${QUALL_MONITOR_JOBS:-2}"
 ARCHITECTURES="${QUALL_MONITOR_ARQUITETURAS:-host}"
 IDENTITY="${QUALL_MONITOR_IDENTIDADE:--}"
-VERSION="${QUALL_MONITOR_VERSAO:-0.1.0}"
-BUILD="${QUALL_MONITOR_BUILD:-1}"
+VERSION="${QUALL_MONITOR_VERSAO:-0.1.1}"
+BUILD="${QUALL_MONITOR_BUILD:-2}"
 case "$ARCHITECTURES" in host|universal) ;; *) echo "QUALL_MONITOR_ARQUITETURAS deve ser host ou universal" >&2; exit 1 ;; esac
 
 # Never ship an override from another repository. Explicit ready mode only reuses this repo's
@@ -44,6 +44,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN/quall-monitor-app" "$BIN/quall-monitor-display" "$APP/Contents/MacOS/"
 cp "$HERE/Info.plist" "$APP/Contents/Info.plist"
 cp "$HERE/QuallMonitor.icns" "$APP/Contents/Resources/"
+cp -R "$HERE/pt.lproj" "$HERE/en.lproj" "$APP/Contents/Resources/"
 cp -R "$BIN/QuallMonitor_QuallIdiomaKit.bundle" "$APP/Contents/Resources/"
 for FILE in LICENSE LICENSE-SCOPE.md NOTICE.txt THIRD_PARTY_NOTICES.txt; do
     [ -s "$ROOT/$FILE" ] || { echo "Aviso/licença ausente: $FILE" >&2; exit 1; }
@@ -82,3 +83,4 @@ rm -f "$ZIP"
 ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
 (cd "$OUT" && shasum -a 256 "$(basename "$ZIP")") > "$ZIP.sha256"
 printf 'App: %s\nDownload: %s\n' "$APP" "$ZIP"
+QUALL_MONITOR_IDENTIDADE="$IDENTITY" "$HERE/instalador.sh" "$APP"

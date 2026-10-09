@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-label="Quall Monitor">
+<defs>
+  <linearGradient id="metal" x2="0" y2="1"><stop stop-color="#f9fbff"/><stop offset="1" stop-color="#aeb9cb"/></linearGradient>
+  <linearGradient id="screen" x2="0" y2="1"><stop stop-color="#152652"/><stop offset="1" stop-color="#0a1433"/></linearGradient>
+</defs>
+<path d="M452 689H572L594 821H430Z" fill="url(#metal)"/>
+<rect x="317" y="805" width="390" height="56" rx="27" fill="url(#metal)"/>
+<rect x="104" y="154" width="816" height="559" rx="48" fill="url(#metal)" stroke="#8493aa" stroke-width="8"/>
+<rect x="139" y="188" width="746" height="455" rx="22" fill="url(#screen)"/>
+<path d="M546.165,541.805 A140.220,140.220 0 1 1 629.305,458.665 A69.540,69.540 0 0 0 579.737,465.987 A99.180,99.180 0 1 0 553.487,492.237 A69.540,69.540 0 0 0 546.165,541.805 Z" fill="#fff"/>
+<circle cx="614.000" cy="526.500" r="52.440" fill="#ff453a"/>
+<circle cx="512" cy="680" r="7" fill="#74849b"/>
+</svg>

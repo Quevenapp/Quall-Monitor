@@ -65,18 +65,14 @@ mdns-sd = { version = "0.21", default-features = false }
 # por conexão de sinalização custa menos que um runtime inteiro, e a sinalização é efêmera.
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 
-# Pareamento por PIN. X25519 dá o segredo de sessão que um bisbilhoteiro passivo não consegue
-# derivar nem sabendo o PIN; HMAC/HKDF/SHA-256 fazem a confirmação e a derivação do segredo
-# de longo prazo. Tudo Rust puro, tudo compila em 32 bits.
-#
-# `zeroize` fica ligada de propósito: o segredo do par sobrevive ao processo em disco, e o que
-# passa pela memória não deveria sobreviver ao `Drop`. `precomputed-tables` fica de fora — são
-# tabelas do ponto base do Ed25519, que o X25519 não usa, e são bytes a mais no binário que a
-# extension do iOS tem de carregar.
-x25519-dalek = { version = "3", default-features = false, features = [
-  "static_secrets",
-  "zeroize",
-] }
+# Pareamento v3: OPAQUE-3DH (RFC 9807), com registro efêmero local e Argon2.
+# PIN curto exige PAKE e limite online; DH seguido de HMAC(PIN) não protege
+# contra um participante ativo que escolhe a própria chave DH.
+opaque-ke = { version = "=4.0.1", default-features = false, features = ["ristretto255", "argon2"] }
+argon2 = { version = "=0.5.3", default-features = false, features = ["alloc", "zeroize"] }
+rand = { version = "0.8", default-features = false, features = ["getrandom"] }
+chacha20poly1305 = { version = "=0.10.1", default-features = false, features = ["alloc"] }
+zeroize = { version = "1.8", features = ["derive"] }
 hmac = "0.12"
 sha2 = { version = "0.10", default-features = false }
 hkdf = "0.12"

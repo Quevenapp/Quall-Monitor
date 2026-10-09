@@ -19,7 +19,7 @@
 //! - **Padrão**: o idioma da interface do Windows (`GetUserDefaultUILanguage`): português (qualquer
 //!   região) → PT; qualquer outro → EN ([`do_sistema`]).
 //! - **A escolha do botão PT | EN** do cabeçalho da janela principal fica em `idioma.txt`, na pasta de
-//!   dados (`%APPDATA%\Quall`), e vence o sistema dali em diante ([`ler_escolha`]).
+//!   dados (`%APPDATA%\Quall Monitor`), e vence o sistema dali em diante ([`ler_escolha`]).
 //! - **A troca vale na hora**: [`definir`] muda o global e sobe a [`versao`]; cada janela que tem
 //!   texto próprio (a principal, a do teleprompter, a dos ajustes da câmera, o menu da bandeja)
 //!   reescreve os rótulos quando vê a versão mudar.
@@ -44,6 +44,7 @@ mod bandeja;
 mod driver;
 mod janela;
 mod mensagens;
+mod monitor;
 mod receptor;
 mod teleprompter;
 
@@ -202,6 +203,7 @@ pub fn areas() -> Vec<(&'static str, &'static [(&'static str, &'static str)])> {
         ("ajustes", ajustes::TEXTOS),
         ("receptor", receptor::TEXTOS),
         ("mensagens", mensagens::TEXTOS),
+        ("monitor", monitor::TEXTOS),
         #[cfg(any(test, feature = "tela-estendida-futura"))]
         ("driver", driver::TEXTOS),
     ]

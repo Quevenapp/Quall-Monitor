@@ -1,3 +1,4 @@
+// Os identificadores e endereços de exemplos/fixtures são sintéticos; não identificam a bancada privada.
 //! Descoberta de aparelhos na LAN por mDNS/Bonjour, anunciando [`SERVICE_TYPE`].
 //!
 //! [`SERVICE_TYPE`]: crate::protocol::SERVICE_TYPE
@@ -11,8 +12,8 @@
 //!    padrão, mesmo com o perfil de rede em `Private`: o silêncio da descoberta é o
 //!    comportamento esperado, não um bug, e o fallback é o que salva.
 //!
-//! O anúncio viaja nos registros TXT, não num JSON: TXT é o que o mDNS carrega de graça na
-//! resposta, e evita uma segunda viagem só para saber quem é o aparelho.
+//! O anúncio público é uma dica efêmera de roteamento. Identidade e nome reais só chegam pelo
+//! canal autenticado da sessão; nunca entram em TXT, nome de instância ou hostname do app.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, SocketAddrV6, ToSocketAddrs};
@@ -21,7 +22,9 @@ use std::time::{Duration, Instant};
 use mdns_sd::{Receiver, RecvTimeoutError, ScopedIp, ServiceDaemon, ServiceEvent, ServiceInfo};
 
 use crate::error::{Error, Result};
-use crate::protocol::{Announcement, Capabilities, DeviceId, Papel, PROTOCOL_VERSION, SERVICE_TYPE};
+use crate::protocol::{
+    Announcement, Capabilities, DeviceId, Papel, PROTOCOL_VERSION, SERVICE_TYPE,
+};
 
 /// Porta padrão do servidor de sinalização do emissor.
 ///
@@ -38,24 +41,43 @@ fn service_type_domain() -> String {
 /// datagrama, e no Wi-Fi de 2,4 GHz do A10s fragmentar é perder.
 mod txt {
     pub const VERSAO: &str = "v";
-    pub const ID: &str = "id";
-    pub const NOME: &str = "n";
+    pub const TOKEN: &str = "t";
     pub const CAPACIDADES: &str = "c";
     pub const PORTA: &str = "p";
-    /// O papel da sessão (`docs/contrato-teleprompter.md` §2). **Só existe quando há papel**: um
-    /// anúncio de vídeo sai com as cinco chaves de antes e mais nenhuma. Uma build anterior não lê
-    /// esta chave — `announcement_from_txt` pede as chaves pelo nome e ignora as outras.
+    /// Papel funcional para seleção da rota, sem nome ou identidade de pessoa/aparelho.
     pub const PAPEL: &str = "pa";
 }
 
-/// Codifica um anúncio nos pares chave/valor de um registro TXT.
-///
-/// As capacidades viram uma string de letras (`s` tela, `c` câmera, `k` exibe) em vez de três
-/// booleanos: cabe em um valor e cresce sem quebrar quem lê a versão antiga.
-///
-/// **A tela do receptor não vai** (ela é do aperto de mão); **o papel vai**, na chave
-/// [`txt::PAPEL`], porque é pela lista que um controle acha o teleprompter.
-pub fn announcement_to_txt(anuncio: &Announcement, porta: u16) -> Vec<(String, String)> {
+/// Novo identificador público por anúncio. Falha de entropia impede anunciar.
+pub fn discovery_token() -> Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes)
+        .map_err(|_| Error::Discovery("sem entropia para o anúncio efêmero".into()))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+fn token_valido(token: &str) -> bool {
+    token.len() == 32
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// O TXT contém somente versão, token efêmero, porta e seleção funcional da rota.
+pub fn announcement_to_txt(anuncio: &Announcement, porta: u16) -> Result<Vec<(String, String)>> {
+    announcement_to_txt_with_token(anuncio, porta, &discovery_token()?)
+}
+
+fn announcement_to_txt_with_token(
+    anuncio: &Announcement,
+    porta: u16,
+    token: &str,
+) -> Result<Vec<(String, String)>> {
+    if !anuncio.is_compatible() || porta == 0 || !token_valido(token) {
+        return Err(Error::Discovery(
+            "anúncio público incompatível ou inválido".into(),
+        ));
+    }
     let mut caps = String::with_capacity(3);
     if anuncio.capabilities.screen_source {
         caps.push('s');
@@ -68,15 +90,14 @@ pub fn announcement_to_txt(anuncio: &Announcement, porta: u16) -> Vec<(String, S
     }
     let mut registro = vec![
         (txt::VERSAO.into(), anuncio.protocol_version.to_string()),
-        (txt::ID.into(), anuncio.device_id.0.clone()),
-        (txt::NOME.into(), anuncio.display_name.clone()),
+        (txt::TOKEN.into(), token.to_string()),
         (txt::CAPACIDADES.into(), caps),
         (txt::PORTA.into(), porta.to_string()),
     ];
     if let Some(papel) = anuncio.papel {
         registro.push((txt::PAPEL.into(), papel.como_texto().into()));
     }
-    registro
+    Ok(registro)
 }
 
 /// Reconstrói o anúncio e a porta de sinalização a partir dos registros TXT.
@@ -90,16 +111,29 @@ pub fn announcement_from_txt(props: &HashMap<String, String>) -> Result<(Announc
     let protocol_version: u16 = obrigatorio(txt::VERSAO)?
         .parse()
         .map_err(|_| Error::Discovery("TXT com versão de protocolo não numérica".into()))?;
+    if protocol_version != PROTOCOL_VERSION || props.contains_key("id") || props.contains_key("n") {
+        return Err(Error::Discovery(
+            "anúncio legado ou com identidade pública".into(),
+        ));
+    }
+    let token = obrigatorio(txt::TOKEN)?;
+    if !token_valido(token) {
+        return Err(Error::Discovery("token de descoberta inválido".into()));
+    }
     let porta: u16 = obrigatorio(txt::PORTA)?
         .parse()
         .map_err(|_| Error::Discovery("TXT com porta não numérica".into()))?;
+    if porta == 0 {
+        return Err(Error::Discovery("TXT com porta zero".into()));
+    }
     let caps = obrigatorio(txt::CAPACIDADES)?;
 
     Ok((
         Announcement {
             protocol_version,
-            device_id: DeviceId(obrigatorio(txt::ID)?.clone()),
-            display_name: obrigatorio(txt::NOME)?.clone(),
+            // Apenas chave da linha descoberta; NUNCA persistir como identidade de um par.
+            device_id: DeviceId(format!("discovery-{token}")),
+            display_name: format!("Quall {}", &token[..8]),
             capabilities: Capabilities {
                 screen_source: caps.contains('s'),
                 camera_source: caps.contains('c'),
@@ -116,6 +150,7 @@ pub fn announcement_from_txt(props: &HashMap<String, String>) -> Result<(Announc
 /// Um aparelho visto na rede.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveredDevice {
+    /// Placeholder público efêmero; a identidade real está em `session::Ready::peer`.
     pub announcement: Announcement,
     /// Endereços em que o aparelho respondeu, já ordenados do mais utilizável para o menos, e
     /// sem repetição. Ver [`ordenar_enderecos`].
@@ -128,7 +163,9 @@ pub struct DiscoveredDevice {
 impl DiscoveredDevice {
     /// Melhor endereço para abrir a sinalização.
     pub fn endpoint(&self) -> Option<SocketAddr> {
-        self.addresses.iter().find_map(|ip| endpoint_com_escopo(ip, self.signaling_port))
+        self.addresses
+            .iter()
+            .find_map(|ip| endpoint_com_escopo(ip, self.signaling_port))
     }
 }
 
@@ -143,7 +180,9 @@ fn endpoint_com_escopo(ip: &ScopedIp, porta: u16) -> Option<SocketAddr> {
 
 fn endpoint_ipv6(ip: std::net::Ipv6Addr, porta: u16, indice: u32) -> Option<SocketAddr> {
     let escopo = if ip.is_unicast_link_local() {
-        if indice == 0 { return None; }
+        if indice == 0 {
+            return None;
+        }
         indice
     } else {
         0 // ULA/global não carrega o índice local recebido na resposta mDNS.
@@ -156,11 +195,15 @@ fn ordenar_enderecos_com_escopo(mut enderecos: Vec<ScopedIp>) -> Vec<ScopedIp> {
         ScopedIp::V6(v6) if v6.addr().is_unicast_link_local() && v6.scope_id().index != 0 => 30,
         _ => peso(&ip.to_ip_addr()),
     };
-    enderecos.sort_by(|a, b| peso_com_escopo(a).cmp(&peso_com_escopo(b))
-        .then_with(|| a.to_ip_addr().cmp(&b.to_ip_addr()))
-        .then_with(|| a.to_string().cmp(&b.to_string())));
-    enderecos.dedup_by(|a, b| a.to_ip_addr() == b.to_ip_addr()
-        && endpoint_com_escopo(a, 0) == endpoint_com_escopo(b, 0));
+    enderecos.sort_by(|a, b| {
+        peso_com_escopo(a)
+            .cmp(&peso_com_escopo(b))
+            .then_with(|| a.to_ip_addr().cmp(&b.to_ip_addr()))
+            .then_with(|| a.to_string().cmp(&b.to_string()))
+    });
+    enderecos.dedup_by(|a, b| {
+        a.to_ip_addr() == b.to_ip_addr() && endpoint_com_escopo(a, 0) == endpoint_com_escopo(b, 0)
+    });
     enderecos
 }
 
@@ -241,6 +284,7 @@ pub struct Advertiser {
     /// `Option` para o `Drop` poder consumir o daemon sem consumir o `Advertiser`.
     daemon: Option<ServiceDaemon>,
     fullname: String,
+    discovery_label: String,
 }
 
 impl Advertiser {
@@ -249,13 +293,10 @@ impl Advertiser {
         let daemon = ServiceDaemon::new()
             .map_err(|e| Error::Discovery(format!("não subiu o daemon mDNS: {e}")))?;
 
-        // O nome da instância precisa ser único na LAN. `display_name` sozinho não é: duas
-        // máquinas chamadas "MacBook" colidem. O sufixo do id resolve sem poluir a lista.
-        let sufixo = sufixo_curto(&anuncio.device_id);
-        let instancia = nome_da_instancia(anuncio);
-        let host = format!("quall-{sufixo}.local.");
-
-        let props = announcement_to_txt(anuncio, porta);
+        let token = discovery_token()?;
+        let instancia = nome_da_instancia(&token)?;
+        let host = format!("quall-{token}.local.");
+        let props = announcement_to_txt_with_token(anuncio, porta, &token)?;
         let info = ServiceInfo::new(
             &service_type_domain(),
             &instancia,
@@ -277,12 +318,18 @@ impl Advertiser {
         Ok(Advertiser {
             daemon: Some(daemon),
             fullname,
+            discovery_label: format!("Quall {}", &token[..8]),
         })
     }
 
-    /// Nome completo da instância anunciada, por exemplo `MacBook a1b2c3._quall._tcp.local.`.
+    /// Nome completo efêmero da instância anunciada (`Quall <token>._quall._tcp.local.`).
     pub fn fullname(&self) -> &str {
         &self.fullname
+    }
+
+    /// Rótulo público efêmero exibido pelos navegadores; nunca é a identidade persistida.
+    pub fn discovery_label(&self) -> &str {
+        &self.discovery_label
     }
 
     /// Desregistra e espera a confirmação, para que a lista dos outros aparelhos não fique com
@@ -361,9 +408,8 @@ impl Browser {
                     if !anuncio.is_compatible() {
                         continue;
                     }
-                    let addresses = ordenar_enderecos_com_escopo(
-                        servico.addresses.iter().cloned().collect(),
-                    );
+                    let addresses =
+                        ordenar_enderecos_com_escopo(servico.addresses.iter().cloned().collect());
                     return Ok(Some(DiscoveryEvent::Found(Box::new(DiscoveredDevice {
                         announcement: anuncio,
                         addresses,
@@ -423,7 +469,7 @@ impl Browser {
 
 /// Resolve o que o usuário digitou no campo de fallback.
 ///
-/// Aceita `192.168.1.41`, `192.168.1.41:7877`, `[fe80::1]:7877` e nomes (`g3bruno.local`).
+/// Aceita `192.168.56.41`, `192.168.56.41:7877`, `[fe80::1]:7877` e nomes (`computador-exemplo.local`).
 /// Sem porta, usa [`DEFAULT_SIGNALING_PORT`].
 ///
 /// Este é o caminho do M6 que foi antecipado para o M1 de propósito: a rede que bloqueia mDNS
@@ -449,8 +495,8 @@ pub const PRAZO_DE_RESOLUCAO: Duration = Duration::from_secs(5);
 /// resolve o endereço **antes** de montar a sessão, o `timeout_ms` que a casca passou não
 /// cobria nada disso — a tela de "conectando" ficava presa fora de qualquer prazo.
 ///
-/// Não morde quem digita um IP: `"192.168.1.131"` e `"192.168.1.131:7877"` saem pelos atalhos
-/// acima sem tocar no resolvedor. Morde o **erro de digitação** (`192.168.1.13x` vira nome) e o
+/// Não morde quem digita um IP: `"192.168.56.131"` e `"192.168.56.131:7877"` saem pelos atalhos
+/// acima sem tocar no resolvedor. Morde o **erro de digitação** (`192.168.56.13x` vira nome) e o
 /// nome de host — que é justamente quem o usuário digita quando o mDNS não funciona.
 ///
 /// # A thread que fica para trás
@@ -528,7 +574,10 @@ pub fn ler_destino(entrada: &str, porta: u16) -> Result<DestinoLido> {
         return Err(Error::Invalid("endereço vazio".into()));
     }
     if !e_link(entrada) {
-        return Ok(DestinoLido { endereco: normalizar_endereco(entrada, porta)?, pin: None });
+        return Ok(DestinoLido {
+            endereco: normalizar_endereco(entrada, porta)?,
+            pin: None,
+        });
     }
     let mut resto = &entrada[PREFIXO_DO_LINK.len()..];
     // Um leitor de QR genérico acrescenta `/`, `?…` ou `#…`: tudo depois do endereço sai.
@@ -549,15 +598,23 @@ pub fn ler_destino(entrada: &str, porta: u16) -> Result<DestinoLido> {
         ));
     }
     if host.is_empty() {
-        return Err(Error::Invalid("o link não traz o endereço depois do @".into()));
+        return Err(Error::Invalid(
+            "o link não traz o endereço depois do @".into(),
+        ));
     }
-    Ok(DestinoLido { endereco: normalizar_endereco(host, porta)?, pin: Some(pin.to_string()) })
+    Ok(DestinoLido {
+        endereco: normalizar_endereco(host, porta)?,
+        pin: Some(pin.to_string()),
+    })
 }
 
 /// Uma porta digitada: só dígitos, de 1 a 65535.
 fn ler_porta(texto: &str) -> Result<u16> {
     let porta = if !texto.is_empty() && texto.bytes().all(|b| b.is_ascii_digit()) {
-        texto.parse::<u32>().ok().filter(|p| (1..=u32::from(u16::MAX)).contains(p))
+        texto
+            .parse::<u32>()
+            .ok()
+            .filter(|p| (1..=u32::from(u16::MAX)).contains(p))
     } else {
         None
     };
@@ -569,7 +626,9 @@ fn ler_porta(texto: &str) -> Result<u16> {
 /// `host`, `host:porta`, `v6`, `[v6]` ou `[v6]:porta` → `host:porta`, sem resolver nada.
 fn normalizar_endereco(host: &str, porta: u16) -> Result<String> {
     if host.chars().any(char::is_whitespace) {
-        return Err(Error::Invalid(format!("'{host}': espaço no meio do endereço")));
+        return Err(Error::Invalid(format!(
+            "'{host}': espaço no meio do endereço"
+        )));
     }
     if host.contains(['/', '?', '#']) {
         return Err(Error::Invalid(format!(
@@ -604,7 +663,10 @@ fn normalizar_endereco(host: &str, porta: u16) -> Result<String> {
     }
     if host.contains('%') {
         let (ip, zona) = ler_ipv6_com_zona(host)?;
-        return Ok(format!("[{ip}%{}]:{porta}", zona.expect("a entrada tem zona")));
+        return Ok(format!(
+            "[{ip}%{}]:{porta}",
+            zona.expect("a entrada tem zona")
+        ));
     }
     // Sobrou nome, com ou sem `:porta`. Um nome com dois-pontos a mais é um IPv6 que o sistema não
     // aceitou.
@@ -616,7 +678,9 @@ fn normalizar_endereco(host: &str, porta: u16) -> Result<String> {
             }
             Ok(format!("{nome}:{}", ler_porta(p)?))
         }
-        None if host.contains(['[', ']']) => Err(Error::Invalid(format!("'{host}' não é um endereço"))),
+        None if host.contains(['[', ']']) => {
+            Err(Error::Invalid(format!("'{host}' não é um endereço")))
+        }
         None => Ok(format!("{host}:{porta}")),
     }
 }
@@ -625,11 +689,20 @@ fn normalizar_endereco(host: &str, porta: u16) -> Result<String> {
 /// sistema, com o mesmo prazo dos nomes de host. Nunca adivinhamos o índice de outra máquina.
 fn ler_ipv6_com_zona(literal: &str) -> Result<(std::net::Ipv6Addr, Option<&str>)> {
     let (ip, zona) = match literal.split_once('%') {
-        Some((ip, zona)) if !zona.is_empty() && zona.bytes().all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c)) => (ip, Some(zona)),
+        Some((ip, zona))
+            if !zona.is_empty()
+                && zona
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c)) =>
+        {
+            (ip, Some(zona))
+        }
         Some(_) => return Err(Error::Invalid(format!("'{literal}': zona IPv6 inválida"))),
         None => (literal, None),
     };
-    let ip = ip.parse().map_err(|_| Error::Invalid(format!("'{literal}': IPv6 que o sistema não aceita")))?;
+    let ip = ip
+        .parse()
+        .map_err(|_| Error::Invalid(format!("'{literal}': IPv6 que o sistema não aceita")))?;
     Ok((ip, zona))
 }
 
@@ -639,7 +712,11 @@ fn ler_ipv6_com_zona(literal: &str) -> Result<(std::net::Ipv6Addr, Option<&str>)
 ///
 /// Um link é [`Error::Invalid`]: leia-o com [`ler_destino`], ponha o PIN nas opções e conecte no
 /// endereço dele (§11.1, achado C1). Um IP não passa pelo resolvedor; um nome, sim, com `limite`.
-pub fn endereco_manual_com_porta(entrada: &str, porta: u16, limite: Duration) -> Result<SocketAddr> {
+pub fn endereco_manual_com_porta(
+    entrada: &str,
+    porta: u16,
+    limite: Duration,
+) -> Result<SocketAddr> {
     let entrada = entrada.trim();
     if e_link(entrada) {
         return Err(Error::Invalid(
@@ -654,8 +731,14 @@ pub fn endereco_manual_com_porta(entrada: &str, porta: u16, limite: Duration) ->
     }
 
     let (tx, rx) = std::sync::mpsc::channel();
-    let (host, porta) = com_porta.rsplit_once(':').expect("endereço normalizado traz porta");
-    let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host).to_string();
+    let (host, porta) = com_porta
+        .rsplit_once(':')
+        .expect("endereço normalizado traz porta");
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
+        .to_string();
     let porta = porta.parse::<u16>().expect("porta normalizada é válida");
     std::thread::spawn(move || {
         let r = (host.as_str(), porta).to_socket_addrs().map(|iter| {
@@ -719,57 +802,12 @@ pub(crate) fn escolher_porta_a_partir_de(base: u16, quantas: u16, espera: Durati
         .filter(|p| *p != 0)
 }
 
-/// O teto de um rótulo DNS, e portanto do nome de uma instância mDNS: 63 bytes.
-const TETO_DO_NOME_DA_INSTANCIA: usize = 63;
-
-/// **O nome da instância mDNS**: o nome do aparelho, o papel (se houver) e o sufixo do id.
-///
-/// Com papel, o nome o carrega: o mesmo aparelho anunciando vídeo e teleprompter ao mesmo tempo
-/// teria duas instâncias com o mesmo nome, e o mDNS resolve colisão renomeando uma delas por conta
-/// própria.
-///
-/// **Cabe em 63 bytes, sempre** (defeito 6 da revisão de 13/09). Acima disso o `mdns-sd` descarta
-/// o registro **em silêncio** (`NameTooLong`) e `Advertiser::start` devolve `Ok` — o aparelho some
-/// de toda lista sem erro nenhum. O papel acrescentado deixava isso ao alcance de um nome comum
-/// de prompter. O nome do aparelho é cortado numa fronteira de caractere (acento conta dois ou três
-/// bytes); o nome inteiro continua indo no TXT (`n`), que é o que as listas mostram. Um nome que já
-/// cabia sai idêntico ao de antes.
-pub fn nome_da_instancia(anuncio: &Announcement) -> String {
-    let sufixo = sufixo_curto(&anuncio.device_id);
-    let papel = anuncio.papel.map(|p| p.como_texto());
-    let fixo = sufixo.len() + 1 + papel.map(|p| p.len() + 1).unwrap_or(0);
-    let cabe = TETO_DO_NOME_DA_INSTANCIA.saturating_sub(fixo);
-    let mut nome = anuncio.display_name.as_str();
-    if nome.len() > cabe {
-        let mut corte = cabe;
-        while corte > 0 && !nome.is_char_boundary(corte) {
-            corte -= 1;
-        }
-        nome = nome[..corte].trim_end();
+/// Rótulo público efêmero, sempre ASCII e menor que os 63 bytes do DNS.
+pub fn nome_da_instancia(token: &str) -> Result<String> {
+    if !token_valido(token) {
+        return Err(Error::Discovery("token de descoberta inválido".into()));
     }
-    match papel {
-        Some(p) => format!("{nome} {p} {sufixo}"),
-        None => format!("{nome} {sufixo}"),
-    }
-}
-
-/// Sufixo curto e estável do id, para nome de instância e de host mDNS.
-///
-/// Só ASCII alfanumérico: nome de host com acento ou espaço quebra resolvedor em algum lugar da
-/// matriz de plataformas, e o `DeviceId` é escolhido pela casca — não dá para confiar nele.
-fn sufixo_curto(id: &DeviceId) -> String {
-    let limpo: String =
-        id.0.chars()
-            .filter(|c| c.is_ascii_alphanumeric())
-            .collect::<String>()
-            .to_ascii_lowercase();
-    let corte = limpo.len().saturating_sub(6);
-    let sufixo = &limpo[corte..];
-    if sufixo.is_empty() {
-        "anon".to_string()
-    } else {
-        sufixo.to_string()
-    }
+    Ok(format!("Quall {token}"))
 }
 
 /// Anúncio deste aparelho, com a versão de protocolo já preenchida.
@@ -803,28 +841,35 @@ mod tests {
     #[test]
     fn txt_sobrevive_ida_e_volta() {
         let original = exemplo();
-        let props: HashMap<String, String> =
-            announcement_to_txt(&original, 7877).into_iter().collect();
+        let props: HashMap<String, String> = announcement_to_txt(&original, 7877)
+            .expect("TXT")
+            .into_iter()
+            .collect();
         let (voltou, porta) = announcement_from_txt(&props).expect("decodifica");
-        assert_eq!(voltou, original);
+        assert!(voltou.device_id.0.starts_with("discovery-"));
+        assert_ne!(voltou.device_id, original.device_id);
+        assert_ne!(voltou.display_name, original.display_name);
+        assert_eq!(voltou.capabilities, original.capabilities);
         assert_eq!(porta, 7877);
     }
 
-    /// **Sem papel, o TXT é o de antes, chave a chave**: as cinco chaves, e nenhuma a mais.
+    /// A superfície pública não leva identidade nem nome de aparelho.
     #[test]
-    fn txt_sem_papel_e_o_de_antes() {
-        let txt = announcement_to_txt(&exemplo(), 7877);
+    fn txt_sem_papel_nao_tem_identidade_persistente() {
+        let txt = announcement_to_txt(&exemplo(), 7877).expect("TXT");
         let chaves: Vec<&str> = txt.iter().map(|(k, _)| k.as_str()).collect();
-        assert_eq!(chaves, ["v", "id", "n", "c", "p"]);
+        assert_eq!(chaves, ["v", "t", "c", "p"]);
     }
 
-    /// Com papel, uma chave a mais — `pa` — que volta; e uma build anterior, que pede as chaves
-    /// pelo nome, lê o anúncio igual.
+    /// O papel funcional sobrevive à descoberta, sem identidade pessoal.
     #[test]
-    fn txt_com_papel_leva_a_chave_pa_e_a_build_anterior_ignora() {
+    fn txt_com_papel_preserva_selecao_funcional_sem_nome() {
         let mut a = exemplo();
         a.papel = Some(Papel::Teleprompter);
-        let props: HashMap<String, String> = announcement_to_txt(&a, 7877).into_iter().collect();
+        let props: HashMap<String, String> = announcement_to_txt(&a, 7877)
+            .expect("TXT")
+            .into_iter()
+            .collect();
         assert_eq!(props.get("pa").map(String::as_str), Some("teleprompter"));
         let (voltou, _) = announcement_from_txt(&props).expect("decodifica");
         assert_eq!(voltou.papel, Some(Papel::Teleprompter));
@@ -834,7 +879,7 @@ mod tests {
         sem_pa.remove("pa");
         let (antigo, _) = announcement_from_txt(&sem_pa).expect("a build anterior decodifica");
         assert_eq!(antigo.papel, None);
-        assert_eq!(antigo.display_name, a.display_name);
+        assert_ne!(antigo.display_name, a.display_name);
 
         // Um valor que esta build não conhece não derruba o anúncio.
         let mut futuro = props;
@@ -845,16 +890,20 @@ mod tests {
 
     #[test]
     fn txt_sem_chave_obrigatoria_e_erro() {
-        let mut props: HashMap<String, String> =
-            announcement_to_txt(&exemplo(), 7877).into_iter().collect();
-        props.remove("id");
+        let mut props: HashMap<String, String> = announcement_to_txt(&exemplo(), 7877)
+            .expect("TXT")
+            .into_iter()
+            .collect();
+        props.remove("t");
         assert!(announcement_from_txt(&props).is_err());
     }
 
     #[test]
     fn capacidades_ausentes_nao_viram_true() {
-        let mut props: HashMap<String, String> =
-            announcement_to_txt(&exemplo(), 7877).into_iter().collect();
+        let mut props: HashMap<String, String> = announcement_to_txt(&exemplo(), 7877)
+            .expect("TXT")
+            .into_iter()
+            .collect();
         props.insert("c".into(), String::new());
         let (voltou, _) = announcement_from_txt(&props).expect("decodifica");
         assert_eq!(
@@ -869,16 +918,16 @@ mod tests {
 
     #[test]
     fn endereco_manual_aceita_ip_puro() {
-        let addr = endereco_manual("192.168.1.41").expect("resolve");
+        let addr = endereco_manual("192.168.56.41").expect("resolve");
         assert_eq!(
             addr.to_string(),
-            format!("192.168.1.41:{DEFAULT_SIGNALING_PORT}")
+            format!("192.168.56.41:{DEFAULT_SIGNALING_PORT}")
         );
     }
 
     #[test]
     fn endereco_manual_aceita_ip_com_porta() {
-        let addr = endereco_manual("192.168.1.41:9000").expect("resolve");
+        let addr = endereco_manual("192.168.56.41:9000").expect("resolve");
         assert_eq!(addr.port(), 9000);
     }
 
@@ -898,10 +947,28 @@ mod tests {
         ] {
             assert_eq!(endereco_manual(entrada).unwrap().to_string(), esperado);
         }
-        assert_eq!(ler_destino("fe80::1%en0", 7979).unwrap().endereco, "[fe80::1%en0]:7979");
-        assert_eq!(ler_destino("[fe80::1%en0]:7980", 7979).unwrap().endereco, "[fe80::1%en0]:7980");
-        assert_eq!(ler_destino("quall://424242@[fe80::1%7]:7980", 7979).unwrap().pin.as_deref(), Some("424242"));
-        for entrada in ["fe80::1%", "fe80::1%en0%en1", "[fe80::1%en0]:0", "[fe80::1%en0]:70000", "192.0.2.1%7"] {
+        assert_eq!(
+            ler_destino("fe80::1%en0", 7979).unwrap().endereco,
+            "[fe80::1%en0]:7979"
+        );
+        assert_eq!(
+            ler_destino("[fe80::1%en0]:7980", 7979).unwrap().endereco,
+            "[fe80::1%en0]:7980"
+        );
+        assert_eq!(
+            ler_destino("quall://424242@[fe80::1%7]:7980", 7979)
+                .unwrap()
+                .pin
+                .as_deref(),
+            Some("424242")
+        );
+        for entrada in [
+            "fe80::1%",
+            "fe80::1%en0%en1",
+            "[fe80::1%en0]:0",
+            "[fe80::1%en0]:70000",
+            "192.0.2.1%7",
+        ] {
             assert!(ler_destino(entrada, 7979).is_err(), "{entrada}");
         }
     }
@@ -917,13 +984,25 @@ mod tests {
     fn endpoint_ipv6_link_local_exige_e_preserva_interface() {
         let ip = "fe80::1234".parse().unwrap();
         assert_eq!(endpoint_ipv6(ip, 7877, 0), None);
-        assert_eq!(endpoint_ipv6(ip, 7877, 9).unwrap().to_string(), "[fe80::1234%9]:7877");
+        assert_eq!(
+            endpoint_ipv6(ip, 7877, 9).unwrap().to_string(),
+            "[fe80::1234%9]:7877"
+        );
         assert_ne!(endpoint_ipv6(ip, 7877, 9), endpoint_ipv6(ip, 7877, 10));
         let ula = "fd00::1234".parse().unwrap();
-        assert_eq!(endpoint_ipv6(ula, 7877, 9).unwrap().to_string(), "[fd00::1234]:7877");
+        assert_eq!(
+            endpoint_ipv6(ula, 7877, 9).unwrap().to_string(),
+            "[fd00::1234]:7877"
+        );
         let a = aparelho(vec!["fe80::1234"]);
-        assert!(a.endpoint().is_none(), "não inventar uma rota para endereço sem escopo");
-        assert_eq!(aparelho(vec!["fd00::1234"]).endpoint().unwrap().to_string(), "[fd00::1234]:7877");
+        assert!(
+            a.endpoint().is_none(),
+            "não inventar uma rota para endereço sem escopo"
+        );
+        assert_eq!(
+            aparelho(vec!["fd00::1234"]).endpoint().unwrap().to_string(),
+            "[fd00::1234]:7877"
+        );
     }
 
     #[test]
@@ -974,11 +1053,17 @@ mod tests {
         let video = porta_para_completar(None);
         assert_eq!((controle, video), (7979, 7877));
         assert_eq!(porta_para_completar(Some(Papel::Teleprompter)), 7877);
-        let e = endereco_manual_com_porta("192.168.15.8", controle, Duration::from_millis(1)).unwrap();
-        assert_eq!(e.to_string(), "192.168.15.8:7979");
-        let e = endereco_manual_com_porta("192.168.15.8:8000", controle, Duration::from_millis(1)).unwrap();
+        let e =
+            endereco_manual_com_porta("192.168.57.8", controle, Duration::from_millis(1)).unwrap();
+        assert_eq!(e.to_string(), "192.168.57.8:7979");
+        let e = endereco_manual_com_porta("192.168.57.8:8000", controle, Duration::from_millis(1))
+            .unwrap();
         assert_eq!(e.port(), 8000, "a porta digitada é mexida");
-        assert_eq!(endereco_manual("192.168.15.8").unwrap().port(), 7877, "o vídeo mudou de porta");
+        assert_eq!(
+            endereco_manual("192.168.57.8").unwrap().port(),
+            7877,
+            "o vídeo mudou de porta"
+        );
     }
 
     /// A tabela de `ler_destino` (§11.1): a união do que Android, iOS e Mac aceitavam, ficando com
@@ -987,44 +1072,80 @@ mod tests {
     fn o_link_traz_o_pin_e_a_porta() {
         let ler = |e: &str| ler_destino(e, PORTA_DO_TELEPROMPTER).map(|d| (d.endereco, d.pin));
         let ok = |e: &str, a: &str, pin: Option<&str>| {
-            assert_eq!(ler(e).ok(), Some((a.to_string(), pin.map(str::to_string))), "entrada {e:?}");
+            assert_eq!(
+                ler(e).ok(),
+                Some((a.to_string(), pin.map(str::to_string))),
+                "entrada {e:?}"
+            );
         };
-        ok("192.168.15.8", "192.168.15.8:7979", None);
-        ok("  192.168.15.8  ", "192.168.15.8:7979", None);
+        ok("192.168.57.8", "192.168.57.8:7979", None);
+        ok("  192.168.57.8  ", "192.168.57.8:7979", None);
         ok("quall-944d0e.local", "quall-944d0e.local:7979", None);
-        ok("192.168.15.8:8000", "192.168.15.8:8000", None);
-        ok("192.168.15.8:7877", "192.168.15.8:7877", None);
+        ok("192.168.57.8:8000", "192.168.57.8:8000", None);
+        ok("192.168.57.8:7877", "192.168.57.8:7877", None);
         ok("[fe80::1]:8000", "[fe80::1]:8000", None);
         ok("[fe80::1]", "[fe80::1]:7979", None);
-        ok("2804:1b1:fec0:1458::1", "[2804:1b1:fec0:1458::1]:7979", None);
-        ok("quall://424242@192.168.15.8:7979", "192.168.15.8:7979", Some("424242"));
-        ok("QUALL://424242@192.168.15.8/", "192.168.15.8:7979", Some("424242"));
-        ok("  QUALL://424242@192.168.15.20:7979/  ", "192.168.15.20:7979", Some("424242"));
-        ok("quall://424242@192.168.15.8:7979?x=1", "192.168.15.8:7979", Some("424242"));
-        ok("quall://424242@[fe80::1]:7980#frag", "[fe80::1]:7980", Some("424242"));
-        ok("quall://123456@ipad.local", "ipad.local:7979", Some("123456"));
+        ok(
+            "2804:1b1:fec0:1458::1",
+            "[2804:1b1:fec0:1458::1]:7979",
+            None,
+        );
+        ok(
+            "quall://424242@192.168.57.8:7979",
+            "192.168.57.8:7979",
+            Some("424242"),
+        );
+        ok(
+            "QUALL://424242@192.168.57.8/",
+            "192.168.57.8:7979",
+            Some("424242"),
+        );
+        ok(
+            "  QUALL://424242@192.168.57.20:7979/  ",
+            "192.168.57.20:7979",
+            Some("424242"),
+        );
+        ok(
+            "quall://424242@192.168.57.8:7979?x=1",
+            "192.168.57.8:7979",
+            Some("424242"),
+        );
+        ok(
+            "quall://424242@[fe80::1]:7980#frag",
+            "[fe80::1]:7980",
+            Some("424242"),
+        );
+        ok(
+            "quall://123456@ipad.local",
+            "ipad.local:7979",
+            Some("123456"),
+        );
         for ruim in [
             "",
             "   ",
-            "192.168.15.8:0",
-            "192.168.15.8:70000",
-            "192.168.15.8:abc",
-            "192.168.15.8:+80",
+            "192.168.57.8:0",
+            "192.168.57.8:70000",
+            "192.168.57.8:abc",
+            "192.168.57.8:+80",
             ":7979",
             "quall://424242@",
-            "quall://42424@192.168.15.8:7979",
-            "quall://4242424@192.168.15.8:7979",
-            "quall://abcdef@192.168.15.8:7979",
-            "quall://4２4242@192.168.15.8:7979",
-            "quall://192.168.15.8:7979",
+            "quall://42424@192.168.57.8:7979",
+            "quall://4242424@192.168.57.8:7979",
+            "quall://abcdef@192.168.57.8:7979",
+            "quall://4２4242@192.168.57.8:7979",
+            "quall://192.168.57.8:7979",
             "[fe80::1",
             "[fe80::1]x",
-            "192.168.15.8 : 7979",
-            "192.168.15.8:7979/",
+            "192.168.57.8 : 7979",
+            "192.168.57.8:7979/",
             "ipad.local?x",
             "2804:1b1::zz",
         ] {
-            assert!(matches!(ler(ruim), Err(Error::Invalid(_))), "{ruim:?} devia ser INVALID, veio {:?}", ler(ruim));
+            assert!(
+                matches!(ler(ruim), Err(Error::Invalid(_))),
+                "{ruim:?} devia ser INVALID, veio {:?}",
+                ler(ruim)
+            );
         }
     }
 
@@ -1050,21 +1171,23 @@ mod tests {
             })
         }
         for e in [
-            "192.168.1.41",
-            "192.168.1.41:9000",
-            " 192.168.1.131 ",
+            "192.168.56.41",
+            "192.168.56.41:9000",
+            " 192.168.56.131 ",
             "169.254.75.173:7877",
             "[::1]:9000",
             "::1",
             "fe80::1",
             "[fe80::1]",
             "2804:1b1:fec0:1458::1",
-            "g3bruno.local",
-            "g3bruno.local:9000",
+            "computador-exemplo.local",
+            "computador-exemplo.local:9000",
             "localhost",
         ] {
             assert_eq!(
-                ler_destino(e, DEFAULT_SIGNALING_PORT).ok().map(|d| d.endereco),
+                ler_destino(e, DEFAULT_SIGNALING_PORT)
+                    .ok()
+                    .map(|d| d.endereco),
                 de_13_09(e),
                 "{e:?} mudou para o vídeo"
             );
@@ -1072,8 +1195,14 @@ mod tests {
                 assert_eq!(endereco_manual(e).ok(), Some(antes), "{e:?}");
             }
         }
-        assert_eq!(de_13_09("192.168.1.41:0").as_deref(), Some("192.168.1.41:0"));
-        assert!(matches!(endereco_manual("192.168.1.41:0"), Err(Error::Invalid(_))), "a porta 0 passou");
+        assert_eq!(
+            de_13_09("192.168.56.41:0").as_deref(),
+            Some("192.168.56.41:0")
+        );
+        assert!(
+            matches!(endereco_manual("192.168.56.41:0"), Err(Error::Invalid(_))),
+            "a porta 0 passou"
+        );
     }
 
     /// **Achado C1 (alta)**: o `connect` recebe só endereço. Um link é `INVALID` — leia-o com
@@ -1081,10 +1210,17 @@ mod tests {
     /// automática tiraria de novo o PIN velho dele e viraria `WRONG_PIN`.
     #[test]
     fn link_no_connect_e_invalid() {
-        for e in ["quall://424242@192.168.15.8:7979", "QUALL://424242@127.0.0.1", "quall://127.0.0.1:7979"] {
+        for e in [
+            "quall://424242@192.168.57.8:7979",
+            "QUALL://424242@127.0.0.1",
+            "quall://127.0.0.1:7979",
+        ] {
             for porta in [DEFAULT_SIGNALING_PORT, PORTA_DO_TELEPROMPTER] {
                 assert!(
-                    matches!(endereco_manual_com_porta(e, porta, Duration::from_millis(1)), Err(Error::Invalid(_))),
+                    matches!(
+                        endereco_manual_com_porta(e, porta, Duration::from_millis(1)),
+                        Err(Error::Invalid(_))
+                    ),
                     "{e:?} entrou no connect"
                 );
             }
@@ -1102,7 +1238,10 @@ mod tests {
         let inicio = Instant::now();
         let outra = escolher_porta_a_partir_de(preferida, 3, Duration::from_millis(300)).unwrap();
         assert_ne!(outra, preferida);
-        assert!(inicio.elapsed() >= Duration::from_millis(300), "não esperou pela preferida");
+        assert!(
+            inicio.elapsed() >= Duration::from_millis(300),
+            "não esperou pela preferida"
+        );
         // Solta no meio da espera: fica com a preferida.
         let solta = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(150));
@@ -1118,7 +1257,7 @@ mod tests {
     #[test]
     fn ip_digitado_nao_passa_pelo_resolvedor() {
         let inicio = Instant::now();
-        let addr = endereco_manual_com_prazo("192.168.1.41:9000", Duration::from_millis(1))
+        let addr = endereco_manual_com_prazo("192.168.56.41:9000", Duration::from_millis(1))
             .expect("IP literal não depende de DNS");
         assert_eq!(addr.port(), 9000);
         assert!(inicio.elapsed() < Duration::from_millis(200));
@@ -1141,16 +1280,16 @@ mod tests {
     #[test]
     fn endpoint_prefere_ipv4_privado_a_ipv6_link_local() {
         assert_eq!(
-            aparelho(vec!["fe80::1", "192.168.1.41"])
+            aparelho(vec!["fe80::1", "192.168.56.41"])
                 .endpoint()
                 .expect("endpoint")
                 .to_string(),
-            "192.168.1.41:7877"
+            "192.168.56.41:7877"
         );
     }
 
     /// Regressão da bancada: o MacBook anunciou 70 endereços e o `169.254.232.1` (APIPA, de uma
-    /// interface sem DHCP) vinha antes do `192.168.1.131` na lista do mDNS.
+    /// interface sem DHCP) vinha antes do `192.168.56.131` na lista do mDNS.
     #[test]
     fn endpoint_nao_escolhe_apipa_havendo_endereco_de_lan() {
         assert_eq!(
@@ -1158,12 +1297,12 @@ mod tests {
                 "169.254.232.1",
                 "127.0.0.1",
                 "fe80::94c7:3bff:fe76:8eba",
-                "192.168.1.131",
+                "192.168.56.131",
             ])
             .endpoint()
             .expect("endpoint")
             .to_string(),
-            "192.168.1.131:7877"
+            "192.168.56.131:7877"
         );
     }
 
@@ -1182,11 +1321,11 @@ mod tests {
     #[test]
     fn enderecos_repetidos_somem() {
         let a = aparelho(vec![
-            "192.168.1.131",
+            "192.168.56.131",
             "fe80::1",
-            "192.168.1.131",
+            "192.168.56.131",
             "fe80::1",
-            "192.168.1.131",
+            "192.168.56.131",
         ]);
         assert_eq!(a.addresses.len(), 2, "sobrou repetição: {:?}", a.addresses);
     }
@@ -1212,17 +1351,18 @@ mod tests {
         let mut anuncio = exemplo();
         anuncio.device_id = DeviceId(id.clone());
 
+        let anunciante = Advertiser::start(&anuncio, 7877).expect("anunciante");
+        let fullname = anunciante.fullname().to_owned();
         // Cada fase usa um navegador **novo**: ele manda uma consulta nova, e um daemon que
         // morreu não responde. Reaproveitar o navegador testaria o cache dele, não a LAN.
         let esta_na_lan = |quanto: Duration| -> bool {
             let navegador = Browser::start().expect("navegador");
             navegador
                 .collect(quanto)
-                .map(|lista| lista.iter().any(|a| a.announcement.device_id.0 == id))
+                .map(|lista| lista.iter().any(|a| a.fullname == fullname))
                 .unwrap_or(false)
         };
 
-        let anunciante = Advertiser::start(&anuncio, 7877).expect("anunciante");
         assert!(anunciante.ativo());
 
         if !esta_na_lan(Duration::from_secs(3)) {
@@ -1259,51 +1399,62 @@ mod tests {
         a.device_id = DeviceId(id.clone());
         a.display_name = "Teleprompter do estúdio de gravação — câmera à esquerda, Ângulo B".into();
         a.papel = Some(Papel::Teleprompter);
-        let _anunciante = Advertiser::start(&a, 7879).expect("anunciante");
+        let anunciante = Advertiser::start(&a, 7879).expect("anunciante");
         let navegador = Browser::start().expect("navegador");
-        let achados = navegador.collect(Duration::from_secs(3)).expect("navegação");
+        let achados = navegador
+            .collect(Duration::from_secs(3))
+            .expect("navegação");
         navegador.stop();
-        let achado = achados.iter().find(|x| x.announcement.device_id.0 == id);
+        let achado = achados.iter().find(|x| x.fullname == anunciante.fullname());
         assert!(achado.is_some(), "o prompter de nome longo sumiu da lista");
-        let achado = achado.map(|x| x.announcement.clone()).unwrap_or_else(exemplo);
-        assert_eq!(achado.display_name, a.display_name, "o nome inteiro vai no TXT");
+        let achado = achado
+            .map(|x| x.announcement.clone())
+            .unwrap_or_else(exemplo);
+        assert_ne!(
+            achado.display_name, a.display_name,
+            "o nome pessoal não vai na rede"
+        );
+        assert!(achado.device_id.0.starts_with("discovery-"));
         assert_eq!(achado.papel, Some(Papel::Teleprompter));
     }
 
-    /// O nome da instância cabe em 63 bytes, cortado numa fronteira de caractere, e um nome que já
-    /// cabia sai idêntico ao de antes.
     #[test]
-    fn nome_da_instancia_cabe_em_63_bytes_e_o_curto_nao_muda() {
-        let mut a = exemplo();
-        assert_eq!(nome_da_instancia(&a), "Galaxy A10s abc123", "o nome curto, sem papel, é o de antes");
-        a.display_name = "Teleprompter do estúdio de gravação — câmera à esquerda, Ângulo B".into();
-        a.papel = Some(Papel::Teleprompter);
-        let n = nome_da_instancia(&a);
-        assert!(n.len() <= 63, "{n:?} tem {} bytes", n.len());
-        assert!(n.ends_with(" teleprompter abc123"), "{n:?}");
-        assert!(a.display_name.starts_with(n.trim_end_matches(" teleprompter abc123")), "{n:?}");
-        // Todos os cortes possíveis, acentos no caminho: sempre UTF-8, sempre ≤ 63.
-        for tamanho in 0..=a.display_name.chars().count() {
-            a.display_name = "ã".repeat(tamanho);
-            let n = nome_da_instancia(&a);
-            assert!(n.len() <= 63, "{tamanho}: {} bytes", n.len());
+    fn rotulos_efemeros_nao_dependem_da_identidade_real() {
+        let a = exemplo();
+        let first: HashMap<_, _> = announcement_to_txt(&a, 7877).unwrap().into_iter().collect();
+        let second: HashMap<_, _> = announcement_to_txt(&a, 7877).unwrap().into_iter().collect();
+        assert_ne!(first["t"], second["t"]);
+        assert!(!first.contains_key("id") && !first.contains_key("n"));
+        let instance = nome_da_instancia(&first["t"]).unwrap();
+        assert!(instance.len() <= 63 && instance.is_ascii());
+        assert!(!instance.contains(&a.display_name) && !instance.contains(&a.device_id.0));
+        let public = serde_json::to_string(&first).unwrap();
+        assert!(!public.contains(&a.display_name) && !public.contains(&a.device_id.0));
+    }
+
+    #[test]
+    fn descoberta_recusa_legado_token_invalido_e_identidade_publica() {
+        let base: HashMap<_, _> = announcement_to_txt(&exemplo(), 7877)
+            .unwrap()
+            .into_iter()
+            .collect();
+        for (field, value) in [
+            ("v", "2"),
+            ("t", "nome-de-aparelho"),
+            ("t", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            ("id", "id-persistente"),
+            ("n", "nome pessoal"),
+            ("p", "0"),
+        ] {
+            let mut props = base.clone();
+            props.insert(field.into(), value.into());
+            assert!(announcement_from_txt(&props).is_err(), "{field}");
         }
+        assert!(nome_da_instancia("nome pessoal").is_err());
     }
 
     #[test]
     fn sem_endereco_nao_ha_endpoint() {
         assert!(aparelho(vec![]).endpoint().is_none());
-    }
-
-    #[test]
-    fn sufixo_e_ascii_e_curto() {
-        let s = sufixo_curto(&DeviceId("MacBook do Bruno — ÁÉÍ 12AB34".into()));
-        assert!(s.chars().all(|c| c.is_ascii_alphanumeric()));
-        assert!(s.len() <= 6);
-    }
-
-    #[test]
-    fn sufixo_de_id_sem_alfanumerico_nao_fica_vazio() {
-        assert_eq!(sufixo_curto(&DeviceId("——".into())), "anon");
     }
 }

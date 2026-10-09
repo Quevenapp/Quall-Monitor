@@ -41,7 +41,7 @@ public enum Idioma: String, CaseIterable, Sendable {
     private static var _atual: Idioma = resolvido()
 
     /// A chave do `UserDefaults` com a escolha do seletor.
-    public static let chaveDaEscolha = "quall.idioma"
+    public static let chaveDaEscolha = "monitor.idioma"
 
     /// **A ordem** (contrato, item 2): `QUALL_IDIOMA` no ambiente (bancada e retratos); sob o XCTest,
     /// o texto-fonte, para os testes que comparam frases em português não dependerem do idioma do Mac;
@@ -51,7 +51,7 @@ public enum Idioma: String, CaseIterable, Sendable {
                           guardado: String? = UserDefaults.standard.string(forKey: chaveDaEscolha),
                           preferidos: [String] = Locale.preferredLanguages,
                           sobXCTest: Bool = NSClassFromString("XCTestCase") != nil) -> Idioma {
-        if let v = ambiente["QUALL_IDIOMA"], let i = Idioma(rawValue: v.lowercased()) { return i }
+        if let v = ambiente["QUALL_MONITOR_IDIOMA"] ?? ambiente["QUALL_IDIOMA"], let i = Idioma(rawValue: v.lowercased()) { return i }
         if sobXCTest { return .pt }
         if let guardado, let i = Idioma(rawValue: guardado) { return i }
         return doSistema(preferidos)
@@ -149,7 +149,7 @@ public enum Traducoes {
     /// (`Contents/Resources`, onde `Empacotar/empacotar.sh` o copia), ao lado do executável
     /// (`swift build`), e ao lado do `.xctest` (`swift test`).
     public static let pacote: Bundle? = {
-        let nome = "QuallCapture_QuallIdiomaKit.bundle"
+        let nome = "QuallMonitor_QuallIdiomaKit.bundle"
         var lugares: [URL?] = [
             Bundle.main.resourceURL,
             Bundle.main.bundleURL,
