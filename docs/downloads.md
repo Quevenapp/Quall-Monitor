@@ -36,11 +36,15 @@ Os pacotes Mac finais receberam **Developer ID Application**, com hardened runti
 | `Quall-Monitor-0.1.1-macos-arm64.dmg` | Apple Silicon (`arm64`) | `575ea04a34e19c0edb6c4b8e507e7a75b5f46ff7fd67f3f816f23f382f718a4f` |
 | `Quall-Monitor-0.1.1-macos-x64.dmg` | Intel (`x86_64`) | `4d51c8c0eb188eb2e7841333e1c6a97685ba9d3a08756fc2819ba97486d4327b` |
 
-A página, o ícone, o manifesto **0.1.1** e esses quatro instaladores foram publicados por SFTP em `/public_html/quall-monitor/`, no canal **`preview`**. Os sete arquivos foram baixados de volta para `dist/hosted-check-0.1.1/`: página, ícone e manifesto são iguais à preparação byte a byte, e os quatro instaladores coincidem com os SHA-256 do manifesto. A prova local está em `dist/hosted-check-0.1.1-proof.json`. A página foi conferida em português e inglês na preparação local. O HTTPS do domínio continua sem responder na rede de desenvolvimento; a confirmação pela rede móvel registrada anteriormente corresponde à **0.1.0**, e a da **0.1.1** permanece pendente.
+A página, o ícone, o manifesto **0.1.1** e esses quatro instaladores foram publicados por SFTP em `/public_html/quall-monitor/`, no canal **`preview`**. Os sete arquivos foram baixados de volta para `dist/hosted-check-0.1.1/`: página, ícone e manifesto são iguais à preparação byte a byte, e os quatro instaladores coincidem com os SHA-256 do manifesto. A prova local está em `dist/hosted-check-0.1.1-proof.json`. A página foi conferida em português e inglês na preparação local.
 
-O app arm64 final foi instalado e conferido em `/Applications/Quall Monitor.app`; a interface alternou entre PT e EN e mostrou o estado de espera em `192.168.0.9:7878`, PIN atual e orientação sobre até oito monitores. Seu endpoint `/quall/v3` respondeu `HTTP/1.1 101 Switching Protocols` tanto em loopback como no endereço LAN, antes do pareamento. Essa conferência não concedeu novas permissões de privacidade nem estabeleceu sessão com receptor físico.
+Em **09/10/2026**, o usuário confirmou que a página pública HTTPS abriu pela rede móvel, mostrou **“Prévia 0.1.1”** e os quatro downloads: dois DMGs Mac e MSIs Windows em PT e EN. A confirmação cobre a disponibilidade da página e dos links; não registra o download efetivo dos quatro instaladores novos. O HTTPS do domínio continua sem responder na rede de desenvolvimento, limitando a conferência local.
 
-Os testes automáticos verificam até oito sessões em loopback. A validação física com Android/iPad, oito telas reais e instalação/desinstalação do driver em Windows permanece pendente; o detalhamento das provas está em [validation.md](validation.md#versão-011--ci-e-instaladores).
+O app arm64 final foi instalado e conferido em `/Applications/Quall Monitor.app`; a interface alternou entre PT e EN e mostrou o estado de espera em `192.168.0.9:7878`, PIN atual e orientação sobre até oito monitores. Seu endpoint `/quall/v3` respondeu `HTTP/1.1 101 Switching Protocols` tanto em loopback como no endereço LAN, antes do pareamento. Essa conferência da interface não concedeu novas permissões de privacidade nem estabeleceu sessão com receptor físico.
+
+Em **09/10/2026**, o usuário confirmou que a imagem recebida do **Quall Monitor 0.1.1 no Mac** apareceu no **Quall Studio no Android e no iPad**, validando a exibição nos dois aparelhos que apresentavam o erro 404. O relato não informa conexão simultânea dos dois receptores.
+
+Os testes automáticos verificam até oito sessões em loopback. Oito telas reais e instalação/desinstalação do driver em Windows continuam pendentes de ensaio físico; o detalhamento das provas está em [validation.md](validation.md#versão-011--publicação-do-site-e-limites). Os MSIs permanecem sem Authenticode, no canal de prévia.
 
 ## Página própria
 
