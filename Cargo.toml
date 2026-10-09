@@ -1,0 +1,97 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/quall-core",
+  "crates/quall-ffi",
+  "crates/quall-opus",
+  "crates/quall-rtc",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.85"
+license = "MPL-2.0"
+publish = false
+
+[workspace.dependencies]
+quall-core = { path = "crates/quall-core" }
+quall-rtc = { path = "crates/quall-rtc" }
+quall-opus = { path = "crates/quall-opus" }
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Transporte: libdatachannel (WebRTC leve, C++), não libwebrtc.
+# `vendored` compila libdatachannel *e* o OpenSSL dela a partir do fonte — é o único modo que
+# não depende de uma libdatachannel instalada na máquina, e portanto o único reprodutível na CI
+# e no cross-compile.
+#
+# O `log` não é escolha nossa: `datachannel` 0.16.1 não compila sem `log` **ou** `tracing`
+# (`src/logger.rs` só define os macros atrás de uma dessas features, e `src/lib.rs` os usa
+# incondicionalmente). Medido aqui em 2026-08-21: com `default-features = false` puro dá 34
+# erros E0433. Ficamos com `log`, que é a facade mais barata.
+#
+# A feature `media` entrou no M2. Ela liga a libsrtp no build do cmake e, com ela, os símbolos
+# da API de mídia da libdatachannel: pacotizador H.264 (RFC 6184), tratador de PLI/FIR,
+# `rtcRequestKeyframe` e as sessões de RTCP. Sem ela, `rtcChainPliHandler` e companhia existem
+# nos bindings (o bindgen roda sobre o `rtc.h` inteiro, que define `RTC_ENABLE_MEDIA 1` por
+# padrão) mas **não existem na biblioteca** — o erro só aparece no link, não no `cargo check`.
+#
+# Custo medido no M1: ~90 KB no `aarch64-apple-ios` com `strip` (6,95 MB → 7,03 MB).
+datachannel = { version = "0.16", default-features = false, features = [
+  "log",
+  "vendored",
+  "media",
+] }
+
+# O `-sys` entra direto por causa do `quall-rtc`. O crate seguro `datachannel` 0.16.1 não expõe
+# **nada** da API de mídia — nem `rtcSetTrackCallback` (o receptor jamais fica sabendo que uma
+# track chegou), nem pacotizador, nem PLI, nem `rtcRequestKeyframe` — e ainda esconde os ids
+# inteiros do `pc` e da track, que são o que a API C pede. Ver `crates/quall-rtc/src/lib.rs`.
+#
+# `links = "datachannel"` no `-sys` garante que só existe uma cópia da biblioteca nativa no
+# grafo: o `datachannel` e o `quall-rtc` compartilham exatamente o mesmo build.
+datachannel-sys = { version = "0.23", default-features = false, features = [
+  "media",
+  "vendored",
+] }
+
+# Descoberta mDNS. `mdns-sd` é Rust puro e não arrasta runtime async — importa para o armv7 do
+# A10s e para os 50 MB da extension do iOS.
+mdns-sd = { version = "0.21", default-features = false }
+
+# Sinalização: WebSocket síncrono sobre `std::net::TcpStream`. Sem tokio de propósito: uma thread
+# por conexão de sinalização custa menos que um runtime inteiro, e a sinalização é efêmera.
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+
+# Pareamento por PIN. X25519 dá o segredo de sessão que um bisbilhoteiro passivo não consegue
+# derivar nem sabendo o PIN; HMAC/HKDF/SHA-256 fazem a confirmação e a derivação do segredo
+# de longo prazo. Tudo Rust puro, tudo compila em 32 bits.
+#
+# `zeroize` fica ligada de propósito: o segredo do par sobrevive ao processo em disco, e o que
+# passa pela memória não deveria sobreviver ao `Drop`. `precomputed-tables` fica de fora — são
+# tabelas do ponto base do Ed25519, que o X25519 não usa, e são bytes a mais no binário que a
+# extension do iOS tem de carregar.
+x25519-dalek = { version = "3", default-features = false, features = [
+  "static_secrets",
+  "zeroize",
+] }
+hmac = "0.12"
+sha2 = { version = "0.10", default-features = false }
+hkdf = "0.12"
+subtle = { version = "2", default-features = false }
+getrandom = "0.3"
+
+# A cópia do `datachannel-sys` com o espaçador exposto na API C e a guarda dele consertada. Três
+# arquivos diferem do publicado; o porquê e o diff estão em `vendor/datachannel-sys/QUALL-PATCH.md`.
+# `links = "datachannel"` continua valendo: o `datachannel` e o `quall-rtc` usam esta cópia, e só ela.
+[patch.crates-io]
+datachannel-sys = { path = "vendor/datachannel-sys" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"

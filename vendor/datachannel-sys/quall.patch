@@ -1,0 +1,72 @@
+--- a/build.rs
++++ b/build.rs
+@@ -87,6 +87,12 @@
+ fn main() {
+     let out_dir = env::var("OUT_DIR").unwrap();
+ 
++    // QUALL: the published build script only emits `rerun-if-env-changed`, which turns off
++    // cargo's default "rerun when any package file changes" — so an edit to the patched C++ was
++    // silently not rebuilt. Watch the libdatachannel sources we patch (see QUALL-PATCH.md).
++    println!("cargo:rerun-if-changed=libdatachannel/src");
++    println!("cargo:rerun-if-changed=libdatachannel/include");
++
+     #[cfg(feature = "vendored-libdatachannel")]
+     {
+         let mut cmake_conf = cmake::Config::new("libdatachannel");
+--- a/libdatachannel/src/pacinghandler.cpp
++++ b/libdatachannel/src/pacinghandler.cpp
+@@ -17,11 +17,17 @@
+ 
+ namespace rtc {
+ 
++// QUALL: `mLastRun` starts at construction instead of the clock's epoch (see QUALL-PATCH.md).
+ PacingHandler::PacingHandler(double bitsPerSecond, std::chrono::milliseconds sendInterval)
+-    : mBytesPerSecond(bitsPerSecond / 8), mBudget(0.), mSendInterval(sendInterval){};
++    : mBytesPerSecond(bitsPerSecond / 8), mBudget(0.), mSendInterval(sendInterval),
++      mLastRun(std::chrono::high_resolution_clock::now()){};
+ 
+ void PacingHandler::schedule(const message_callback &send) {
+-	if (!mHaveScheduled.exchange(true)) {
++	// QUALL: the upstream 0.23.2 guard was inverted (`!exchange(true)`), so the first frame was
++	// never scheduled and waited for the next one, and a drain that needed a second tick stopped
++	// until the next frame arrived. `exchange` returns the previous value: skip only when a run is
++	// already scheduled. See QUALL-PATCH.md.
++	if (mHaveScheduled.exchange(true)) {
+ 		return;
+ 	}
+ 
+--- a/libdatachannel/src/capi.cpp
++++ b/libdatachannel/src/capi.cpp
+@@ -1400,6 +1400,19 @@
+ 	});
+ }
+ 
++// QUALL: C API for the PacingHandler, which 0.23.2 only exposes in C++ (see QUALL-PATCH.md).
++int rtcChainPacingHandler(int tr, double bitsPerSecond, int sendIntervalMs) {
++	return wrap([&] {
++		if (bitsPerSecond <= 0. || sendIntervalMs <= 0)
++			throw std::invalid_argument("Pacing rate and send interval must be positive");
++		auto track = getTrack(tr);
++		auto handler = std::make_shared<PacingHandler>(bitsPerSecond,
++		                                               std::chrono::milliseconds(sendIntervalMs));
++		track->chainMediaHandler(handler);
++		return RTC_ERR_SUCCESS;
++	});
++}
++
+ int rtcChainRembHandler(int tr, rtcRembHandlerCallbackFunc cb) {
+ 	return wrap([&] {
+ 		auto track = getTrack(tr);
+--- a/libdatachannel/include/rtc/rtc.h
++++ b/libdatachannel/include/rtc/rtc.h
+@@ -422,6 +422,10 @@
+ 
+ // Chain RembHandler on track
+ RTC_C_EXPORT int rtcChainRembHandler(int tr, rtcRembHandlerCallbackFunc cb);
++
++// QUALL: chain PacingHandler on track — sends at most bitsPerSecond, in bursts of one
++// sendIntervalMs worth. Must be the last handler in the chain (see QUALL-PATCH.md).
++RTC_C_EXPORT int rtcChainPacingHandler(int tr, double bitsPerSecond, int sendIntervalMs);
+ 
+ // Transform seconds to timestamp using track's clock rate, result is written to timestamp
+ RTC_C_EXPORT int rtcTransformSecondsToTimestamp(int id, double seconds, uint32_t *timestamp);

@@ -1,0 +1,111 @@
+language = "C"
+
+# O cabeçalho **precisa** carregar as convenções, e isso não é enfeite.
+#
+# O cbindgen não emite documentação de módulo (`//!`), só a dos itens. Resultado: a seção
+# `# Convenções` do `lib.rs` nunca chegava aqui — e seis funções deste header dizem "no padrão
+# `(buf, cap)` do topo do módulo", apontando para um texto que quem lê o header **não tem**.
+# Swift, Kotlin e o C++ do OBS leem este arquivo e mais nada. Duas decisões erradas de casca já
+# foram construídas sobre afirmações deste header; deixar o contrato fora dele é a mesma classe
+# de problema.
+header = """
+// Gerado por cbindgen a partir de crates/quall-ffi. Não editar à mão.
+//
+// =============================================================================================
+// Convenções desta fronteira
+// =============================================================================================
+//
+// - Toda string é UTF-8 terminada em NUL.
+//
+// - **Padrão `(buf, cap) -> intptr_t`.** A função devolve quantos bytes são necessários
+//   *incluindo o NUL*, e só escreve se couber. Chame com `buf` nulo para perguntar o tamanho,
+//   aloque, e chame de novo. Negativo é erro; o motivo sai em `quall_last_error()`.
+//
+// - Função que devolve ponteiro devolve **nulo** em erro; o motivo sai em `quall_last_error()`
+//   como texto e em `quall_last_status()` como **código**.
+//
+// - `quall_last_error()` e `quall_last_status()` são **por thread** e valem até a próxima falha
+//   na mesma thread. Leia-os logo depois da chamada que falhou, antes de qualquer outra função
+//   `quall_`, e só quando ela de fato sinalizou falha (nulo, ou negativo) — uma chamada
+//   bem-sucedida **não** limpa nenhum dos dois. Copie a mensagem se precisar guardar.
+//
+// - **Decida pelo código, não pelo texto.** A mensagem está em português e é para a pessoa;
+//   comparar prefixo dela é exatamente o defeito que fez `QUALL_STATUS_NO_ROUTE` existir.
+//   `QUALL_STATUS_NEEDS_PIN` depois de um `quall_connect` nulo não é recusa: é convite a
+//   mostrar a tela de PIN de novo.
+//
+// - Todo ponteiro devolvido por `..._new`, `..._start`, `quall_host`, `quall_connect`,
+//   `quall_session_track` e `quall_session_next_track` é do chamador e tem função de liberar.
+//   Liberar duas vezes é erro do chamador, como em qualquer API C.
+//
+// - `quall_host`, `quall_connect` e `quall_browser_collect` **bloqueiam**. Chame de uma thread
+//   de trabalho, nunca da thread de interface. Para interromper a espera de `quall_host` e
+//   `quall_connect`, use `quall_canceller_new()` + `quall_host_cancelable()` e chame
+//   `quall_session_cancel()` do botão Cancelar.
+//
+// - **Callbacks rodam em threads da libdatachannel**, não na sua. Não bloqueie dentro deles. No
+//   Android essas threads **não estão anexadas à JVM**: prefira `quall_track_take_idr_request()`
+//   ao callback.
+//
+// - **Para desregistrar um callback, chame a mesma função com `cb = NULL`.**
+//   `quall_track_on_frame(t, NULL, NULL)` e `quall_track_on_idr_request(t, NULL, NULL)`
+//   desligam o tratador. Com `QUALL_STATUS_OK`, o tratador antigo **não está rodando em thread
+//   nenhuma** e não voltará a rodar: o `user_data` pode ser liberado, mesmo com a sessão de pé.
+//   `quall_track_free()` **não** desregistra — dois handles podem apontar para a mesma track.
+//
+// - **`quall_session_close()` é barreira, e é ela que autoriza liberar o `user_data`.** Com
+//   `QUALL_STATUS_OK`, ao voltar: nenhum callback desta sessão está rodando, e nenhum voltará a
+//   rodar. Libere o `user_data` na linha seguinte, à vontade.
+//
+//   Status diferente de `QUALL_STATUS_OK` quer dizer **não libere nada** — a sessão foi fechada
+//   e liberada de qualquer jeito, o que falhou foi a promessa sobre os callbacks:
+//   `QUALL_STATUS_TIMEOUT` é um callback seu que não voltou em 2 s (callback não pode
+//   bloquear); `QUALL_STATUS_INVALID` é você ter chamado **de dentro de um callback**, caso em
+//   que esperar seria travar o processo — feche de outra thread.
+//
+// - **Não feche a sessão de dentro de um callback.** Além de não render barreira, destruir a
+//   conexão de dentro de uma thread da libdatachannel é pedir para ela se enroscar. Levante uma
+//   bandeira e feche do seu próprio laço.
+//
+// - Um objeto (`QuallSession`, `QuallBrowser`, `QuallTrack`) pode ser usado de mais de uma
+//   thread, mas as funções que **avançam** estado — `quall_session_next_track`,
+//   `quall_session_next_event`, `quall_browser_collect`, `quall_messages_next`,
+//   `quall_teleprompter_pump` — devem ser chamadas de uma thread só.
+//
+// - **Mensagens entre aparelhos** (`quall_session_messages`, `docs/contrato-teleprompter.md`): o
+//   handle `QuallMessages` sobrevive a `quall_session_close`, como o de track, e depois dele
+//   devolve `QUALL_STATUS_CLOSED` sem tocar na biblioteca. `quall_messages_send` pode ser chamado
+//   de **qualquer** thread e não bloqueia. `quall_messages_next` só tira a mensagem da fila
+//   quando ela coube em `buf`: devolvido maior que `cap` quer dizer "não consumida, aloque e
+//   chame de novo"; `0` quer dizer "nada chegou". Numa sessão, **um leitor só**: num
+//   teleprompter quem lê é `quall_teleprompter_pump`.
+//
+// - **O teleprompter** (`QuallTeleprompter`): uma réplica por aparelho, que vive mais que a sessão.
+//   As edições (`quall_teleprompter_set_*`, `_jump`, `_jump_by`) podem vir de qualquer thread e
+//   saem na hora; a bombeada roda em laço na thread da sessão, junto com
+//   `quall_session_next_event(s, 0)`. Os bits de `changed` são os de `QuallTeleprompterChange`.
+"""
+include_guard = "QUALL_H"
+pragma_once = false
+tab_width = 4
+documentation_style = "doxy"
+cpp_compat = true
+
+[export]
+# Os bits de `changed` do teleprompter vão num `uint32_t` (vários de uma vez), então nenhuma
+# assinatura usa a enum — e sem isto o cbindgen não a emitiria, e a casca teria de copiar os
+# números à mão.
+include = ["QuallTeleprompterChange", "QuallCameraHostChange", "QuallCameraRemoteChange"]
+# **Sem `prefix`.** Os tipos já nascem `QuallStatus`, `QuallTrack`, `QuallFrame` no Rust, e o
+# prefixo automático os transformava em `QuallQuallStatus` — nome que ninguém quer digitar e que
+# some do `grep` cruzado entre o Rust e o Swift.
+
+[enum]
+# Em C não há namespace de enum: sem isto, `QuallStatus::Ok` vira o identificador **global**
+# `Ok`, e `Timeout`, `Protocol`, `Closed`, `Io`, `Screen` e `Camera` idem. Um header assim
+# colide com qualquer coisa no processo hospedeiro — e o hospedeiro aqui é o OBS, o Zoom ou uma
+# extension do iOS, não um programa de teste nosso.
+#
+# `QualifiedScreamingSnakeCase` produz `QUALL_STATUS_OK` e `QUALL_TRACK_KIND_SCREEN`, que é a
+# convenção que o resto do mundo C usa.
+rename_variants = "QualifiedScreamingSnakeCase"

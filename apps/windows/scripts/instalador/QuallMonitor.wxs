@@ -1,0 +1,109 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util"
+     xmlns:fire="http://wixtoolset.org/schemas/v4/wxs/firewall"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package Name="Quall Monitor" Manufacturer="Veneri &amp; Quellis Ltda."
+           Version="$(var.Versao)" Language="1033" Codepage="1252" Scope="perMachine"
+           Compressed="yes" InstallerVersion="500"
+           UpgradeCode="CF7A1B50-649C-45A5-A330-5B11B72F1AD9">
+    <MajorUpgrade Schedule="afterInstallInitialize" DowngradeErrorMessage="Uma versão mais nova do Quall Monitor já está instalada." />
+    <MediaTemplate EmbedCab="yes" />
+    <Launch Condition="Installed OR (VersionNT64 AND WINDOWSBUILDNUMBER &gt;= 22000)"
+            Message="Quall Monitor requer Windows 11 x64, build 22000 ou mais recente." />
+    <Property Id="WINDOWSBUILDNUMBER" Secure="yes">
+      <RegistrySearch Id="NativeWindowsBuild" Root="HKLM" Key="SOFTWARE\Microsoft\Windows NT\CurrentVersion" Name="CurrentBuildNumber" Type="raw" Bitness="always64" />
+    </Property>
+    <Property Id="ARPPRODUCTICON" Value="QuallMonitorIcon.exe" />
+    <Property Id="ARPURLINFOABOUT" Value="https://queven.com.br/quall-monitor/" />
+    <Property Id="ARPNOREPAIR" Value="1" />
+    <Property Id="SUDOVDA_CONSENT" Secure="yes" />
+    <!-- State is read before any effects. Rollback preserves any previous ownership. -->
+    <Property Id="DRIVER_OWNED_BEFORE" Secure="yes">
+      <RegistrySearch Id="MonitorDriverOwnership" Root="HKLM" Key="SOFTWARE\Quall Monitor\TelaEstendida"
+                      Name="Estado" Type="raw" Bitness="always64" />
+    </Property>
+    <SetProperty Id="ARPINSTALLLOCATION" Value="[INSTALLFOLDER]" After="CostFinalize" />
+    <util:CloseApplication Id="CloseQuallMonitor" Target="quall-monitor.exe" CloseMessage="yes"
+                          RebootPrompt="no" Description="Feche o Quall Monitor para continuar." />
+    <ui:WixUI Id="WixUI_Minimal" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.Bin)\license.rtf" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALTEXT"
+              Value="O driver SudoVDA acompanha o Quall Monitor. Se o Windows pedir, reinicie antes de usar. Detalhes em driver-setup.log na pasta do aplicativo." />
+    <UI>
+      <Dialog Id="MonitorDriverConsent" Width="370" Height="270" Title="Quall Monitor — driver SudoVDA">
+        <Control Id="Title" Type="Text" X="18" Y="18" Width="334" Height="22"
+                 Text="Driver de monitor virtual incluído" />
+        <Control Id="Explanation" Type="Text" X="18" Y="48" Width="334" Height="105"
+                 Text="Para criar monitores, o setup instala SudoVDA 1.10.9.289. Se o driver já existir, ele será preservado. O pacote incluído usa o certificado autoemitido CN=sudovda@su.mk. Ao marcar a confirmação abaixo, você autoriza adicionar esse certificado às lojas Root e TrustedPublisher da máquina. Isso concede confiança ao certificado. O setup remove somente o driver e a confiança que o Quall Monitor tiver instalado quando você desinstalar o aplicativo." />
+        <Control Id="Consent" Type="CheckBox" X="18" Y="164" Width="334" Height="32"
+                 Property="SUDOVDA_CONSENT" CheckBoxValue="1"
+                 Text="Aceito confiar no certificado para instalar o driver incluído." />
+        <Control Id="Note" Type="Text" X="18" Y="202" Width="334" Height="26"
+                 Text="Sem confirmação, a instalação só continua com driver ou confiança já existentes. Instalação silenciosa nunca adiciona confiança." />
+        <Control Id="Continue" Type="PushButton" X="245" Y="242" Width="105" Height="17" Default="yes" Text="Continuar">
+          <Publish Event="EndDialog" Value="Return" />
+        </Control>
+        <Control Id="Cancel" Type="PushButton" X="155" Y="242" Width="80" Height="17" Cancel="yes" Text="Cancelar">
+          <Publish Event="EndDialog" Value="Exit" />
+        </Control>
+      </Dialog>
+      <InstallUISequence>
+        <Show Dialog="MonitorDriverConsent" Before="ExecuteAction" Condition="NOT Installed AND UILevel = 5" />
+      </InstallUISequence>
+    </UI>
+    <!-- Driver setup executes as SYSTEM only after the protected program files exist. -->
+    <CustomAction Id="RollbackMonitorDriver" Directory="INSTALLFOLDER"
+                  ExeCommand="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[#DriverSetupScript]&quot; -Acao desinstalar"
+                  Execute="rollback" Impersonate="no" Return="ignore" />
+    <CustomAction Id="InstallMonitorDriver" Directory="INSTALLFOLDER"
+                  ExeCommand="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[#DriverSetupScript]&quot; -Acao instalar -Consentimento &quot;[SUDOVDA_CONSENT]&quot; -NivelUi [UILevel]"
+                  Execute="deferred" Impersonate="no" Return="check" />
+    <CustomAction Id="UninstallMonitorDriver" Directory="INSTALLFOLDER"
+                  ExeCommand="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[#DriverSetupScript]&quot; -Acao desinstalar"
+                  Execute="deferred" Impersonate="no" Return="check" />
+    <InstallExecuteSequence>
+      <Custom Action="RollbackMonitorDriver" Before="InstallMonitorDriver" Condition="NOT Installed AND NOT DRIVER_OWNED_BEFORE AND NOT REMOVE" />
+      <Custom Action="InstallMonitorDriver" After="InstallFiles" Condition="NOT REMOVE" />
+      <Custom Action="UninstallMonitorDriver" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallExecuteSequence>
+    <Icon Id="QuallMonitorIcon.exe" SourceFile="$(var.Bin)\quall-monitor.exe" />
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Quall Monitor" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="MONITOR_MENU" Name="Quall Monitor" />
+    </StandardDirectory>
+    <Feature Id="Monitor" Title="Quall Monitor" Level="1">
+      <ComponentRef Id="MonitorApp" />
+      <ComponentRef Id="MonitorSetupScript" />
+      <ComponentRef Id="MonitorShortcut" />
+      <ComponentGroupRef Id="Notices" />
+    </Feature>
+    <Component Id="MonitorApp" Directory="INSTALLFOLDER" Guid="6FA2F343-BD0C-4811-948A-48B007CE6E3E" Bitness="always64">
+      <File Id="QuallMonitorExe" Source="$(var.Bin)\quall-monitor.exe" KeyPath="yes" />
+      <fire:FirewallException Id="MonitorLanTcp" Name="Quall Monitor — LAN TCP" Program="[#QuallMonitorExe]"
+                             Protocol="tcp" Scope="localSubnet" Profile="private" />
+      <fire:FirewallException Id="MonitorLanUdp" Name="Quall Monitor — LAN UDP" Program="[#QuallMonitorExe]"
+                             Protocol="udp" Scope="localSubnet" Profile="private" />
+    </Component>
+    <Component Id="MonitorSetupScript" Directory="INSTALLFOLDER" Guid="6F22ADDA-9C31-45ED-AEAF-A86BB93F76C7" Bitness="always64">
+      <File Id="DriverSetupScript" Source="$(var.Bin)\driver-setup.ps1" KeyPath="yes" />
+      <RemoveFile Id="DriverSetupLog" Name="driver-setup.log" On="uninstall" />
+    </Component>
+    <Component Id="MonitorShortcut" Directory="MONITOR_MENU" Guid="565250CB-080B-470C-A247-C6ED7806DDA1" Bitness="always64">
+      <Shortcut Id="MonitorStart" Name="Quall Monitor" Target="[#QuallMonitorExe]" WorkingDirectory="INSTALLFOLDER" />
+      <RemoveFolder Id="MonitorMenuRemove" On="uninstall" />
+      <RegistryValue Root="HKLM" Key="SOFTWARE\Quall Monitor" Name="Installed" Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+    <ComponentGroup Id="Notices" Directory="INSTALLFOLDER">
+      <Component Id="MplLicense" Guid="10D4620F-C71F-4F4C-B11A-C28F80A91F37"><File Source="$(var.Bin)\LICENSE" KeyPath="yes" /></Component>
+      <Component Id="LicenseScope" Guid="0B7840F4-75EB-4DFD-8A62-CC08276504DE"><File Source="$(var.Bin)\LICENSE-SCOPE.md" KeyPath="yes" /></Component>
+      <Component Id="OwnNotice" Guid="11070EC5-6860-4C94-8ADB-9E43C72F44F7"><File Source="$(var.Bin)\NOTICE.txt" KeyPath="yes" /></Component>
+      <Component Id="ThirdPartyNotice" Guid="836D2406-95E7-49C4-9766-5EC2F5CBEF43"><File Source="$(var.Bin)\THIRD_PARTY_NOTICES.txt" KeyPath="yes" /></Component>
+      <Component Id="SourceRevision" Guid="7E27DA46-EB99-4E15-960D-4276960356A2"><File Source="$(var.Bin)\SOURCE-REVISION.txt" KeyPath="yes" /></Component>
+      <Component Id="WixNotice" Guid="6AE716C8-520B-4B76-BE37-36E9C2DB4275"><File Source="$(var.Bin)\WiX-NOTICES.txt" KeyPath="yes" /></Component>
+      <Component Id="SudoNotice" Guid="D900D0D4-2628-4F93-8CFC-09F527252CA7"><File Source="$(var.Bin)\SudoVDA-NOTICES.txt" KeyPath="yes" /></Component>
+    </ComponentGroup>
+  </Package>
+</Wix>

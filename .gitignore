@@ -1,0 +1,14 @@
+/target/
+**/target/
+**/.build/
+/dist/
+.DS_Store
+*.p12
+*.pfx
+*.mobileprovision
+*.jks
+*.keystore
+.env*
+Signing.local.*
+__pycache__/
+*.pyc

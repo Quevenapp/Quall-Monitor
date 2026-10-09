@@ -1,0 +1,48 @@
+[package]
+name = "quall-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# `webrtc` é o único pedaço do núcleo que não é Rust puro: ele arrasta libdatachannel (C++,
+# build por cmake) e um OpenSSL compilado do fonte. Fica atrás de uma feature para que quem
+# só precisa de protocolo, descoberta, sinalização e pareamento — a casca Android que ainda
+# está subindo, um teste de CI de cross-compile — não pague por um toolchain C++.
+#
+# Ligada por padrão: o caminho normal do produto inclui transporte.
+default = ["webrtc"]
+webrtc = ["dep:datachannel", "dep:quall-rtc"]
+
+[dependencies]
+# **Só para prender o socket de sinalização a uma interface.** `std::net::TcpStream` sabe conectar
+# com prazo e sabe escutar num endereço, e **não** sabe fazer as duas coisas: não há
+# `bind`-e-depois-`connect`. `socket2` é a casca fina sobre o socket do sistema que tem isso, e já
+# estava no `Cargo.lock` como dependência transitiva — usar direto não muda o grafo.
+socket2 = "0.6"
+serde = { workspace = true }
+# **`float_roundtrip`: o número que sai no JSON volta idêntico.** Sem ela o `serde_json` lê decimal
+# "com o melhor esforço", e `0.1 + 3.7` (= 3.8000000000000003) voltava como 3.8. No teleprompter
+# isso não é cosmético: duas réplicas com o mesmo carimbo e valores que diferem no último bit
+# **divergem para sempre** — medido na simulação `converge_com_perda_duplicata_e_desordem`, em
+# 13/09/2026. Mesma versão do lock, sem crate novo; custa ~2x na leitura de ponto flutuante, que
+# aqui é rara.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+
+datachannel = { workspace = true, optional = true }
+
+# O único crate do Quall com `unsafe`, e a razão de este aqui manter
+# `#![forbid(unsafe_code)]` mesmo tendo entrado no assunto de tracks RTP. Ver
+# `crates/quall-rtc/src/lib.rs` para os quatro buracos do crate `datachannel` que o obrigaram
+# a existir.
+quall-rtc = { workspace = true, optional = true }
+getrandom = { workspace = true }
+hkdf = { workspace = true }
+hmac = { workspace = true }
+mdns-sd = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+tungstenite = { workspace = true }
+x25519-dalek = { workspace = true }

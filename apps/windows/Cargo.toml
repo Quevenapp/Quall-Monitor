@@ -1,0 +1,214 @@
+[workspace]
+# Workspace independente do workspace raiz. Este binário só compila no Windows (Dell G3 da
+# bancada) e nunca no host de desenvolvimento (macOS), então não faz sentido listá-lo em
+# `Cargo.toml` da raiz — evita também mexer nesse arquivo enquanto a Frente 1 trabalha nele.
+
+[package]
+name = "quall-monitor-windows"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MPL-2.0"
+publish = false
+autobins = false
+description = "Quall Monitor: tela estendida e recepção de tela para Windows, distribuído pelo site oficial."
+
+# Os módulos de captura/encode (M1, Frente 2) e de decode/exibição (M2, Frente 6) vivem no mesmo
+# pacote e compartilham `device.rs` (escolha de adaptador DXGI) via este alvo de biblioteca — dois
+# pacotes Cargo separados duplicariam a lógica de adaptador, que já é sutil o bastante (ver
+# `device.rs`) para não valer a pena manter em dois lugares.
+[lib]
+name = "quall_capture_probe"
+path = "src/lib.rs"
+
+[[bin]]
+name = "quall-monitor"
+path = "src/bin/quall_app.rs"
+required-features = ["net", "tela-estendida-futura"]
+
+[features]
+# Duas features, porque há dois pesos diferentes de "precisar de `quall-core`":
+#
+# - `EncodePreset` (`quall_core::protocol`), que `quall-capture-probe` usa: não depende de rede
+#   nenhuma, só de `serde`.
+# - `session::conectar`/`transport::Session` (o que `connect.rs` usa): esses módulos ficam atrás
+#   de `feature = "webrtc"` **dentro do próprio `quall-core`** (ver `crates/quall-core/Cargo.toml`
+#   — ligada por padrão lá), e é isso que arrasta `datachannel` (libdatachannel em C++ + OpenSSL
+#   compilado do fonte) — um build a frio disso leva minutos.
+#
+# Por isso `quall-core` entra aqui com `default-features = false`: `core` (default) dá acesso a
+# `protocol`/`discovery`/`pairing`/`signaling` sem tocar C++ nenhum; `net` acrescenta
+# `quall-core/webrtc` por cima, só para quem precisa mesmo de `connect.rs`. O caminho principal
+# desta entrega (decode H.264 em hardware + janela, a partir de um `.h264` de bancada) não
+# depende de nenhuma das duas — não usa `quall-core` de jeito nenhum:
+#
+#     cargo build --bin quall-receiver-probe --no-default-features
+#
+# — zero OpenSSL, compila em segundos (medido: ~45s a frio nesta bancada, contra minutos com
+# `webrtc`). `quall-receiver-probe connect` exige `--features net`.
+#
+# `net` também arrasta o `quall-opus` (libopus vendorizada, compilada por `cc`). Ele entra aqui e
+# não em `core` porque só o app de produto codifica áudio: as duas sondas de bancada não têm track
+# nenhuma. `docs/audio.md` §11 mede o custo em ~375 KiB de binário para encoder+decoder — barato ao
+# lado dos 10 MiB de OpenSSL+libdatachannel que o `net` já paga, mas não é motivo para cobrá-lo de
+# quem só decodifica um `.h264` de arquivo.
+default = ["net", "tela-estendida-futura"]
+core = ["dep:quall-core"]
+net = ["core", "quall-core/webrtc", "dep:quall-opus"]
+# **A build de distribuição Microsoft Store**: não admite a feature futura de tela estendida.
+# O release sem a feature futura já exclui os módulos e payloads de driver; `loja` endurece
+# o contrato para a embalagem, inclusive quando alguém acrescentar features manualmente.
+loja = []
+# Código preservado para desenvolvimento futuro; ausente de todos os artefatos deste release.
+tela-estendida-futura = ["windows/Win32_Security_Cryptography", "windows/Win32_Security_WinTrust", "windows/Win32_Storage_Packaging_Appx"]
+
+[dependencies]
+quall-core = { path = "../../crates/quall-core", optional = true, default-features = false }
+# A libopus de verdade, vendorizada. **Este pacote é a primeira coisa do projeto a compilar o
+# `quall-opus` no MSVC** — `docs/audio.md` diz que o `build.rs` já trata o compilador da Microsoft
+# (`USE_ALLOCA` em vez de `VAR_ARRAYS`), mas que isso era o que o fonte dizia, não o que a máquina
+# tinha mostrado.
+quall-opus = { path = "../../crates/quall-opus", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+crossbeam-channel = "0.5"
+# Só usado pela sonda de recepção (`quall-receiver-probe`), para não ter que definir um tipo de
+# erro próprio numa sonda de bancada — os erros aqui só precisam chegar legíveis no stderr.
+anyhow = "1"
+
+# A fonte de mídia da câmera virtual, como **biblioteca**: dela vêm a geometria do cano
+# (`LARGURA`/`ALTURA`/`BYTES_NV12`), o `CANO_SEM_NOME` e o `cano_do_nome`. É o que impede o
+# contrato do cano de existir em dois lugares — ver `src/cano.rs`.
+quall-camera-fonte = { path = "../../integrations/camera-windows/fonte" }
+
+[target.'cfg(windows)'.dependencies]
+# `Matrix3x2` e `Vector2`, os tipos que o Direct2D recebe (a transformação do espelho e a origem de
+# cada linha do teleprompter). O crate `windows` depende deste mas não o reexporta; a versão é a do
+# `Cargo.lock`, então nada novo é baixado.
+windows-numerics = "0.3"
+# O `#[implement]` do retorno assíncrono do leitor da câmera (`src/captura_de_camera.rs`) expande
+# para `::windows_core`, que precisa ser dependência direta. A versão é a do `Cargo.lock` (o crate
+# `windows` já o arrasta), então nada novo é baixado. A mesma nota de `integrations/camera-windows`:
+# `implement` não é feature do crate `windows` 0.62.
+windows-core = "0.62"
+windows = { version = "0.62", features = [
+    "Foundation",
+    "Foundation_Collections",
+    # `CM_Get_Device_Interface_ListW` e o `Present` do nó PnP: abrir o adaptador do monitor
+    # virtual pela interface de dispositivo, e testemunhar que o monitor saiu. Ver
+    # `src/bin/receita_monitor.rs` e `docs/monitor-virtual-windows.md` §7.
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Properties",
+    "Graphics",
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Win32_Foundation",
+    # **O teleprompter** (`src/teleprompter/`): o texto rolando em fração de pixel pelo Direct2D, a
+    # quebra em linhas de altura uniforme pelo DirectWrite, o compasso e a contagem de retraços pelo
+    # DWM (`DwmFlush`, `DwmGetCompositionTimingInfo`), a tela acesa (`SetThreadExecutionState`), o
+    # quadro de trás e a captura da própria janela na bancada (um DIB, `Memory`), a área de
+    # transferência do editor e a hora local dos roteiros guardados (`Time`). Ver o cabeçalho de
+    # `src/teleprompter/texto.rs`.
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dwm",
+    # `GetUserDefaultUILanguage`: o idioma inicial do app (a tradução EN/PT, 02/10).
+    "Win32_Globalization",
+    # Endereço manual da LAN: interfaces físicas ativas e IPv6 ULA/global, sem VPN/CLAT.
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Power",
+    "Win32_System_Time",
+    # Nome do monitor como a pessoa o conhece ("DELL U2415"), lido do EDID pelo DisplayConfig —
+    # é a única API do Windows que devolve o mesmo nome que Configurações > Sistema > Vídeo mostra.
+    # Ver `src/fontes.rs`.
+    "Win32_Devices_Display",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    # WASAPI: `IMMDeviceEnumerator`, `IAudioClient` (com `AUDCLNT_STREAMFLAGS_LOOPBACK`),
+    # `IAudioCaptureClient` e `IAudioRenderClient`. Ver `src/audio.rs`.
+    "Win32_Media_Audio",
+    # **Os controles de câmera do R9** (`src/ajustes_da_camera.rs`, `docs/controles-de-camera.md`
+    # §6): `IAMCameraControl` e `IAMVideoProcAmp` (DirectShow) e o `IKsControl` da anti-cintilação
+    # (KernelStreaming), por `cast` na `IMFMediaSource`. Features do mesmo crate: nada é baixado.
+    "Win32_Media_DirectShow",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_MediaFoundation",
+    # O cano nomeado da câmera virtual (`src/cano.rs`): criar o cano com DACL própria, esperar
+    # cliente e escrever o quadro. Ver o cabeçalho daquele módulo para por que cano e não memória
+    # compartilhada.
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    # **O driver da tela estendida que o Quall instala** (`src/driver_da_tela_estendida.rs`, 02/10,
+    # noite): o certificado do SudoVDA nas lojas da máquina (`CertOpenStore`,
+    # `CertAddEncodedCertificateToStore`), a assinatura do catálogo (`WinVerifyTrust`) e a
+    # identidade de pacote que diz "veio da loja" (`GetCurrentPackageFullName`). Features do mesmo
+    # crate: nada é baixado.
+    "Win32_Storage_FileSystem",
+    # `WriteFile` e `ConnectNamedPipe` recebem um `*mut OVERLAPPED`, que mora aqui: sem esta
+    # feature as duas somem, e o erro que sai é "unresolved import" do módulo de cano — que parece
+    # feature de cano faltando e é a de I/O.
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Ole",
+    "Win32_System_Performance",
+    # O dono de uma câmera virtual (`CustomCaptureSourceClsid`), lido do `Device Parameters` da
+    # interface por `CM_Open_Device_Interface_KeyW` — que devolve um `HKEY`. Só leitura. Ver
+    # `src/cameras.rs` e `docs/camera-no-windows.md` §2.3.
+    "Win32_System_Registry",
+    # `GetProcessMemoryInfo`: o custo de memória de manter um encoder de reserva vivo é um dos
+    # riscos que a frente da troca a quente precisa medir em vez de supor. Ver `quall_gemeos.rs`.
+    "Win32_System_ProcessStatus",
+    # A lista de processos do sistema (Toolhelp32): a imagem da sonda da câmera de bancada quando
+    # ela não se deixa abrir do token limitado da sessão do usuário (`src/cameras.rs`, o R5, M55).
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    # A janela principal do "Estúdio de bolso" (`src/janela.rs`): o `NM_CUSTOMDRAW` dos botões, o
+    # `DRAWITEMSTRUCT` da lista e do letreiro, a dica dos campos (`EM_SETCUEBANNER`) e a barra de
+    # rolagem escura da lista (`SetWindowTheme`). Feature do mesmo crate: nada novo é baixado.
+    "Win32_UI_Controls",
+    # O nome dos campos e da lista para o Narrador (`IAccPropServices::SetHwndPropStr`), na mesma
+    # janela. Feature do mesmo crate.
+    "Win32_UI_Accessibility",
+    "Win32_UI_HiDpi",
+    # A pasta Vídeos do gravador local do R5 (`SHGetKnownFolderPath(FOLDERID_Videos)`,
+    # `src/gravador_local.rs`): a pasta de vídeos pode estar redirecionada, e só o shell sabe onde.
+    # E o ícone da bandeja (`Shell_NotifyIconW`, `src/bandeja.rs`, 01/10).
+    "Win32_UI_Shell",
+    # O `COMDLG_FILTERSPEC` do diálogo "Abrir arquivo .txt…" do editor do roteiro (02/10).
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+# **A mesma cópia do `datachannel-sys` que a raiz usa** (`Cargo.toml` da raiz, `[patch.crates-io]`).
+#
+# Este é um workspace próprio, e o cargo só aplica o `[patch]` do manifesto raiz do workspace que
+# está compilando: o da raiz do repositório não vale aqui. Sem estas linhas o `quall-core` deste
+# grafo puxava o `datachannel-sys` publicado, que não tem `rtcChainPacingHandler`, e o
+# `quall-rtc` (`crates/quall-rtc/src/lib.rs`, o espaçador) deixava de compilar — o portão do
+# Windows de 13/09/2026, o primeiro depois da cópia em `vendor/` (`ebc94f2`), saiu vermelho
+# exatamente assim. O caminho é relativo a este manifesto.
+[patch.crates-io]
+datachannel-sys = { path = "../../vendor/datachannel-sys" }

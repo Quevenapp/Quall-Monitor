@@ -1,0 +1,13 @@
+// Empresta o header da fronteira C do núcleo (`crates/quall-ffi/include/quall.h`) para o Swift,
+// sem copiá-lo — mesma razão que `apps/ios/Quall/Comum/Ponte.h` documenta: o header é gerado pelo
+// cbindgen a cada build do Rust, e uma cópia envelheceria em silêncio numa fronteira onde
+// divergência de assinatura vira corrupção de memória em vez de erro de compilação.
+//
+// SwiftPM não tem "bridging header" (isso é conceito de projeto Xcode); o equivalente é um alvo
+// `systemLibrary` com módulo apontando para o header de verdade. `link "quall"` deixa o linker a
+// cargo de quem consome este módulo (Package.swift do executável passa o caminho completo do
+// `.a`, como o `project.yml` do iOS já faz) — aqui só declaramos a API, não o binário.
+module CQuall {
+    header "../../../../crates/quall-ffi/include/quall.h"
+    export *
+}

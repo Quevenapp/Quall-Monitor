@@ -1,0 +1,4 @@
+# Os arquivos do SudoVDA vão byte a byte: o app confere o SHA-256 de cada um (o .inf é UTF-16LE com CRLF).
+* -text -diff
+LEIAME.md text
+.gitattributes text

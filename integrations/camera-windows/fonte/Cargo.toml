@@ -1,0 +1,45 @@
+[workspace]
+
+[package]
+name = "quall-camera-fonte"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MPL-2.0"
+publish = false
+description = "Fonte de mídia (Frame Server Custom Media Source) da câmera virtual do Quall no Windows."
+
+[lib]
+name = "quall_camera_fonte"
+# `cdylib`: é um servidor COM in-proc carregado pelo Frame Server (`svchost -k Camera`, conta
+# `NT AUTHORITY\LocalService`), pelo processo que cria a câmera e pelo app que a consome.
+# `cdylib` **e** `rlib`. O `cdylib` é o servidor COM; o `rlib` existe desde 09/09/2026 para que o
+# nome do cano, a geometria e o cabeçalho tenham **uma casa só**. Antes disso `sonda/src/cano.rs`
+# repetia as constantes à mão, que é a família de defeito mais frequente desta casa — seis
+# ocorrências em três dias, e o commit `1fe7416` chama-se literalmente "quatro números que eram um
+# só estavam escritos em dois lugares". Um `pub use` custa menos que um roteiro de conferência.
+crate-type = ["rlib"]
+path = "src/lib.rs"
+
+[target.'cfg(windows)'.dependencies]
+windows-core = "0.62"
+# Nota: `implement` **não** é feature do crate `windows` 0.62 — o `#[implement]` vem do
+# `windows-implement`, que o `windows-core` já arrasta sem feature nenhuma. Pedi-la aqui só
+# produz "does not have that feature" com uma lista de mil linhas.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_MediaFoundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Ole",
+    "Win32_System_Pipes",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+] }

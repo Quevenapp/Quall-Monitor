@@ -1,0 +1,22 @@
+Quall Monitor — aviso de licenciamento próprio
+
+Responsável pela distribuição: Veneri & Quellis Ltda.
+
+O código próprio autorizado é licenciado sob Mozilla Public License 2.0
+(MPL-2.0), conforme LICENSE e LICENSE-SCOPE.md. Os direitos e avisos de
+cada titular permanecem preservados; este aviso não declara cessão
+empresarial de todo o checkout.
+
+Derivado do código do Quall Studio, revisão
+93b45a82e0eecef42c6f5862210a98ec3778bb92.
+
+Fontes correspondentes e modificações:
+https://github.com/Quevenapp/Quall-Monitor
+Cada pacote contém sua revisão exata em SOURCE-REVISION.txt. Essa revisão
+pode ser consultada ou baixada no repositório público acima.
+
+Componentes terceiros conservam suas licenças e atribuições. Consulte
+THIRD_PARTY_NOTICES.txt, LICENSE-SCOPE.md e SudoVDA-NOTICES.txt no pacote
+Windows. Não são concedidos direitos sobre marcas ou conteúdo de usuários.
+
+Downloads do produto: site oficial Quéven, https://queven.com.br/

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  Manifesto do app Windows do Quall.
+
+  Ele existe por um motivo só: ligar os Common Controls 6. Sem esta dependência declarada, o
+  Windows 11 desenha o botão e a lista suspensa com a aparência clássica do Windows 95 — o app
+  funciona igual e parece abandonado.
+
+  A primeira tentativa foi embutir a mesma dependência por `#[link_section = ".drectve"]` em
+  `src/janela.rs`, sem arquivo e sem build.rs. **Medido e falso**: o exe compilou, ligou e rodou, e
+  uma varredura dos 10.476.544 bytes dele não achou nem "Microsoft.Windows.Common-Controls" nem
+  "assemblyIdentity". A diretiva não chegou ao linker. É mais um caso da distância entre o que se
+  supõe da plataforma e o que ela faz — a mesma família do `S_OK` que o driver ignora.
+
+  A identidade de pacote do produto está em `docs/identidade-windows.md` e **não** entra aqui:
+  este manifesto é de aparência de controle, não de identidade.
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+          type="win32"
+          name="Microsoft.Windows.Common-Controls"
+          version="6.0.0.0"
+          processorArchitecture="*"
+          publicKeyToken="6595b64144ccf1df"
+          language="*" />
+    </dependentAssembly>
+  </dependency>
+</assembly>

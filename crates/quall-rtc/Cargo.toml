@@ -1,0 +1,20 @@
+[package]
+name = "quall-rtc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+datachannel = { workspace = true }
+datachannel-sys = { workspace = true }
+# A fachada `log`, e ela não é enfeite: é o **único** ponto de controle do registro interno da
+# libdatachannel. O crate `datachannel` chama `rtcInitLogger` uma vez, dentro de
+# `RtcPeerConnection::new`, com o nível lido de `log::max_level()`. Sem instalar um registrador
+# aqui, o produto é cego para `Send failed, buffer is full` — a única testemunha que a libjuice
+# oferece de um datagrama descartado no socket. Ver `ativar_registro`.
+#
+# `log` já estava no grafo: o `datachannel` depende dela desde o M0 (a feature `log` é obrigatória,
+# ver o comentário no `Cargo.toml` da raiz). Isto não acrescenta dependência nova ao produto.
+log = { workspace = true }

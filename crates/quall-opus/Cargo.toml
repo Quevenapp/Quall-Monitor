@@ -1,0 +1,33 @@
+[package]
+name = "quall-opus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# A libopus vendorizada vive em `vendor/opus`, podada do upstream 1.5.2. Ver `build.rs` para o
+# que foi cortado e por quê, e `docs/audio.md` §10 para a decisão de vendorização.
+
+[dependencies]
+
+[build-dependencies]
+# `cc` já estava no `Cargo.lock` (puxado por `cmake` e `openssl-src`, que o `datachannel-sys`
+# arrasta), então esta dependência **não acrescenta um crate ao grafo**. Foi um dos argumentos
+# que escolheram `cc` em vez de um `-sys` de crates.io — ver `build.rs`.
+cc = "1"
+
+[features]
+default = []
+
+# Aritmética de ponto fixo no SILK (`--enable-fixed-point` do autoconf).
+#
+# **Não ligue isto em uma plataforma só.** O fluxo de Opus produzido por uma build de ponto fixo
+# não é byte a byte igual ao de uma build de ponto flutuante — os dois são válidos e
+# interoperáveis, mas diferentes. Misturar as duas na matriz quebra qualquer conferência de
+# conteúdo byte a byte entre dois aparelhos. Ver `docs/audio.md` §12.
+fixed-point = []
+
+# Remove as entradas de API que falam em `f32` (`--disable-float-api`). Só faz sentido junto de
+# `fixed-point`; sozinho não corta quase nada, porque o SILK de ponto flutuante continua lá.
+sem-api-de-float = []

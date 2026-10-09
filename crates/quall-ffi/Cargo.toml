@@ -1,0 +1,34 @@
+[package]
+name = "quall-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "quall"
+# staticlib: iOS (app + Broadcast Upload Extension) e macOS.
+# cdylib:    Android (`System.loadLibrary`), plugin de OBS e câmera virtual do Windows.
+# rlib:      testes do próprio workspace.
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+quall-core = { workspace = true }
+# A fronteira C devolve lista de aparelhos e contadores como JSON. Ver a justificativa em
+# `quall_browser_devices_json`: a alternativa seria uma função com cinco buffers de saída.
+serde_json = { workspace = true }
+
+# O encoder de Opus que a fronteira C exporta. Atrás de uma feature **ligada por padrão**,
+# seguindo o precedente do `quall-core` com `webrtc` e do `quall-probe` com `opus`: quem quiser
+# medir o custo de tamanho da libopus no `libquall.a` constrói com `--no-default-features` e
+# compara. Sem ela, `quall_audio_encoder_new` continua existindo no header e devolve nulo com o
+# motivo em `quall_last_error` — a fronteira não muda de forma conforme a feature.
+quall-opus = { workspace = true, optional = true }
+
+[features]
+default = ["opus"]
+opus = ["dep:quall-opus"]
+
+[build-dependencies]
+cbindgen = "0.29"

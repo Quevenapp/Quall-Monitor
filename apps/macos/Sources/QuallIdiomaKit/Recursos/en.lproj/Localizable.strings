@@ -1,0 +1,642 @@
+/* A tabela inglesa do Quall do Mac (`docs/traducao.md`, "macOS").
+   A chave é o texto em português do código: `T("Espelhar")` → "Mirror". O português não tem tabela.
+   Lacuna é sempre `%@` (`%1$@`, `%2$@` para trocar a ordem); um `%` de verdade numa frase com lacuna
+   é `%%`. As frases vêm na ordem dos fontes, agrupadas pelo primeiro arquivo que as usa. */
+
+/* QuallApp/Ajustes.swift */
+"Licenças de terceiros" = "Third-party licenses";
+"Política de privacidade" = "Privacy policy";
+"Suporte" = "Support";
+"Não foi possível abrir o site." = "Couldn't open the website.";
+"Não foi possível abrir as licenças." = "Couldn't open the licenses.";
+"O arquivo de avisos não foi encontrado no app." = "The notices file was not found in the app.";
+"O macOS não conseguiu abrir o arquivo de avisos." = "macOS couldn't open the notices file.";
+"Abrir gravações" = "Open recordings";
+"A câmera é gravada na pasta de gravações do app." = "Camera recordings are saved to the app's recordings folder.";
+"Não foi possível abrir as gravações." = "Couldn't open the recordings.";
+"Não consegui abrir a pasta %@: %@" = "Couldn't open the folder %@: %@";
+"O sistema escolhe o caminho a cada sessão." = "The system picks the route for each session.";
+"O vídeo sai só por esta rede. Se o outro aparelho não alcançar este Mac por ela, a sessão não sobe — escolha Automática." = "Video goes out only on this network. If the other device can't reach this Mac on it, the session won't start — choose Automatic.";
+"Automática" = "Automatic";
+"%@ — sem endereço agora" = "%@ — no address right now";
+"versão %@" = "version %@";
+"fora do pacote" = "outside the app bundle";
+"%@ · protocolo %@" = "%@ · protocol %@";
+"Espelhar" = "Mirror";
+"Sair pela rede" = "Send over network";
+"Pareamento" = "Pairing";
+"Aparelhos pareados" = "Paired devices";
+"Os aparelhos que já parearam com este Mac entram sem PIN." = "Devices that have already paired with this Mac join without a PIN.";
+"Nenhum aparelho pareado com este Mac." = "No device paired with this Mac.";
+"Esquecer" = "Forget";
+"Pare a sessão para esquecer os aparelhos pareados" = "Stop the session to forget paired devices";
+"Esquecer os aparelhos pareados?" = "Forget paired devices?";
+"Cancelar" = "Cancel";
+"Da próxima vez, cada aparelho vai pedir o PIN de novo." = "Next time, each device will ask for the PIN again.";
+
+/* QuallApp/AjustesDaCamera.swift */
+"Nenhuma câmera aberta. Abra uma câmera em Espelhar ou em Texto com a câmera." = "No camera open. Open a camera in Mirror or in Text with camera.";
+"Grupo" = "Group";
+"Efeitos de vídeo do sistema…" = "System video effects…";
+"O painel do macOS: Centro do palco, Retrato, Luz de estúdio. Vale para a câmera em todos os apps." = "The macOS panel: Center Stage, Portrait, Studio Light. Applies to the camera in every app.";
+"Exposição" = "Exposure";
+"Auto" = "Auto";
+"Manual" = "Manual";
+"Compensação (EV)" = "Compensation (EV)";
+"0 EV" = "0 EV";
+"Anti-cintilação" = "Anti-flicker";
+"Desligada" = "Off";
+"Travado" = "Locked";
+", indisponível" = ", unavailable";
+
+/* QuallApp/AplicativoQuall.swift */
+"Controle do teleprompter" = "Teleprompter remote";
+"Um papel por vez. Pare de espelhar para usar os outros." = "One role at a time. Stop mirroring to use the others.";
+"Aguardando" = "Waiting";
+"No ar" = "Live";
+"Encerrando" = "Ending";
+"Um papel por vez. Desconecte o controle para usar os outros." = "One role at a time. Disconnect the remote to use the others.";
+"Conectado" = "Connected";
+"Sem conexão" = "No connection";
+"Saindo" = "Leaving";
+"Conectando" = "Connecting";
+"Um papel por vez. Pare de exibir para usar os outros." = "One role at a time. Stop receiving to use the others.";
+"Parando" = "Stopping";
+"Controle o texto de outro aparelho enquanto esta janela mostra o vídeo de outro." = "Control the text on one device while this window shows video from another.";
+"Controlar um teleprompter…" = "Control a teleprompter…";
+"O teleprompter já está aberto na janela principal." = "The teleprompter is already open in the main window.";
+
+/* QuallApp/BarraDeMenus.swift */
+"Quall Studio, no ar: %@" = "Quall Studio, live: %@";
+"Abrir o Quall Studio" = "Open Quall Studio";
+"Sair do Quall Studio" = "Quit Quall Studio";
+"O Quall Studio continua rodando na barra de menus, no ícone do Q." = "Quall Studio keeps running in the menu bar, under the Q icon.";
+"Para voltar, clique nele ou abra o Quall Studio de novo." = "To come back, click it or open Quall Studio again.";
+
+/* QuallApp/BarraLateral.swift */
+"Exibir" = "Receive";
+"Mostrar o texto" = "Show the text";
+"Controlar" = "Remote";
+"Texto com a câmera" = "Text with camera";
+"Teleprompter" = "Teleprompter";
+"Este Mac aparece como" = "This Mac appears as";
+"Ajustes" = "Settings";
+
+/* QuallApp/Emissor.swift */
+"\"%@\" não está mais disponível. Escolha outra fonte." = "\"%@\" is no longer available. Choose another source.";
+"A rede escolhida (%@) está sem endereço agora. Escolha outra em \"Sair pela rede\", ou Automática." = "The chosen network (%@) has no address right now. Choose another in \"Send over network\", or Automatic.";
+"Não consegui reservar uma porta de rede neste Mac." = "Couldn't reserve a network port on this Mac.";
+"A câmera parou de esperar receptor depois de %@ falhas seguidas. Gravar continua funcionando; toque em Parar e espelhe de novo para esperar." = "The camera stopped waiting for a receiver after %@ failures in a row. Recording still works; tap Stop and mirror again to wait.";
+"Um aparelho tentou entrar com um pareamento que este Mac não reconhece mais. Peça para ele digitar o PIN de novo; se continuar falhando, esqueça os pareamentos e comecem do zero." = "A device tried to join with a pairing this Mac no longer recognizes. Ask it to enter the PIN again; if it keeps failing, forget paired devices and start over.";
+"Um aparelho tentou entrar com o PIN errado. O PIN mudou: passe os seis dígitos novos — cada PIN vale uma tentativa por conexão." = "A device tried to join with the wrong PIN. The PIN has changed: share the six new digits — each PIN is good for one try per connection.";
+"Um aparelho tentou entrar com o PIN errado. Toque em Espelhar de novo e passe os seis dígitos novos — cada PIN vale uma tentativa por conexão." = "A device tried to join with the wrong PIN. Tap Mirror again and share the six new digits — each PIN is good for one try per connection.";
+"O pareamento fechou, mas os dois aparelhos não acharam caminho um para o outro. Quase sempre é a rede: Wi-Fi de hóspede, isolamento entre aparelhos ou redes diferentes. Ponha os dois na mesma rede e tente de novo." = "Pairing worked, but the two devices couldn't find a route to each other. It's almost always the network: guest Wi-Fi, client isolation or different networks. Put both on the same network and try again.";
+"Ninguém entrou em cinco minutos. Toque em Espelhar de novo quando o outro aparelho estiver pronto." = "No one joined in five minutes. Tap Mirror again when the other device is ready.";
+"Não consegui abrir a sessão." = "Couldn't open the session.";
+"O outro aparelho" = "The other device";
+"%@ saiu." = "%@ left.";
+"A conexão com %@ caiu." = "The connection to %@ dropped.";
+"A captura parou sozinha: %@" = "Capture stopped on its own: %@";
+"Não consegui iniciar a captura: %@" = "Couldn't start capture: %@";
+"Esperando de novo com o mesmo PIN." = "Waiting again with the same PIN.";
+"outro aparelho" = "another device";
+"Pareamentos esquecidos. Da próxima vez o PIN será pedido." = "Paired devices forgotten. The PIN will be asked next time.";
+
+/* QuallApp/EsperaDaCamera.swift */
+"Um aparelho tentou entrar com o PIN errado. O PIN da câmera mudou." = "A device tried to join with the wrong PIN. The camera PIN has changed.";
+"A espera da câmera falhou (status %@)." = "Waiting with the camera failed (status %@).";
+"Quem recebia saiu (%@); esperando de novo com o mesmo PIN." = "The receiver left (%@); waiting again with the same PIN.";
+"A câmera parou de esperar receptor depois de %@ falhas seguidas. Gravar neste Mac continua funcionando; feche e abra a tela para esperar de novo." = "The camera stopped waiting for a receiver after %@ failures in a row. Recording on this Mac still works; close and reopen the screen to wait again.";
+
+/* QuallApp/Estilo.swift */
+"sem rede" = "no network";
+"Copiado" = "Copied";
+"Copiar o endereço %@" = "Copy address %@";
+"Sem rede" = "No network";
+"Copiar o endereço" = "Copy address";
+"Dispensar o aviso" = "Dismiss";
+"Mostrar menos" = "Show less";
+"+1 aviso" = "+1 notice";
+"+%@ avisos" = "+%@ notices";
+"Mic desligado" = "Mic off";
+"Ligando…" = "Turning on…";
+"Mic ligado" = "Mic on";
+"Sem acesso" = "No access";
+"Não abriu" = "Didn't open";
+"Desligar o microfone" = "Turn off microphone";
+"Ligar o microfone" = "Turn on microphone";
+"Parar a gravação" = "Stop recording";
+"Gravar" = "Record";
+"Parar a gravação (o arquivo fica na pasta de gravações)" = "Stop recording (the file stays in the recordings folder)";
+"Gravar a câmera, sem o texto, na pasta de gravações (o microfone só se estiver ligado)" = "Record the camera, without the text, to the recordings folder (microphone only if it's on)";
+"Começando…" = "Starting…";
+"Fechando…" = "Closing…";
+" · SEM SOM" = " · NO AUDIO";
+
+/* QuallApp/GravadorLocal.swift */
+"Gravando SEM SOM — ligue o microfone" = "Recording with NO AUDIO — turn on the microphone";
+"não foi possível criar a pasta %@: %@" = "couldn't create folder %@: %@";
+"a câmera não está aberta" = "the camera isn't open";
+"câmera interrompida: %@" = "camera interrupted: %@";
+"a câmera não está entregando imagem" = "the camera isn't delivering video";
+"sem espaço: sobram %@ MB (gravar pede 500 MB livres)" = "out of space: %@ MB left (recording needs 500 MB free)";
+"Não gravou: %@" = "Didn't record: %@";
+"A gravação não começou: %@" = "Recording didn't start: %@";
+"A gravação parou com erro (%@); o que foi gravado fica em %@ como \"(interrompido)\"." = "Recording stopped with an error (%@); what was recorded stays in %@ as \"(interrompido)\".";
+"Gravação salva em %@ (%@): %@" = "Recording saved in %@ (%@): %@";
+
+/* QuallApp/ModoSegurar.swift */
+"Segure um botão, ou a seta ↑ ou ↓ do teclado (o passador de slides também serve). Soltou, o texto para." = "Hold a button, or the ↑ or ↓ arrow key (a slide clicker works too). Let go and the text stops.";
+"Velocidade %@ linhas/s" = "Speed %@ lines/s";
+"A velocidade ajustada. Para mudá-la, saia do modo." = "The set speed. To change it, leave this mode.";
+"Inverter botões" = "Swap buttons";
+"Troca o que os dois botões fazem (e as setas ↑ ↓), para quando o espelho do suporte deixa o texto andando ao contrário da seta." = "Swaps what the two buttons do (and the ↑ ↓ arrows), for when the rig's mirror makes the text move against the arrow.";
+"Solte o botão de rolar para trocar." = "Release the scroll button to swap.";
+"Sair do modo" = "Leave mode";
+"Volta à tela do controle com todos os comandos" = "Back to the remote screen with all controls";
+"%@ não responde" = "%@ isn't responding";
+"Controlando %@" = "Controlling %@";
+"Saindo…" = "Leaving…";
+"Conexão perdida" = "Connection lost";
+"Sem conexão com o prompter — tentando de novo (tentativa %@)." = "No connection to the prompter — trying again (attempt %@).";
+"Sem conexão com o prompter — tentando de novo." = "No connection to the prompter — trying again.";
+"Os botões voltam com ele." = "The buttons come back with it.";
+"Esperando o prompter responder…" = "Waiting for the prompter to respond…";
+"O prompter não responde há mais de 2,5 s. Os botões voltam quando ele responder." = "The prompter hasn't responded for over 2.5 s. The buttons come back when it does.";
+"Atualize o app do prompter para usar este modo" = "Update the app on the prompter to use this mode";
+
+/* QuallApp/PainelControlar.swift */
+"Controlar um teleprompter" = "Control a teleprompter";
+"Escolha o prompter. Do outro lado: Quall Studio → Teleprompter → Mostrar o texto." = "Choose the prompter. On the other side: Quall Studio → Teleprompter → Show the text.";
+"Prompters na rede" = "Prompters on the network";
+"procurando" = "searching";
+"Procurando prompters…" = "Looking for prompters…";
+"Nenhum prompter na lista." = "No prompters in the list.";
+"Ou digite o endereço" = "Or type the address";
+"Deixe vazio se este Mac e o prompter já se parearam antes." = "Leave empty if this Mac and the prompter have paired before.";
+"Voltar" = "Back";
+"Conectando…" = "Connecting…";
+"Conectar" = "Connect";
+
+/* QuallApp/PerguntaDoTextoNaTela.swift */
+"Desconectar" = "Disconnect";
+"Volta ao formulário; a pergunta volta na próxima conexão com este prompter." = "Back to the form; the question comes back on the next connection to this prompter.";
+"Fechar" = "Close";
+
+/* QuallApp/Receptor.swift */
+"Digite o endereço que o outro aparelho está mostrando." = "Type the address the other device is showing.";
+"retomando pareamento…" = "resuming pairing…";
+"conectando e pareando…" = "connecting and pairing…";
+"esperando a track do emissor…" = "waiting for the sender's track…";
+"cancelado" = "cancelled";
+"%@ conectou mas não abriu nenhuma track de vídeo (a sessão só trouxe som)" = "%@ connected but opened no video track (the session only brought audio)";
+"%@ conectou mas não abriu nenhuma track de vídeo" = "%@ connected but opened no video track";
+"câmera" = "camera";
+"tela" = "screen";
+"O aparelho em %@ encerrou a transmissão." = "The device at %@ ended the stream.";
+"A conexão de mídia com %@ caiu — o pareamento tinha dado certo, o que falhou foi o transporte. Confira se os dois estão na mesma rede e tente conectar de novo." = "The media connection to %@ dropped — pairing had worked, the transport failed. Check that both are on the same network and try connecting again.";
+"%@ s sem nenhum quadro." = "%@ s without a single frame.";
+"Recepção encerrada." = "Receiving ended.";
+"sem som: %@" = "no audio: %@";
+"a saída está sendo remontada" = "the output is being rebuilt";
+"som: %@" = "audio: %@";
+"som: nada chegando do emissor (o som pode estar com outro receptor)" = "audio: nothing arriving from the sender (the audio may be with another receiver)";
+"som: tocando, volume %.0f%%" = "audio: playing, volume %.0f%%";
+"Cancelado." = "Cancelled.";
+"PIN errado. Confira os seis dígitos na tela do outro aparelho e toque em Conectar de novo — cada tentativa vale por uma conexão." = "Wrong PIN. Check the six digits on the other device's screen and tap Connect again — each try counts as one connection.";
+"O outro aparelho não reconhece mais este Mac. Peça um PIN novo na tela dele e digite aqui." = "The other device no longer recognizes this Mac. Get a new PIN from its screen and type it here.";
+"O pareamento não fechou. Confira o PIN na tela do outro aparelho e tente de novo." = "Pairing didn't complete. Check the PIN on the other device's screen and try again.";
+"Ninguém atendeu neste endereço. Confira se o outro aparelho já está esperando e se o endereço e a porta estão certos." = "No one answered at this address. Check that the other device is already waiting and that the address and port are right.";
+"Os dois aparelhos não acharam caminho um até o outro. Confira se estão na mesma rede Wi-Fi e se ela não isola os aparelhos entre si (rede de hóspedes)." = "The two devices couldn't find a route to each other. Check that they're on the same Wi-Fi network and that it doesn't isolate devices from each other (guest network).";
+"O outro aparelho fala outra versão do Quall Studio. Atualize os dois." = "The other device speaks a different Quall Studio version. Update both.";
+"Não deu para conectar." = "Couldn't connect.";
+"Não deu para conectar: %@" = "Couldn't connect: %@";
+
+/* QuallApp/Retratos.swift */
+"Câmera" = "Camera";
+"Rede automática · " = "Automatic network · ";
+"Encerrando…" = "Ending…";
+"Parar e salvar a gravação" = "Stop and save recording";
+"Parar de espelhar" = "Stop mirroring";
+"Falta a permissão de Câmera. Abra Ajustes do Sistema > Privacidade e Segurança > Câmera e habilite o Quall Studio." = "Camera permission is missing. Open System Settings > Privacy & Security > Camera and turn on Quall Studio.";
+"Abrir os Ajustes do Sistema" = "Open System Settings";
+"O outro aparelho não reconheceu este Mac." = "The other device didn't recognize this Mac.";
+"Esquecer aparelhos pareados" = "Forget paired devices";
+"Gravando na pasta de gravações." = "Recording to the recordings folder.";
+"%.1f GB livres" = "%.1f GB free";
+"O macOS negou o microfone ao Quall Studio." = "macOS denied Quall Studio the microphone.";
+"Digite o endereço que a tela do prompter mostra (por exemplo 192.168.1.20:7979)." = "Type the address the prompter screen shows (for example 192.168.1.20:7979).";
+
+/* QuallApp/SeletorDeIdioma.swift */
+"Troca o idioma do Quall Studio" = "Changes Quall Studio's language";
+
+/* QuallApp/TelaComCamera.swift */
+"Em cima" = "Top";
+"Embaixo" = "Bottom";
+"À esquerda" = "Left";
+"À direita" = "Right";
+
+/* QuallApp/TelaDeEspera.swift */
+"Wi-Fi" = "Wi-Fi";
+"Cabo" = "Cable";
+"%@, sem endereço" = "%@, no address";
+"No outro aparelho, abra o Quall Studio em %@ e escolha %@ na lista, ou digite o endereço abaixo." = "On the other device, open Quall Studio in %@ and choose %@ in the list, or type the address below.";
+"No outro aparelho, abra o Quall Studio em %@ e digite o endereço abaixo." = "On the other device, open Quall Studio in %@ and type the address below.";
+"A %@ vai com o som." = "%@ goes with its audio.";
+"A %@ vai sem som." = "%@ goes without audio.";
+"há %@" = "for %@";
+"Pronto para espelhar" = "Ready to mirror";
+"Aparelhos pareados entram direto." = "Paired devices join right away.";
+"Aparelho novo? PIN" = "New device? PIN";
+"Aparelho novo?" = "New device?";
+"Na primeira vez, o PIN" = "The first time, the PIN";
+"ou pelo endereço" = "or by address";
+"Aparecendo na lista dos outros aparelhos" = "Showing in other devices' lists";
+"Sem anúncio na rede — use o endereço" = "Not announced on the network — use the address";
+"Espelhando para" = "Mirroring to";
+"%@ aparelhos" = "%@ devices";
+"Origem" = "Source";
+"Imagem" = "Picture";
+"Rede" = "Network";
+"Som" = "Audio";
+"Indo junto" = "Going along";
+"Sem som" = "No audio";
+"Tudo o que aparece nesta tela vai junto. Conteúdo protegido aparece preto do outro lado — é o macOS que faz isso, em qualquer app de espelhamento." = "Everything on this screen goes along. Protected content shows up black on the other side — macOS does that, in any mirroring app.";
+"Esconder os números" = "Hide the numbers";
+"Mostrar os números" = "Show the numbers";
+"Mais um aparelho" = "One more device";
+"Ele ganha um monitor só dele, no formato da tela dele." = "It gets a display of its own, shaped like its screen.";
+"O receptor pode sair e voltar: a câmera e a gravação continuam." = "The receiver can leave and come back: the camera and the recording go on.";
+"Prévia como espelho" = "Mirror the preview";
+"Parar e salvar" = "Stop and save";
+"Parar" = "Stop";
+"O som do microfone vai junto da câmera, cru. Começa desligado; desligar fecha de verdade." = "Microphone audio goes along with the camera, raw. It starts off; turning it off really closes it.";
+"Abrindo" = "Opening";
+"Enviando para" = "Sending to";
+
+/* QuallApp/TelaDeExibicao.swift */
+"Assistir outro aparelho" = "Watch another device";
+"Digite o endereço e o PIN que aparecem na tela de quem está espelhando." = "Type the address and PIN shown on the mirroring device's screen.";
+"Endereço" = "Address";
+"Peça os seis dígitos que a tela do outro aparelho está mostrando." = "Ask for the six digits the other device's screen is showing.";
+"Deixe vazio se este Mac e o outro aparelho já parearam." = "Leave empty if this Mac and the other device have already paired.";
+"Usar o último · " = "Use the last one · ";
+"pareado agora" = "paired just now";
+"mudo: a câmera do Quall está ligada (numa chamada, ou pelo app dela)" = "muted: Quall's camera is on (in a call, or by its app)";
+"Ligar o som" = "Turn on audio";
+"Calar" = "Mute";
+"Parando…" = "Stopping…";
+"tocar mesmo com a câmera do Quall numa chamada" = "play even with Quall's camera in a call";
+
+/* QuallApp/TelaDoControle.swift */
+"Teclado: espaço tocar/pausar · ↑↓ velocidade (⇧ = 1) · ←→ pular (⇧ = 10%) · Home ou 0 começo · M espelho · +/− fonte · [ ] margem · , . linha de leitura · E editar" = "Keyboard: space play/pause · ↑↓ speed (⇧ = 1) · ←→ jump (⇧ = 10%) · Home or 0 start · M mirror · +/− font · [ ] margin · , . reading line · E edit";
+"Sair" = "Exit";
+"Segurar para rolar" = "Hold to scroll";
+"A tela fica só com dois botões grandes, Rolar para cima e Rolar para baixo: o texto rola enquanto um deles está apertado, na velocidade ajustada." = "The screen keeps only two big buttons, Scroll up and Scroll down: the text scrolls while one of them is held, at the set speed.";
+"Gravando há %@" = "Recording for %@";
+"O prompter não está gravando" = "The prompter isn't recording";
+"o prompter ainda não respondeu" = "the prompter hasn't responded yet";
+"pedindo para gravar…" = "asking to record…";
+"pedindo para parar…" = "asking to stop…";
+"Conexão perdida — tentando de novo (tentativa %@)." = "Connection lost — trying again (attempt %@).";
+"Conexão perdida — tentando de novo." = "Connection lost — trying again.";
+"O prompter continua como estava; os comandos vão quando a conexão voltar." = "The prompter stays as it was; commands go through when the connection is back.";
+"O prompter não responde há mais de 2,5 s. Os comandos vão quando ele voltar." = "The prompter hasn't responded for over 2.5 s. Commands go through when it's back.";
+"O último comando ainda não chegou ao prompter." = "The last command hasn't reached the prompter yet.";
+"O prompter fala outra versão do teleprompter: atualize o app nos dois aparelhos." = "The prompter speaks a different teleprompter version: update the app on both devices.";
+"O relógio de um dos dois aparelhos está mais de um dia errado: algumas edições foram recusadas." = "The clock on one of the two devices is off by more than a day: some edits were rejected.";
+"O roteiro não chegou ao prompter depois de 20 tentativas." = "The script didn't reach the prompter after 20 tries.";
+"Início" = "Start";
+"Voltar ao começo (Home ou 0)" = "Back to Start (Home or 0)";
+"Pular 5% para trás (← pula 2%, ⇧← 10%)" = "Jump back 5% (← jumps 2%, ⇧← 10%)";
+"Pausar" = "Pause";
+"Tocar" = "Play";
+"Tocar ou pausar (espaço)" = "Play or pause (space)";
+"Pular 5% para a frente (→ pula 2%, ⇧→ 10%)" = "Jump ahead 5% (→ jumps 2%, ⇧→ 10%)";
+"Velocidade" = "Speed";
+"%.2f linhas/s" = "%.2f lines/s";
+"Fonte" = "Font size";
+"Margem" = "Margin";
+"%.0f%% de cada lado" = "%.0f%% on each side";
+"Linha de leitura" = "Reading line";
+"%.0f%% do topo" = "%.0f%% from the top";
+"Espelho" = "Mirror";
+"Inverter o texto na horizontal (para ler pelo vidro)" = "Flip the text horizontally (to read through the glass)";
+"Roteiro" = "Script";
+"%@ bytes" = "%@ bytes";
+"Editar…" = "Edit…";
+"Colar da área de transferência…" = "Paste from clipboard…";
+"Sem roteiro ainda." = "No script yet.";
+
+/* QuallApp/TelaDoPrompter.swift */
+"Controle sumido" = "Remote gone";
+"O texto continua como estava. Esperando o controle voltar." = "The text stays as it was. Waiting for the remote to come back.";
+"Sem roteiro.\nToque em Editar ou cole um texto — aqui ou no controle." = "No script.\nTap Edit or paste some text — here or on the remote.";
+"O controle fala outra versão do teleprompter: atualize o app nos dois aparelhos." = "The remote speaks a different teleprompter version: update the app on both devices.";
+"Controle sumido — esperando a volta" = "Remote gone — waiting for it to return";
+"A espera parou" = "Waiting stopped";
+"Esperando o controle" = "Waiting for the remote";
+"Esconder (o PIN continua valendo)" = "Hide (the PIN stays valid)";
+"ENDEREÇO" = "ADDRESS";
+"Aparecendo na lista dos outros aparelhos como %@." = "Showing in other devices' lists as %@.";
+"Sem anúncio na rede — digite o endereço no controle." = "Not announced on the network — type the address on the remote.";
+"No outro aparelho: Quall Studio → Teleprompter → Controlar." = "On the other device: Quall Studio → Teleprompter → Remote.";
+"Esperar de novo" = "Wait again";
+"Fonte automática" = "Automatic font size";
+"A maior fonte com pelo menos duas palavras por linha. Arraste as setas do alto para enquadrar o texto." = "The largest font with at least two words per line. Drag the arrows at the top to frame the text.";
+"Colar" = "Paste";
+"Abre o editor com o texto da área de transferência" = "Opens the editor with the clipboard text";
+"Tela cheia (F)" = "Full screen (F)";
+"Controlado por %@" = "Controlled by %@";
+"Sem controle" = "No remote";
+"%@ de %@ bytes" = "%@ of %@ bytes";
+"O texto mudou no outro aparelho enquanto você editava." = "The text changed on the other device while you were editing.";
+"O texto novo tem %@ bytes e começa com “%@”. Se você confirmar o seu, ele substitui o novo nos dois aparelhos — vale o último que mudou." = "The new text has %@ bytes and starts with “%@”. If you confirm yours, it replaces the new one on both devices — the last change wins.";
+"Usar o texto novo" = "Use the new text";
+"O seu rascunho vai para a área de transferência" = "Your draft goes to the clipboard";
+"Manter o meu" = "Keep Mine";
+"O texto foi atualizado pelo outro aparelho." = "The text was updated by the other device.";
+"Colar tudo da área de transferência" = "Paste everything from the clipboard";
+"Confirmar" = "Confirm";
+"⌘↩ confirma. O texto só vai para o outro aparelho ao confirmar." = "⌘↩ confirms. The text only goes to the other device when you confirm.";
+
+/* QuallApp/TelaDoPrompterComCamera.swift */
+"Arraste para dividir a tela entre o texto e a prévia (de 20 % a 80 %)" = "Drag to split the screen between the text and the preview (20% to 80%)";
+"Prévia escondida — a câmera continua transmitindo e gravando." = "Preview hidden — the camera keeps streaming and recording.";
+"Abrindo a câmera…" = "Opening the camera…";
+"Controle sumido — o texto continua como estava; esperando o controle voltar." = "Remote gone — the text stays as it was; waiting for the remote to come back.";
+"Câmera: %@" = "Camera: %@";
+"Microfone: %@" = "Microphone: %@";
+"Voltar ao começo" = "Back to Start";
+"Vel." = "Speed";
+"Tela cheia (F): a barra de título sai de cima da lente" = "Full screen (F): the title bar moves out from over the lens";
+"Parar e sair" = "Stop and exit";
+"controlado por %@" = "controlled by %@";
+"controle sumido" = "remote gone";
+"a espera parou" = "waiting stopped";
+"esperando o controle" = "waiting for the remote";
+"Texto" = "Text";
+"Controle do texto (Quall Studio → Teleprompter → Controlar)" = "Text remote (Quall Studio → Teleprompter → Remote)";
+"enviando para %@" = "sending to %@";
+"esperando quem recebe" = "waiting for a receiver";
+"parou de esperar" = "stopped waiting";
+"parada" = "stopped";
+"Receber a câmera (Quall Studio → Exibir, ou o OBS)" = "Receive the camera (Quall Studio → Receive, or OBS)";
+"O PIN e o endereço desta sessão, em letra grande" = "This session's PIN and address, in large type";
+"Aparecendo na lista dos outros aparelhos." = "Showing in other devices' lists.";
+"Sem anúncio na rede — digite o endereço." = "Not announced on the network — type the address.";
+"Lado do texto" = "Text side";
+"Esconder a prévia (a câmera continua)" = "Hide the preview (the camera keeps going)";
+"Espelho do texto (vidro)" = "Mirror the text (glass)";
+"Microfone" = "Microphone";
+"O padrão do sistema" = "System default";
+"Ajustes desta tela: lado do texto, espelho, prévia, câmera e microfone" = "Settings for this screen: text side, mirror, preview, camera and microphone";
+"Microfone ligado" = "Microphone on";
+"Microfone desligado" = "Microphone off";
+"Desligar o microfone (fecha de verdade)" = "Turn off the microphone (really closes it)";
+"Ligar o microfone: o som vai junto da câmera, cru, sem tratamento" = "Turn on the microphone: audio goes with the camera, raw, unprocessed";
+"Fechando o arquivo…" = "Closing the file…";
+"SEM SOM" = "NO AUDIO";
+"⌥-clique trava ali." = "⌥-click locks it there.";
+
+/* QuallApp/TelaInicial.swift */
+"Uma tela ou uma câmera. Quem exibe escolhe este Mac na lista." = "A screen or a camera. The receiving device picks this Mac in its list.";
+"O que vamos espelhar?" = "What are we mirroring?";
+"Atualizar" = "Refresh";
+"Procurando telas e câmeras…" = "Looking for screens and cameras…";
+"Nada para transmitir ainda." = "Nothing to stream yet.";
+"Por qual rede o vídeo sai: nos Ajustes" = "Which network the video goes out on: in Settings";
+"Mandar o som junto" = "Send audio too";
+"O som que o Mac inteiro está tocando. O microfone fica de fora." = "Whatever the whole Mac is playing. The microphone stays out.";
+
+/* QuallApp/Teleprompter.swift */
+"O prompter não grava (atualize o app, ou abra a tela com câmera)." = "The prompter doesn't record (update the app, or open the camera screen).";
+"Sem conexão com o prompter." = "No connection to the prompter.";
+"O pedido não saiu: %@." = "The request didn't go out: %@.";
+"Não consegui criar o teleprompter: %@" = "Couldn't create the teleprompter: %@";
+"Não consegui criar o controle: %@" = "Couldn't create the remote: %@";
+"O prompter recusou: %@" = "The prompter refused: %@";
+"Fonte automática desligada: o controle mudou a fonte" = "Automatic font size off: the remote changed the font size";
+"A área de transferência não tem texto." = "The clipboard has no text.";
+"O seu rascunho foi para a área de transferência." = "Your draft went to the clipboard.";
+"O roteiro tem %@ bytes; o máximo é %@ (cerca de 20 mil palavras)." = "The script has %@ bytes; the maximum is %@ (about 20,000 words).";
+"O texto foi recusado: %@" = "The text was rejected: %@";
+"Cinco tentativas seguidas com o PIN errado: a espera parou, para ninguém ficar adivinhando o PIN. Toque em Esperar de novo." = "Five wrong PIN attempts in a row: waiting stopped, so no one can keep guessing the PIN. Tap Wait again.";
+"Um aparelho tentou entrar com o PIN errado. O PIN mudou: passe os seis dígitos novos." = "A device tried to join with the wrong PIN. The PIN has changed: share the six new digits.";
+"Um aparelho tentou entrar com um pareamento que este Mac não reconhece mais: ele precisa digitar o PIN." = "A device tried to join with a pairing this Mac no longer recognizes: it needs to enter the PIN.";
+"Um aparelho que não é controle do Quall Studio, ou de outra versão, tentou entrar e foi recusado." = "A device that isn't a Quall Studio remote, or is on another version, tried to join and was refused.";
+"Não consegui abrir a porta %@ (%@). Tentando de novo." = "Couldn't open port %@ (%@). Trying again.";
+"A espera parou: %@" = "Waiting stopped: %@";
+"A sinalização falhou (%@). Tentando de novo." = "Signaling failed (%@). Trying again.";
+"PIN errado. Confira os seis dígitos na tela do prompter e conecte de novo — cada tentativa vale por uma conexão, e o PIN do prompter muda depois de um erro." = "Wrong PIN. Check the six digits on the prompter screen and connect again — each try counts as one connection, and the prompter's PIN changes after a mistake.";
+"O prompter não reconhece mais este Mac. Digite o PIN que a tela dele mostra." = "The prompter no longer recognizes this Mac. Type the PIN its screen shows.";
+"O pareamento não fechou. Confira o PIN na tela do prompter e tente de novo." = "Pairing didn't complete. Check the PIN on the prompter screen and try again.";
+"Esse aparelho não aceitou este Mac como controle: %@" = "That device didn't accept this Mac as a remote: %@";
+"O prompter já tem outro controle conectado." = "The prompter already has another remote connected.";
+"O prompter ainda está com a sessão anterior — tentando de novo (ele percebe a queda em até 5 s)." = "The prompter is still on the previous session — trying again (it notices the drop within 5 s).";
+"Conexão perdida — tentando de novo. Os comandos vão quando a conexão voltar." = "Connection lost — trying again. Commands go through when the connection is back.";
+"Ninguém atendeu neste endereço. Confira se o prompter está aberto e se o endereço e a porta estão certos." = "No one answered at this address. Check that the prompter is open and that the address and port are right.";
+"Os dois aparelhos não acharam caminho um até o outro. Confira se estão na mesma rede." = "The two devices couldn't find a route to each other. Check that they're on the same network.";
+"Conexão perdida (%@) — tentando de novo." = "Connection lost (%@) — trying again.";
+
+/* QuallBarraDeMenusKit/MarcaNaBarra.swift */
+"Quall Studio, no ar" = "Quall Studio, live";
+
+/* QuallBarraDeMenusKit/SituacaoNaBarra.swift */
+"Pronto" = "Ready";
+"Espelhar: esperando um aparelho" = "Mirror: waiting for a device";
+"Câmera: esperando um aparelho" = "Camera: waiting for a device";
+"Espelhando para %@" = "Mirroring to %@";
+"Câmera indo para %@" = "Camera going to %@";
+"Encerrando a transmissão…" = "Ending the stream…";
+"Exibir: conectando…" = "Receive: connecting…";
+"Exibir: esperando a imagem de %@" = "Receive: waiting for video from %@";
+"Exibindo %@" = "Receiving %@";
+"Parando de exibir…" = "Stopping receiving…";
+"Teleprompter: esperando o controle" = "Teleprompter: waiting for the remote";
+"Teleprompter: controlado por %@" = "Teleprompter: controlled by %@";
+"Teleprompter: sem o controle" = "Teleprompter: no remote";
+"Teleprompter: a espera parou" = "Teleprompter: waiting stopped";
+"Teleprompter: saindo…" = "Teleprompter: leaving…";
+"Texto com a câmera: esperando um aparelho" = "Text with camera: waiting for a device";
+"Texto com a câmera: indo para %@" = "Text with camera: going to %@";
+"Controlar: conectando…" = "Remote: connecting…";
+"Controlando o texto de %@" = "Controlling the text on %@";
+"Controlar: sem conexão" = "Remote: no connection";
+"Controlar: saindo…" = "Remote: leaving…";
+
+/* QuallCaptureKit/CatalogoDeFontes.swift */
+"Nenhum monitor encontrado — o que não deveria acontecer num Mac ligado." = "No display found — which shouldn't happen on a running Mac.";
+"Monitor %@" = "Display %@";
+"A tela" = "The screen";
+"Falta a permissão de Gravação de Tela." = "Screen Recording permission is missing.";
+"Falta a permissão de Gravação de Tela (erro %@)." = "Screen Recording permission is missing (error %@).";
+"Se o macOS acabou de perguntar, responda Permitir e toque em Atualizar. Se não perguntou, abra Ajustes do Sistema > Privacidade e Segurança > Gravação de Tela e habilite o Quall Studio." = "If macOS just asked, answer Allow and tap Refresh. If it didn't ask, open System Settings > Privacy & Security > Screen Recording and turn on Quall Studio.";
+"A permissão de Câmera ainda não foi pedida por este processo." = "Camera permission hasn't been requested by this process yet.";
+"Permissão de Câmera negada. Abra Ajustes do Sistema > Privacidade e Segurança > Câmera e habilite o Quall Studio." = "Camera permission denied. Open System Settings > Privacy & Security > Camera and turn on Quall Studio.";
+"Estado de permissão de Câmera desconhecido nesta versão do macOS." = "Unknown Camera permission state on this macOS version.";
+"Permissão concedida, mas nenhuma câmera foi encontrada neste Mac." = "Permission granted, but no camera was found on this Mac.";
+
+/* QuallCaptureKit/ControlesDaCamera.swift */
+"O macOS não oferece %@ para câmeras." = "macOS doesn't offer %@ for cameras.";
+"Esta câmera não oferece %@." = "This camera doesn't offer %@.";
+"Esta câmera tem foco fixo." = "This camera has fixed focus.";
+"%@ e %@" = "%@ and %@";
+"Ajustes da câmera" = "Camera settings";
+"Travar exposição" = "Lock exposure";
+"Travar balanço" = "Lock white balance";
+"Restaurar automático" = "Reset to auto";
+"Usar meus ajustes" = "Use my settings";
+"Toque na imagem para focar e medir naquele ponto." = "Tap the picture to focus and meter at that point.";
+"Travado de novo depois de medir a cena." = "Locked again after metering the scene.";
+"Pouca luz: %@ fps para clarear a imagem. Mais luz no ambiente devolve os %@ fps." = "Low light: %@ fps to brighten the picture. More light in the room brings back %@ fps.";
+"Exposição e foco travados" = "Exposure and focus locked";
+"Exposição travada" = "Exposure locked";
+"Foco travado" = "Focus locked";
+"Passe a exposição para Manual para escolher ISO e obturador." = "Switch exposure to Manual to choose ISO & shutter.";
+"ISO" = "ISO";
+"o obturador" = "shutter";
+"o Kelvin" = "Kelvin";
+"os presets de balanço" = "white balance presets";
+"o foco manual" = "manual focus";
+"a anti-cintilação" = "anti-flicker";
+"a compensação de exposição" = "exposure compensation";
+"o toque para focar" = "tap to focus";
+"a trava de exposição" = "exposure lock";
+"a trava de balanço" = "white balance lock";
+"a trava de foco" = "focus lock";
+"o brilho" = "brightness";
+"o ganho" = "gain";
+"ISO e obturador" = "ISO & shutter";
+"Balanço" = "White balance";
+"Foco" = "Focus";
+"Incandescente" = "Incandescent";
+"Fluorescente" = "Fluorescent";
+"Luz do dia" = "Daylight";
+"Nublado" = "Cloudy";
+"Kelvin" = "Kelvin";
+
+/* QuallCaptureKit/DonoDaCamera.swift */
+"O Quall Studio não tem acesso à câmera. Abra Ajustes do Sistema → Privacidade e Segurança → Câmera e ligue o Quall Studio." = "Quall Studio has no access to the camera. Open System Settings → Privacy & Security → Camera and turn on Quall Studio.";
+"O acesso à câmera está bloqueado neste Mac por um perfil de gerenciamento." = "Camera access is blocked on this Mac by a management profile.";
+"A câmera do próprio Quall não pode ser a fonte (seria um laço)." = "Quall's own camera can't be the source (it would be a loop).";
+"A câmera escolhida não está mais disponível. Escolha outra." = "The chosen camera is no longer available. Choose another.";
+"Nenhuma câmera encontrada neste Mac." = "No camera found on this Mac.";
+"Não foi possível abrir a câmera %@." = "Couldn't open camera %@.";
+"A saída de vídeo da câmera não pôde ser criada." = "The camera's video output couldn't be created.";
+"a câmera %@ foi desconectada" = "camera %@ was disconnected";
+"a câmera parou com erro: %@" = "the camera stopped with an error: %@";
+"O Quall Studio não tem acesso ao microfone. Abra Ajustes do Sistema → Privacidade e Segurança → Microfone e ligue o Quall Studio; a câmera segue sem som enquanto isso." = "Quall Studio has no access to the microphone. Open System Settings → Privacy & Security → Microphone and turn on Quall Studio; the camera goes on without audio meanwhile.";
+"O microfone está bloqueado neste Mac por um perfil de gerenciamento; a câmera segue sem som." = "The microphone is blocked on this Mac by a management profile; the camera goes on without audio.";
+"A câmera já fechou." = "The camera has already closed.";
+"O microfone escolhido não está disponível agora." = "The chosen microphone isn't available right now.";
+"Não foi possível abrir o microfone %@." = "Couldn't open microphone %@.";
+"A captura não aceitou o microfone." = "Capture didn't accept the microphone.";
+"O microfone não abriu junto da câmera. Tente de novo." = "The microphone didn't open with the camera. Try again.";
+
+/* QuallCaptureKit/MonitorVirtual.swift */
+
+/* QuallCaptureKit/MonitorVirtualAuxiliar.swift */
+
+/* QuallCaptureKit/PermissaoDeTela.swift */
+"Gravação de Tela já concedida." = "Screen Recording already granted.";
+"Gravação de Tela concedida agora, no diálogo do sistema." = "Screen Recording granted just now, in the system dialog.";
+"Falta a permissão de Gravação de Tela — a mesma concessão cobre a tela **e** o áudio do sistema. O pedido foi feito, então o Quall Studio passa a aparecer em Ajustes do Sistema > Privacidade e Segurança > Gravação do Áudio do Sistema e da Tela. Marque a caixinha e abra o app de novo." = "Screen Recording permission is missing — the same grant covers the screen **and** system audio. The request was made, so Quall Studio now shows up in System Settings > Privacy & Security > Screen & System Audio Recording. Tick the box and open the app again.";
+
+/* QuallCaptureKit/ScreenCapturer.swift */
+"Nenhum display encontrado para captura." = "No display found to capture.";
+"Permissão de Gravação de Tela (ScreenCaptureKit / TCC) negada ou ainda não concedida para este binário. Abra Ajustes do Sistema > Privacidade e Segurança > Gravação de Tela, habilite o binário que está rodando este processo e rode de novo. Erro subjacente: %@" = "Screen Recording permission (ScreenCaptureKit / TCC) denied or not yet granted for this binary. Open System Settings > Privacy & Security > Screen Recording, turn on the binary running this process and run again. Underlying error: %@";
+"Falha no SCStream: %@" = "SCStream failure: %@";
+"Não consegui limitar a captura a este processo: %@. A regra da casa manda não capturar em vez de capturar demais — ver docs/regras-de-frente.md." = "Couldn't limit capture to this process: %@. The house rule is to not capture rather than capture too much — see docs/regras-de-frente.md.";
+"O monitor \"%@\" foi desconectado durante a transmissão, então ela parou. Escolha outro monitor e comece de novo — o Quall Studio não troca de tela sozinho, porque isso mandaria para a rede uma tela que ninguém escolheu. (testemunhas: %@)" = "Display \"%@\" was disconnected during the stream, so it stopped. Choose another display and start again — Quall Studio doesn't switch screens on its own, because that would send a screen nobody chose over the network. (witnesses: %@)";
+"\"%@\" passou a espelhar %@, então a transmissão parou. Para usá-la como mais uma tela, escolha \"Usar Como Tela Estendida\" no menu Espelhamento de Tela (ou em Ajustes > Monitores) e comece de novo." = "\"%@\" started mirroring %@, so the stream stopped. To use it as another screen, choose \"Use As Extended Display\" in the Screen Mirroring menu (or in Settings > Displays) and start again.";
+
+/* QuallCaptureKit/TomadaDeGravacao.swift */
+"O codificador da gravação não abriu (%@)." = "The recording encoder didn't open (%@).";
+"o arquivo não fechou: %@" = "the file didn't close: %@";
+"o arquivo falhou: %@" = "the file failed: %@";
+
+/* QuallReceptorKit/SomPuxado.swift */
+"mudo" = "muted";
+"volume zero" = "volume zero";
+
+/* QuallTeleprompterKit/PerguntaDoTexto.swift */
+"O prompter %@ tem outro roteiro." = "The prompter %@ has a different script.";
+"No prompter" = "On the prompter";
+"Neste aparelho" = "On this device";
+"Usar o do prompter" = "Use the prompter's";
+"Mandar o meu" = "Send mine";
+"O roteiro que sair fica em Roteiros guardados." = "The script that's replaced stays in Saved scripts.";
+"Conferindo o roteiro do prompter…" = "Checking the prompter's script…";
+"O prompter saiu. A pergunta volta quando ele voltar." = "The prompter left. The question comes back when it returns.";
+"O roteiro do prompter mudou. Confira de novo." = "The prompter's script changed. Check again.";
+"Roteiros guardados" = "Saved scripts";
+"Nenhum roteiro guardado." = "No saved scripts.";
+"Ver" = "View";
+"Usar este" = "Use this one";
+"Apagar" = "Delete";
+"Usar este roteiro?" = "Use this script?";
+"Ele substitui o roteiro atual, também no prompter conectado." = "It replaces the current script, also on the connected prompter.";
+"Usar" = "Use";
+"Apagar este roteiro guardado?" = "Delete this saved script?";
+"1 palavra" = "1 word";
+"%@ palavras" = "%@ words";
+"Do prompter %@" = "From the prompter %@";
+"Deste aparelho, antes de %@" = "From this device, before %@";
+
+/* QuallTeleprompterKit/SegurarParaRolar.swift */
+"Rolar para cima" = "Scroll up";
+"Rolar para baixo" = "Scroll down";
+"volta o texto" = "moves the text back";
+"avança o texto" = "moves the text forward";
+"O texto parou. Solte e aperte de novo." = "The text stopped. Release and press again.";
+"O texto chegou ao fim." = "The text reached the end.";
+
+/* R9b: o controle remoto da câmera (docs/controle-remoto-da-camera.md) */
+"Permitir controle remoto da câmera" = "Allow remote camera control";
+"O aparelho não permite controle remoto da câmera" = "This device doesn't allow remote camera control";
+"Quem recebe esta câmera (outro aparelho com o Quall Studio, ou o OBS) pode mudar estes ajustes. Vence quem mexer por último." = "Whoever receives this camera (another device with Quall Studio, or OBS) can change these settings. The last change wins.";
+"O aparelho que filma não oferece os ajustes da câmera agora." = "The filming device isn't offering camera settings right now.";
+"O aparelho não conseguiu aplicar o ajuste." = "The device couldn't apply the setting.";
+"O aparelho não respondeu." = "The device didn't respond.";
+"Este aparelho não aceitou %@." = "This device didn't accept %@.";
+"Este aparelho não aceitou o ajuste." = "This device didn't accept the setting.";
+"Este aparelho não oferece %@." = "This device doesn't offer %@.";
+"O fabricante deste aparelho não libera %@ para outros apps." = "This device's manufacturer doesn't make %@ available to other apps.";
+"O iOS ajusta a cintilação sozinho." = "iOS handles flicker on its own.";
+"Esta câmera não publica a calibração de cor que o Kelvin precisa." = "This camera doesn't publish the color calibration Kelvin needs.";
+"Outro app está controlando esta câmera. Feche-o para ajustar." = "Another app is controlling this camera. Close it to adjust.";
+"Destrave a exposição para compensar." = "Unlock exposure to compensate.";
+"Passar para Manual" = "Switch to Manual";
+"Ganho e obturador" = "Gain & shutter";
+"Brilho" = "Brightness";
+"Ganho" = "Gain";
+"Obturador" = "Shutter";
+"ganho digital" = "digital gain";
+"Perto ↔ Longe" = "Near ↔ Far";
+"A câmera usou %@ em vez de %@." = "The camera used %@ instead of %@.";
+/* Traduções exclusivas do monitor virtual; fora dos recursos da primeira release. */
+"Fixada em %@ pelo argumento --tela-estendida desta abertura." = "Fixed at %@ by this launch's --tela-estendida argument.";
+"A tela inteira do aparelho como espaço de trabalho, na resolução dela — a letra fica pequena." = "The whole device screen as workspace, at its own resolution — text gets small.";
+"Escala da tela estendida" = "Extended display scale";
+"60 fps na tela estendida" = "60 fps on the extended display";
+"Mais fluido, e o dobro de dados. Aparelho que não decodifica rápido o bastante mostra a imagem quebrando — aí volte para 30." = "Smoother, and twice the data. A device that can't decode fast enough shows a broken picture — then go back to 30.";
+"Quall — tela estendida" = "Quall — extended display";
+"Tela estendida" = "Extended display";
+"Um monitor novo para cada aparelho" = "A new display for each device";
+"novo monitor · " = "new display · ";
+"Uma tela, a tela estendida ou uma câmera. Quem exibe escolhe este Mac na lista." = "A screen, the extended display or a camera. The receiving device picks this Mac in its list.";
+"Tela estendida: esperando um aparelho" = "Extended display: waiting for a device";
+"Tela estendida: %@" = "Extended display: %@";
+"novo monitor · %@ · %@ fps" = "new display · %@ · %@ fps";
+"Este macOS não tem a API de monitor virtual (CGVirtualDisplay)." = "This macOS doesn't have the virtual display API (CGVirtualDisplay).";
+"O macOS recusou criar o monitor virtual: %@" = "macOS refused to create the virtual display: %@";
+"O monitor virtual foi criado mas não ficou online em %@ ms." = "The virtual display was created but didn't come online within %@ ms.";
+"O monitor virtual ficou online mas não ganhou modo de exibição em %@ ms." = "The virtual display came online but got no display mode within %@ ms.";
+"O monitor virtual não oferece o modo %@. Oferecidos: %@" = "The virtual display doesn't offer mode %@. Offered: %@";
+"Não consegui fixar o modo do monitor virtual (%@, CGError %@)." = "Couldn't set the virtual display's mode (%@, CGError %@).";
+"O monitor virtual ficou em %@, e não em %@." = "The virtual display ended up at %@, not %@.";
+"O auxiliar %@ não está ao lado do app." = "The helper %@ isn't next to the app.";
+"O auxiliar do monitor virtual não subiu: %@" = "The virtual display helper didn't start: %@";
+"O auxiliar do monitor virtual respondeu algo ilegível: %@" = "The virtual display helper replied with something unreadable: %@";
+"Letra do tamanho da do Mac. Se a tela do aparelho tem menos de 1060 pixels de altura, o macOS não aceita 2x nela: o monitor é desenhado maior e reduzido para a tela, sem sair 1:1." = "Text the same size as on the Mac. If the device screen is under 1060 pixels tall, macOS won't accept 2x on it: the display is drawn larger and scaled down to the screen, not 1:1.";
