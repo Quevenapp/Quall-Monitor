@@ -10,7 +10,9 @@
 - A diferença de diagnóstico de concorrência do Swift no runner arm64 da CI foi corrigida com armazenamento do resultado assíncrono protegido por trava. Build Release e os 47 testes locais passaram após a correção.
 - Windows: **553 testes passaram** no runner Windows, executável GUI x64 e MSI compilados. A inspeção somente leitura conferiu as nove cargas do cabinet, hashes, ações elevadas do driver, diálogo de consentimento e revisão `8f9f1f58f9a9391db6c40b478594f09d247d9995`, com `Dirty: False`. Os recursos PE foram conferidos externamente: Quall Monitor, versão 0.1.0. O MSI e o executável da prévia estão sem Authenticode.
 - Snapshot público: avisos de licença presentes e SHA-256 dos quatro payloads SudoVDA conferidos.
-- Página `/quall-monitor/`: verificada no navegador local; `index.html` e `downloads.json` com lista de arquivos vazia foram enviados por WebFTP para `public_html/quall-monitor/`, incluindo o requisito do Quall Studio instalado no receptor. O upload dos binários pelo WebFTP falhou, e a abertura HTTPS apresentou timeout nesta rede. Os downloads de produto permanecem “Em preparação”, sem downloads ativos.
+- Página `/quall-monitor/`: verificada no navegador local; `index.html` enviado por WebFTP para `public_html/quall-monitor/`, com o requisito do Quall Studio instalado no receptor e o aviso de ausência de Authenticode no Windows.
+- Publicação por SFTP: após a falha do upload dos binários pelo WebFTP, os três pacotes foram enviados para `/public_html/quall-monitor/downloads/`. O manifesto final `downloads.json` foi enviado por SFTP com confirmação de envio concluído; os links de download estão configurados.
+- Integridade na hospedagem: os três binários foram baixados de volta por SFTP para `dist/hosted-check/`, e seus SHA-256 coincidiram com `dist/site/quall-monitor/downloads.json`. A página e o manifesto baixados de volta são iguais, byte a byte, à preparação; os três botões foram conferidos no navegador usando essa preparação. O acesso HTTP público aos downloads ainda não foi confirmado; a tentativa HTTPS após a publicação apresentou timeout nesta rede.
 
 ## Validação nativa e limites
 

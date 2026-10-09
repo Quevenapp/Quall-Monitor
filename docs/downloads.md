@@ -6,13 +6,15 @@ A frente do site deve oferecer os pacotes macOS e Windows com versão, arquitetu
 
 Um build de validação não deve ser apresentado como release assinada. A prévia Windows 0.1.0 pode ser oferecida com o estado de assinatura informado: o MSI da CI não tem Authenticode do aplicativo. Para uma versão estável, assinar o instalador e validar instalação, remoção e tela estendida em aparelhos físicos. Para a entrega pública do Mac, usar Developer ID e notarizar o pacote. A compilação local e a CI não importam chaves privadas para o repositório.
 
-A publicação da página e a transferência dos pacotes para a hospedagem do site são uma etapa separada. Nenhuma URL de download é declarada ativa por este documento.
+A publicação da página e a transferência dos pacotes para a hospedagem do site são uma etapa separada. A disponibilidade das URLs de download por HTTP público ainda não foi confirmada.
 
 ## Estado em 09/10/2026
 
 O [Build 37938552250](https://github.com/Quevenapp/Quall-Monitor/actions/runs/37938552250) passou nos quatro jobs. Foram preparados três pacotes 0.1.0 da revisão `8f9f1f58f9a9391db6c40b478594f09d247d9995`: Mac Apple Silicon (arm64), Mac Intel (x64) e Windows x64 (MSI). Os dois pacotes Mac estão assinados, com notarização `Accepted`, tickets anexados e validados, e aceitação pelo Gatekeeper. O MSI e o executável Windows estão sem Authenticode; a distribuição Windows está preparada como prévia. Os testes de tela estendida em aparelhos físicos permanecem pendentes.
 
-O `index.html` e o `downloads.json` com lista de arquivos vazia foram enviados por WebFTP. A página informa o requisito de **Quall Studio instalado no receptor** e mantém os downloads “Em preparação”. O upload dos binários pelo WebFTP falhou, e o acesso HTTPS apresentou timeout nesta rede. Os downloads de produto ainda não estão ativos.
+O `index.html`, com o requisito de **Quall Studio instalado no receptor** e o aviso de ausência de Authenticode no Windows, foi enviado por WebFTP. Após a falha do upload dos binários pelo WebFTP, os três pacotes foram publicados por SFTP em `/public_html/quall-monitor/downloads/`, e o manifesto final `downloads.json` foi enviado por SFTP com confirmação de envio concluído. Os links de download estão configurados no manifesto.
+
+Os três binários foram baixados de volta por SFTP para `dist/hosted-check/`; seus SHA-256 coincidiram com os valores de `dist/site/quall-monitor/downloads.json`. O `index.html` e o manifesto também foram baixados de volta e são iguais, byte a byte, à preparação. Essa conferência valida os arquivos armazenados na hospedagem. O acesso HTTP público aos downloads ainda não foi confirmado; a tentativa HTTPS após a publicação apresentou timeout nesta rede.
 
 ## Página própria
 
