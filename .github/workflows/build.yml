@@ -15,7 +15,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  QUALL_MONITOR_VERSAO: 0.1.1
+  QUALL_MONITOR_VERSAO: 0.2.0
   QUALL_MONITOR_BUILD: 2
 
 jobs:
@@ -95,8 +95,8 @@ jobs:
       - name: Build app and MSI
         shell: pwsh
         run: |
-          ./apps/windows/scripts/instalador/construir-msi.ps1 -Versao 0.1.1 -Idioma pt-BR -Destino "$pwd/dist/windows"
-          ./apps/windows/scripts/instalador/construir-msi.ps1 -Versao 0.1.1 -Idioma en-US -SoEmpacotar -Destino "$pwd/dist/windows"
+          ./apps/windows/scripts/instalador/construir-msi.ps1 -Versao 0.2.0 -Idioma pt-BR -Destino "$pwd/dist/windows"
+          ./apps/windows/scripts/instalador/construir-msi.ps1 -Versao 0.2.0 -Idioma en-US -SoEmpacotar -Destino "$pwd/dist/windows"
       - name: Verify source notices
         run: python tools/verify-distribution.py
       - uses: actions/upload-artifact@v4

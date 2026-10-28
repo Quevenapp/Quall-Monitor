@@ -9,8 +9,8 @@ APP="$OUT/Quall Monitor.app"
 JOBS="${QUALL_MONITOR_JOBS:-2}"
 ARCHITECTURES="${QUALL_MONITOR_ARQUITETURAS:-host}"
 IDENTITY="${QUALL_MONITOR_IDENTIDADE:--}"
-VERSION="${QUALL_MONITOR_VERSAO:-0.1.1}"
-BUILD="${QUALL_MONITOR_BUILD:-2}"
+VERSION="${QUALL_MONITOR_VERSAO:-0.2.0}"
+BUILD="${QUALL_MONITOR_BUILD:-3}"
 case "$ARCHITECTURES" in host|universal) ;; *) echo "QUALL_MONITOR_ARQUITETURAS deve ser host ou universal" >&2; exit 1 ;; esac
 
 # Never ship an override from another repository. Explicit ready mode only reuses this repo's

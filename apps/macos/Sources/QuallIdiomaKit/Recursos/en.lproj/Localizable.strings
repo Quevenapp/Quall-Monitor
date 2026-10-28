@@ -706,3 +706,45 @@
 "O pareamento não terminou. Inicie novamente para gerar outro PIN." = "Pairing did not finish. Start again to generate another PIN.";
 
 "Não foi possível confirmar a saída de %@ monitor(es). Suas vagas permanecem reservadas nesta execução do app." = "Could not confirm the removal of %@ display(s). Their slots remain reserved for this app session.";
+
+/* 0.2.0: pairing by 4-digit code, saved sessions and QR (from Quall Studio v3 strings) */
+"A conexão pelo QR não fechou (%@). Leia o QR novo." = "The QR connection didn't complete (%@). Scan the new QR.";
+"Algo está interferindo na conexão com este aparelho. Use o PIN." = "Something is interfering with the connection to this device. Use the PIN.";
+"Conectando a %@…" = "Connecting to %@…";
+"Esse não era o número do outro aparelho. O código ficou desligado nesta espera; o PIN continua valendo." = "That wasn't the other device's number. The code is now off for this wait; the PIN still works.";
+"Este Mac está na rede %@." = "This Mac is on the network %@.";
+"Este Mac não está numa rede local. Ligue o Wi-Fi ou o cabo na mesma rede do outro aparelho." = "This Mac is not on a local network. Turn on Wi-Fi or plug the cable into the same network as the other device.";
+"Este Mac ou o celular ainda guarda um pareamento antigo com o outro, e o QR não o substitui. Conecte pela lista, ou esqueça o pareamento no aparelho que ainda o guarda e leia o QR novo." = "This Mac or the phone still keeps an old pairing with the other, and the QR doesn't replace it. Connect from the list, or forget the pairing on the device that still keeps it and scan the new QR.";
+"Este aparelho não aceita o código. Digite o PIN que aparece na tela dele." = "This device doesn't accept the code. Enter the PIN shown on its screen.";
+"Já há um pareamento com %@ (neste Mac ou no outro aparelho), e o código ou o QR não o substitui. Toque em Esquecer este aparelho para tirá-lo deste Mac, ou use o PIN." = "There is already a pairing with %@ (on this Mac or on the other device), and the code or the QR does not replace it. Tap Forget this device to remove it from this Mac, or use the PIN.";
+"Nenhum destes" = "None of these";
+"Ninguém respondeu na rede. Redes de convidados e roteadores com isolamento escondem os aparelhos uns dos outros." = "Nobody answered on the network. Guest networks and routers with isolation hide devices from each other.";
+"O QR expirou. Gerando outro…" = "The QR expired. Making a new one…";
+"O aparelho salvo estava noutra rede. Os dois precisam estar na mesma rede (o 2,4 GHz e o 5 GHz do roteador às vezes são redes separadas)." = "The saved device was on another network. Both need to be on the same network (a router's 2.4 GHz and 5 GHz are sometimes separate networks).";
+"O celular chamou, mas este Mac não o alcançou na rede." = "The phone called, but this Mac couldn't reach it on the network.";
+"O celular leu o QR, mas a conexão não fechou. Leia o QR novo." = "The phone read the QR, but the connection didn't complete. Scan the new QR.";
+"O código expirou sem confirmação." = "The code expired without confirmation.";
+"O outro aparelho não reconheceu este pareamento. Para parear de novo, toque em Esquecer este aparelho, ou digite o PIN." = "The other device didn't recognize this pairing. To pair again, tap Forget this device, or enter the PIN.";
+"O outro aparelho recusou o código, ou desistiu." = "The other device declined the code, or gave up.";
+"O pareamento anterior não vale mais. Confirme o código para parear de novo." = "The previous pairing is no longer valid. Confirm the code to pair again.";
+"Os códigos não conferiram. Tente de novo; se repetir, alguém pode estar no meio da rede." = "The codes did not match. Try again; if it happens again, someone may be in the middle of the network.";
+"Por perto" = "Nearby";
+"Procurar de novo" = "Search again";
+"Quem atendeu não é o celular que leu o QR. Leia o QR novo." = "Whoever answered is not the phone that read the QR. Scan the new QR.";
+"Recusar" = "Decline";
+"Um dos dois aparelhos ainda guarda um pareamento antigo com o outro, e o código não o substitui. Esqueça o pareamento no aparelho que ainda o guarda, ou use o PIN." = "One of the two devices still keeps an old pairing with the other, and the code doesn't replace it. Forget the pairing on the device that still keeps it, or use the PIN.";
+"Um firewall pode estar barrando a busca. Permita o Quall nas redes privadas e públicas." = "A firewall may be blocking the search. Allow Quall on private and public networks.";
+"Vale por mais %@" = "Valid for %@ more";
+"Você recusou o código." = "You declined the code.";
+"pareado" = "paired";
+"pareado · %@" = "paired · %@";
+"visto há %@ s" = "seen %@ s ago";
+"%@ quer conectar. Toque no número que aparece na tela dele." = "%@ wants to connect. Tap the number shown on its screen.";
+"Abra o Quall Studio no celular ou tablet e leia este QR. A tela dele aparece aqui quando ele confirmar." = "Open Quall Studio on the phone or tablet and scan this QR code. Its screen appears here once it confirms.";
+"Conectados antes" = "Connected before";
+"O aparelho salvo não respondeu. Confira se ele está em Estender tela na mesma rede." = "The saved device did not respond. Check that it is in Extend display on the same network.";
+"Outro aparelho" = "Another device";
+"Procurando aparelhos em Estender tela na rede local…" = "Looking for devices in Extend display on the local network…";
+"Sem digitar: no outro aparelho, toque neste Mac na lista e confira o código de 4 dígitos." = "No typing: on the other device, tap this Mac in the list and check the 4-digit code.";
+"Toque neste número no outro aparelho:" = "Tap this number on the other device:";
+"Não consegui criar o QR. Tente novamente." = "Couldn't create the QR code. Try again.";

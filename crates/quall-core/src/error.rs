@@ -86,6 +86,16 @@ pub enum Error {
     /// uma queda, enquanto o prompter solta a sessão velha. Separado de [`Error::Signaling`] porque
     /// o conselho é outro: não é endereço errado, é "espere e tente de novo".
     Ocupado(String),
+    /// **Algo está interferindo na conexão com este aparelho** (`docs/v3-no-privado.md` §3.4, A1):
+    /// pernas do código que caíram depois do nonce e antes do código, três por alvo em 10 min. O
+    /// conselho é usar o PIN.
+    Interferencia(String),
+    /// **O outro aparelho não reconheceu este pareamento** (§3.5, A2): há vínculo v3 com ele aqui e
+    /// a dica dele não veio. Falha fechado; a casca oferece "Esquecer este aparelho" (ou o PIN).
+    ParNaoReconhecido(String),
+    /// **Já há um pareamento com este aparelho** (§3.5 e §8.2, B2): o código e o QR não substituem
+    /// um vínculo que existe. A casca oferece "Esquecer" (ou o PIN, que substitui).
+    JaPareado(String),
 }
 
 impl fmt::Display for Error {
@@ -110,6 +120,10 @@ impl fmt::Display for Error {
             Error::Cancelled => write!(f, "a espera foi cancelada"),
             Error::Io(m) => write!(f, "e/s: {m}"),
             Error::Ocupado(m) => write!(f, "ocupado: {m}"),
+            // Os três com o prefixo `pareamento:`, como os outros de pareamento.
+            Error::Interferencia(m) => write!(f, "pareamento: {m}"),
+            Error::ParNaoReconhecido(m) => write!(f, "pareamento: {m}"),
+            Error::JaPareado(m) => write!(f, "pareamento: {m}"),
         }
     }
 }
@@ -163,6 +177,20 @@ pub(crate) fn hex_decode<const N: usize>(texto: &str) -> Result<[u8; N]> {
     Ok(saida)
 }
 
+/// Decodifica hex de tamanho variável, até `teto` dígitos, **por bytes**: um caractere de mais de um
+/// byte é só um dígito inválido, nunca um corte no meio de um caractere (revisão do QR, A1). Ao
+/// contrário de `u8::from_str_radix`, não aceita sinal (`+f`).
+pub(crate) fn hex_decode_vec(texto: &str, teto: usize) -> Result<Vec<u8>> {
+    let bytes = texto.as_bytes();
+    if bytes.len() % 2 != 0 || bytes.len() > teto {
+        return Err(Error::Invalid(format!("hex de {} dígitos", bytes.len())));
+    }
+    bytes
+        .chunks_exact(2)
+        .map(|par| Ok((digito(par[0])? << 4) | digito(par[1])?))
+        .collect()
+}
+
 fn digito(c: u8) -> Result<u8> {
     match c {
         b'0'..=b'9' => Ok(c - b'0'),
@@ -191,6 +219,15 @@ mod tests {
     fn hex_de_tamanho_errado_e_erro() {
         assert!(hex_decode::<4>("000fa5").is_err());
         assert!(hex_decode::<4>("000fa5ffff").is_err());
+    }
+
+    #[test]
+    fn hex_variavel_por_bytes_sem_panico_e_sem_sinal() {
+        assert_eq!(hex_decode_vec("00ff", 8).unwrap(), vec![0, 255]);
+        for ruim in ["aéa", "é", "+f", "0", "zz", "-1", "0g"] {
+            assert!(hex_decode_vec(ruim, 8).is_err(), "{ruim}");
+        }
+        assert!(hex_decode_vec("00000000", 4).is_err(), "acima do teto");
     }
 
     #[test]

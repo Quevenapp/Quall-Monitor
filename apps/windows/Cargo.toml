@@ -5,7 +5,7 @@
 
 [package]
 name = "quall-monitor-windows"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MPL-2.0"
@@ -46,6 +46,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 crossbeam-channel = "0.5"
+# **O QR do computador no Exibir** (`docs/conexao.md` §10, `src/qr_na_tela.rs`): só a matriz. Sem a
+# feature padrão `image` (puxaria o crate `image` e codecs): o desenho é nosso, pelo Direct2D. Rust puro,
+# sem dependência nenhuma, MIT OR Apache-2.0. A mesma versão do Quall Studio.
+qrcode = { version = "0.14", default-features = false }
 # Só usado pela sonda de recepção (`quall-receiver-probe`), para não ter que definir um tipo de
 # erro próprio numa sonda de bancada — os erros aqui só precisam chegar legíveis no stderr.
 anyhow = "1"

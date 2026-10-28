@@ -68,7 +68,7 @@ pub fn announcement_to_txt(anuncio: &Announcement, porta: u16) -> Result<Vec<(St
     announcement_to_txt_with_token(anuncio, porta, &discovery_token()?)
 }
 
-fn announcement_to_txt_with_token(
+pub(crate) fn announcement_to_txt_with_token(
     anuncio: &Announcement,
     porta: u16,
     token: &str,
@@ -147,6 +147,79 @@ pub fn announcement_from_txt(props: &HashMap<String, String>) -> Result<(Announc
     ))
 }
 
+// =============================================================================================
+// O nome anunciado (`docs/v3-no-privado.md` §8.7, a P3 revista)
+// =============================================================================================
+
+/// O teto do nome anunciado, em bytes UTF-8, depois do saneamento.
+pub const TETO_DO_NOME_ANUNCIADO: usize = 40;
+
+/// A chave do nome anunciado, no TXT do mDNS **e** no datagrama UDP. **Não é `n`**: o leitor v3 das
+/// lojas recusa o anúncio inteiro que traga `n` ou `id` ([`announcement_from_txt`]) e ignora chave
+/// desconhecida — `nm` passa por ele como `cc` passou.
+pub const CHAVE_DO_NOME: &str = "nm";
+
+/// Os caracteres de formatação invisíveis que o nome anunciado não leva — a mesma lista do nome no
+/// cartão do código (`pairing::de_formatacao`): direção do texto (U+202A–U+202E, U+2066–U+2069…),
+/// largura zero (U+200B–U+200F, U+2060, U+FEFF…). Com eles, um nome forjado se faria passar por
+/// outro na tela sem mudar letra visível nenhuma.
+fn e_formatacao_invisivel(c: char) -> bool {
+    crate::pairing::de_formatacao(c)
+}
+
+/// **O nome anunciado, saneado** — o mesmo nos dois lados: quem anuncia saneia antes de mandar, quem
+/// lê saneia de novo na chegada (`docs/v3-no-privado.md` §8.7). Sem caracteres de controle (quebras
+/// inclusive) nem de formatação invisível; espaços em sequência viram um; aparado nas pontas e
+/// cortado em [`TETO_DO_NOME_ANUNCIADO`] bytes sem partir caractere. `None` se não sobrou nada.
+pub fn sanear_nome_anunciado(nome: &str) -> Option<String> {
+    let mut limpo = String::with_capacity(TETO_DO_NOME_ANUNCIADO);
+    let mut espaco_pendente = false;
+    for c in nome.chars() {
+        if e_formatacao_invisivel(c) {
+            continue;
+        }
+        // Controle vira separador: uma quebra de linha entre duas palavras não as cola.
+        if c.is_control() || c.is_whitespace() {
+            espaco_pendente = true;
+            continue;
+        }
+        let espaco = usize::from(espaco_pendente && !limpo.is_empty());
+        if limpo.len() + espaco + c.len_utf8() > TETO_DO_NOME_ANUNCIADO {
+            break;
+        }
+        if espaco == 1 {
+            limpo.push(' ');
+        }
+        espaco_pendente = false;
+        limpo.push(c);
+    }
+    (!limpo.is_empty()).then_some(limpo)
+}
+
+/// O nome que os anúncios deste processo levam. Ver [`definir_nome_anunciado`].
+static NOME_ANUNCIADO: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// **Define o nome que os anúncios deste processo levam** (chave [`CHAVE_DO_NOME`]), saneado.
+/// `None`, ou um nome que o saneamento esvazia, apaga: os anúncios saem sem nome, e a lista dos
+/// outros mostra o alias. Vale para todo anúncio que **começa** depois; o que já está no ar segue com
+/// o nome com que começou. Devolve o nome que ficou.
+pub fn definir_nome_anunciado(nome: Option<&str>) -> Option<String> {
+    let limpo = nome.and_then(sanear_nome_anunciado);
+    let mut g = NOME_ANUNCIADO.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    g.clone_from(&limpo);
+    limpo
+}
+
+/// O nome que o próximo anúncio deste processo vai levar, se houver.
+pub fn nome_anunciado() -> Option<String> {
+    NOME_ANUNCIADO.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+}
+
+/// O nome anunciado de um TXT (ou de um datagrama, que usa as mesmas chaves), saneado na chegada.
+pub fn nome_anunciado_do_txt(props: &HashMap<String, String>) -> Option<String> {
+    props.get(CHAVE_DO_NOME).and_then(|n| sanear_nome_anunciado(n))
+}
+
 /// Um aparelho visto na rede.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveredDevice {
@@ -158,6 +231,9 @@ pub struct DiscoveredDevice {
     pub signaling_port: u16,
     /// Nome completo da instância mDNS, usado para casar o evento de remoção.
     pub fullname: String,
+    /// O nome que o aparelho anuncia (chave [`CHAVE_DO_NOME`]), já saneado. **Não autentica nada**
+    /// (`docs/v3-no-privado.md` §8.7): a lista o mostra com o alias embaixo.
+    pub nome_anunciado: Option<String>,
 }
 
 impl DiscoveredDevice {
@@ -285,18 +361,36 @@ pub struct Advertiser {
     daemon: Option<ServiceDaemon>,
     fullname: String,
     discovery_label: String,
+    /// O mesmo anúncio pela UDP (`docs/conexao.md` §2), com **o mesmo token** do mDNS: responde
+    /// perguntas e se anuncia por broadcast. Sai junto com o mDNS em [`Advertiser::stop`] e no `Drop`.
+    _udp: Option<crate::busca::Respondedor>,
 }
 
 impl Advertiser {
     /// Começa a anunciar. `porta` é a porta TCP em que o servidor de sinalização já está ouvindo.
+    ///
+    /// Anuncia pelos **dois** caminhos: mDNS e UDP ([`crate::busca`]), com o mesmo token efêmero.
     pub fn start(anuncio: &Announcement, porta: u16) -> Result<Self> {
-        let daemon = ServiceDaemon::new()
-            .map_err(|e| Error::Discovery(format!("não subiu o daemon mDNS: {e}")))?;
+        Self::start_com_codigo(anuncio, porta, false)
+    }
 
+    /// [`Advertiser::start`], dizendo na lista (TXT e UDP, chave `cc`) se este aparelho **aceita a
+    /// confirmação por código** — verdade quando a casca hospeda com `hospedar_com_codigo`
+    /// (`docs/v3-no-privado.md` §3.8). O leitor v3 das lojas ignora a chave; ela só serve à
+    /// interface ("conecta sem PIN"), a correção não depende dela.
+    pub fn start_com_codigo(anuncio: &Announcement, porta: u16, aceita_codigo: bool) -> Result<Self> {
         let token = discovery_token()?;
         let instancia = nome_da_instancia(&token)?;
         let host = format!("quall-{token}.local.");
-        let props = announcement_to_txt_with_token(anuncio, porta, &token)?;
+        let mut props = announcement_to_txt_with_token(anuncio, porta, &token)?;
+        if aceita_codigo {
+            props.push((crate::busca::CHAVE_ACEITA_CODIGO.into(), "1".into()));
+        }
+        // Lido uma vez: o mDNS e a UDP deste token dizem o mesmo nome até o fim (§8.7).
+        let nome = nome_anunciado();
+        if let Some(nome) = &nome {
+            props.push((CHAVE_DO_NOME.into(), nome.clone()));
+        }
         let info = ServiceInfo::new(
             &service_type_domain(),
             &instancia,
@@ -311,14 +405,30 @@ impl Advertiser {
         .enable_addr_auto();
 
         let fullname = info.get_fullname().to_string();
-        daemon
-            .register(info)
-            .map_err(|e| Error::Discovery(format!("não registrou o serviço: {e}")))?;
+        // Os testes da fronteira C pedem só o laço local (`busca::so_o_laco_local`): nada vai ao
+        // mDNS de verdade, e o anúncio UDP abre em `127.0.0.1`.
+        let daemon = if crate::busca::laco_local_pedido() {
+            None
+        } else {
+            let daemon = ServiceDaemon::new()
+                .map_err(|e| Error::Discovery(format!("não subiu o daemon mDNS: {e}")))?;
+            daemon
+                .register(info)
+                .map_err(|e| Error::Discovery(format!("não registrou o serviço: {e}")))?;
+            Some(daemon)
+        };
 
         Ok(Advertiser {
-            daemon: Some(daemon),
+            daemon,
             fullname,
             discovery_label: format!("Quall {}", &token[..8]),
+            _udp: Some(crate::busca::Respondedor::iniciar_com_token_e_nome(
+                anuncio,
+                porta,
+                aceita_codigo,
+                &token,
+                nome,
+            )),
         })
     }
 
@@ -342,6 +452,8 @@ impl Advertiser {
 
     /// O corpo de [`Advertiser::stop`], que o `Drop` também usa. Idempotente.
     fn parar(&mut self) -> Result<()> {
+        // O anúncio UDP sai primeiro: ele não tem despedida, só para de responder.
+        self._udp = None;
         let Some(daemon) = self.daemon.take() else {
             return Ok(());
         };
@@ -393,6 +505,13 @@ impl Browser {
     /// não um erro. Anúncios de versão incompatível são descartados aqui: quem chama não deveria
     /// precisar saber que existem.
     pub fn next_event(&self, limite: Duration) -> Result<Option<DiscoveryEvent>> {
+        Ok(self.next_event_com_codigo(limite)?.map(|(evento, _)| evento))
+    }
+
+    /// Igual a [`Browser::next_event`], dizendo também se o aparelho achado **aceita a
+    /// confirmação por código** (a chave TXT [`crate::busca::CHAVE_ACEITA_CODIGO`]). Num `Lost`, o
+    /// segundo valor é `false` e não quer dizer nada.
+    pub fn next_event_com_codigo(&self, limite: Duration) -> Result<Option<(DiscoveryEvent, bool)>> {
         let prazo = Instant::now() + limite;
         loop {
             let restante = prazo.saturating_duration_since(Instant::now());
@@ -410,15 +529,22 @@ impl Browser {
                     }
                     let addresses =
                         ordenar_enderecos_com_escopo(servico.addresses.iter().cloned().collect());
-                    return Ok(Some(DiscoveryEvent::Found(Box::new(DiscoveredDevice {
-                        announcement: anuncio,
-                        addresses,
-                        signaling_port: porta,
-                        fullname: servico.fullname.clone(),
-                    }))));
+                    let aceita_codigo = props
+                        .get(crate::busca::CHAVE_ACEITA_CODIGO)
+                        .is_some_and(|v| v == "1");
+                    return Ok(Some((
+                        DiscoveryEvent::Found(Box::new(DiscoveredDevice {
+                            announcement: anuncio,
+                            addresses,
+                            signaling_port: porta,
+                            fullname: servico.fullname.clone(),
+                            nome_anunciado: nome_anunciado_do_txt(&props),
+                        })),
+                        aceita_codigo,
+                    )));
                 }
                 Ok(ServiceEvent::ServiceRemoved(_, fullname)) => {
-                    return Ok(Some(DiscoveryEvent::Lost(fullname)));
+                    return Ok(Some((DiscoveryEvent::Lost(fullname), false)));
                 }
                 // SearchStarted/ServiceFound/SearchStopped não interessam a quem chama.
                 Ok(_) => continue,
@@ -1274,6 +1400,7 @@ mod tests {
             ),
             signaling_port: 7877,
             fullname: "x._quall._tcp.local.".into(),
+            nome_anunciado: None,
         }
     }
 
@@ -1451,6 +1578,68 @@ mod tests {
             assert!(announcement_from_txt(&props).is_err(), "{field}");
         }
         assert!(nome_da_instancia("nome pessoal").is_err());
+    }
+
+    /// §8.7: controle, quebras, invisíveis e espaços em sequência saem; o corte é em 40 bytes sem
+    /// partir caractere; o que sobra vazio é "sem nome".
+    #[test]
+    fn o_nome_anunciado_e_saneado_e_cortado() {
+        assert_eq!(sanear_nome_anunciado("  iPhone   7 \n").as_deref(), Some("iPhone 7"));
+        assert_eq!(
+            sanear_nome_anunciado("Mac\nBook\r\tdo\u{0}Pessoa").as_deref(),
+            Some("Mac Book do Pessoa")
+        );
+        assert_eq!(sanear_nome_anunciado("S\u{202E}42\u{200B}S").as_deref(), Some("S42S"));
+        assert_eq!(sanear_nome_anunciado("\u{FEFF} \n\t"), None);
+        assert_eq!(sanear_nome_anunciado(""), None);
+        // 40 bytes: 20 "ã" (2 bytes cada) cabem, o 21º não; o corte nunca parte um caractere.
+        assert_eq!(sanear_nome_anunciado(&"ã".repeat(30)), Some("ã".repeat(20)));
+        let impar = sanear_nome_anunciado(&format!("a{}", "ã".repeat(30))).unwrap_or_default();
+        assert_eq!(impar.len(), 39);
+        // Um espaço que cairia no fim do corte não fica pendurado.
+        let a39 = "a".repeat(39);
+        assert_eq!(sanear_nome_anunciado(&format!("{a39} b")), Some(a39));
+        // Saneado duas vezes é o mesmo (quem lê saneia de novo).
+        let uma = sanear_nome_anunciado(" Câmera\u{2066} 2 ").unwrap_or_default();
+        assert_eq!(uma, "Câmera 2");
+        assert_eq!(sanear_nome_anunciado(&uma), Some(uma));
+    }
+
+    /// §8.7: o nome vai na chave `nm`, lida saneada; sem `nm`, o item fica com o alias. O alias
+    /// (`display_name`) não muda com o nome.
+    #[test]
+    fn o_anuncio_leva_o_nome_e_volta_saneado() {
+        let mut props: HashMap<_, _> =
+            announcement_to_txt(&exemplo(), 7877).unwrap().into_iter().collect();
+        assert_eq!(nome_anunciado_do_txt(&props), None, "anúncio sem nome fica com o alias");
+        props.insert(CHAVE_DO_NOME.into(), "iPhone 7\u{202E}\nfalso".into());
+        let (lido, _) = announcement_from_txt(&props).expect("o anúncio com nome é lido");
+        assert!(lido.display_name.starts_with("Quall ") && lido.display_name.len() == 14);
+        assert_eq!(nome_anunciado_do_txt(&props).as_deref(), Some("iPhone 7 falso"));
+    }
+
+    /// §8.7: o leitor v3 das lojas (`e752ed61`, o mesmo `announcement_from_txt`) só recusa `id` e
+    /// `n`; a chave `nm` passa. A recusa de `n` continua.
+    #[test]
+    fn o_leitor_das_lojas_aceita_o_anuncio_com_nome() {
+        let mut props: HashMap<_, _> =
+            announcement_to_txt(&exemplo(), 7877).unwrap().into_iter().collect();
+        props.insert(CHAVE_DO_NOME.into(), "Câmera 2".into());
+        props.insert(crate::busca::CHAVE_ACEITA_CODIGO.into(), "1".into());
+        assert!(announcement_from_txt(&props).is_ok());
+        props.insert("n".into(), "Câmera 2".into());
+        assert!(announcement_from_txt(&props).is_err());
+    }
+
+    /// O nome do processo: definir saneia, apagar volta a `None`. Global: o teste deixa como achou.
+    #[test]
+    fn o_nome_do_processo_e_definido_saneado_e_apagado() {
+        let antes = nome_anunciado();
+        assert_eq!(definir_nome_anunciado(Some(" Estúdio\n B ")).as_deref(), Some("Estúdio B"));
+        assert_eq!(nome_anunciado().as_deref(), Some("Estúdio B"));
+        assert_eq!(definir_nome_anunciado(Some(" \t ")), None);
+        assert_eq!(nome_anunciado(), None);
+        definir_nome_anunciado(antes.as_deref());
     }
 
     #[test]

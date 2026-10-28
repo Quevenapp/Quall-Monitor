@@ -1,0 +1,23 @@
+--- a/providers/implementations/storemgmt/file_store.c
++++ b/providers/implementations/storemgmt/file_store.c
+@@ -197,6 +197,12 @@
+ 
+ static void *file_open(void *provctx, const char *uri)
+ {
++#if defined(OPENSSL_NO_STDIO) && defined(OPENSSL_NO_POSIX_IO)
++    /* The app uses in-memory keys and certificates only. Fail closed. */
++    (void)provctx;
++    (void)uri;
++    return NULL;
++#else
+     struct file_ctx_st *ctx = NULL;
+     struct stat st;
+     const char *path_data[2];
+@@ -272,6 +278,7 @@
+         BIO_free_all(bio);
+ 
+     return ctx;
++#endif
+ }
+ 
+ void *file_attach(void *provctx, OSSL_CORE_BIO *cin)

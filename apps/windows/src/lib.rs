@@ -179,6 +179,9 @@ pub mod audio;
 pub mod microfone;
 #[cfg(feature = "net")]
 pub mod descoberta;
+// A tabela de vizinhos do Windows para a sondagem da busca (`docs/v3-no-privado.md` §8.9).
+#[cfg(feature = "core")]
+pub mod vizinhos;
 #[cfg(feature = "net")]
 pub mod emissor;
 #[cfg(feature = "net")]
@@ -226,6 +229,13 @@ pub mod estilo;
 pub mod idioma;
 pub mod opcoes_do_monitor;
 pub mod modelo_da_janela;
+// **A conexão sem dor** (`docs/conexao.md`, `docs/v3-no-privado.md`): o cartão do código de 4
+// dígitos com a escolha entre três, a frase de quando ele não fecha e a sessão salva por identidade.
+// Sem Win32 (o modelo da janela o usa); o rótulo da linha da lista pede o núcleo (`core`).
+pub mod conexao;
+// **O QR do computador no Exibir** (`docs/conexao.md` §10): a matriz (crate `qrcode`), o desenho e as
+// frases. Sem rede e sem Win32; quem cria o convite e conecta é o `receptor.rs`.
+pub mod qr_na_tela;
 // **A tela estendida no produto** (R10, 02/10): o SudoVDA que a pessoa instalar, detectado e nunca
 // embutido. As regras (o ladrilho apagado, quem espelha) são puras, testadas em qualquer máquina.
 #[cfg(feature = "tela-estendida-futura")]

@@ -29,11 +29,12 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 use quall_core::cancel::Cancelamento;
+use quall_core::confirmacao::ConfirmacaoPorCodigo;
 use quall_core::discovery::anuncio;
 use quall_core::error::Error;
 use quall_core::pairing::{PairedPeers, Pin};
 use quall_core::protocol::Capabilities;
-use quall_core::session::{hospedar, EventoDeSessao, Ready, SessionConfig};
+use quall_core::session::{hospedar_com_codigo, EventoDeSessao, Ready, SessionConfig};
 use quall_core::signaling::SignalingServer;
 use quall_core::track::{AmostraDeAudio, QuadroCodificado, TrackConfig, TrackKind};
 use quall_core::transport::TransportConfig;
@@ -680,6 +681,9 @@ pub struct PedidoDaSessao {
     pub id: Id,
     pub servidor: SignalingServer,
     pub pin: Pin,
+    /// **O confirmador do código de 4 dígitos desta espera** (`docs/v3-no-privado.md` §3): o
+    /// coordenador o cria por PIN e a janela mostra os três números dele. O PIN continua valendo.
+    pub codigo: Option<ConfirmacaoPorCodigo>,
     pub com_audio: bool,
     /// D2: esta sessão é a dona do som. Escrito pelo coordenador (`Efeitos::dar_o_som`).
     pub toca_som: Arc<AtomicBool>,
@@ -727,6 +731,7 @@ fn correr_sessao_por_dentro(p: PedidoDaSessao, conectou: &AtomicBool) {
         id,
         servidor,
         pin,
+        codigo,
         com_audio,
         toca_som,
         argumentos,
@@ -790,7 +795,7 @@ fn correr_sessao_por_dentro(p: PedidoDaSessao, conectou: &AtomicBool) {
         audio_prometido,
     ));
 
-    let resultado = hospedar(
+    let resultado = hospedar_com_codigo(
         &servidor,
         SessionConfig {
             announcement: eu,
@@ -807,6 +812,7 @@ fn correr_sessao_por_dentro(p: PedidoDaSessao, conectou: &AtomicBool) {
             silencio_do_caminho: None,
             cancelamento,
         },
+        codigo,
     );
     // **O servidor sai assim que `hospedar` volta**, com par ou sem: um receptor com a porta velha
     // na memória não fica no backlog de uma porta que ninguém mais aceita, e a reabertura de uma
@@ -828,6 +834,8 @@ fn correr_sessao_por_dentro(p: PedidoDaSessao, conectou: &AtomicBool) {
     let mut novos = PairedPeers::new();
     novos.insert(&pronto.outcome);
     identidade::guardar_pares(&novos);
+    // O nome local do par (§5.4), da sessão autenticada: a lista do Exibir o mostra no item dele.
+    identidade::guardar_nome_do_par(&pronto.peer.device_id.0, &pronto.peer.display_name);
     let par = Par {
         nome: pronto.peer.display_name.clone(),
         device_id: pronto.peer.device_id.0.clone(),

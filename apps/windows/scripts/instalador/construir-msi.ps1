@@ -1,6 +1,6 @@
 # MPL-2.0. Build Quall Monitor x64 for direct distribution; no Store or virtual-camera package.
 param(
-    [ValidatePattern('^\d+\.\d+\.\d+$')][string]$Versao = '0.1.1',
+    [ValidatePattern('^\d+\.\d+\.\d+$')][string]$Versao = '0.2.0',
     [string]$Destino,
     [ValidateSet('pt-BR','en-US')][string]$Idioma = 'pt-BR',
     [switch]$SoEmpacotar

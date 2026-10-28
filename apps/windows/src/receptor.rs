@@ -39,12 +39,13 @@ use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use crate::idioma::{t, tf, tr};
 
 use quall_core::cancel::Cancelamento;
+use quall_core::confirmacao::ConfirmacaoPorCodigo;
 use quall_core::discovery::{anuncio, endereco_manual};
 use quall_core::error::Error;
 use quall_core::pairing::{PairedPeers, Pin};
-use quall_core::protocol::Capabilities;
+use quall_core::protocol::{Capabilities, DeviceId};
 use quall_core::rtp::Contadores;
-use quall_core::session::{conectar, EventoDeSessao, SessionConfig};
+use quall_core::session::{conectar_com_codigo, conectar_com_codigo_ao_alvo, EventoDeSessao, SessionConfig};
 use quall_core::signaling::RelatoDoEnlace;
 use quall_core::track::{QuadroCodificado, TrackReceptor};
 use quall_core::transport::TransportConfig;
@@ -52,6 +53,8 @@ use quall_core::transport::TransportConfig;
 use crate::argumentos::Argumentos;
 use crate::cadeia::Condenacao;
 use crate::camera_remota::ControleRemoto;
+use crate::conexao::{self, CaminhoDoExibir, CartaoDoCodigo, FaseDoCodigo, OrigemDoDestino, SessaoSalva};
+use crate::qr_na_tela::{FaseDoQr, QrNaTela};
 use crate::descoberta::{Aparelho, Busca};
 use crate::exibicao::{Exibicao, QuadroRecebido};
 use crate::identidade;
@@ -114,6 +117,17 @@ pub struct EstadoDoReceptor {
     /// **R9b**: o aparelho que filma respondeu ao controle remoto da câmera, com a câmera aberta
     /// (`pronto` ou `nao_permitido`): a janela mostra a engrenagem "Ajustes da câmera".
     pub camera_remota: bool,
+    /// **O cartão do código de 4 dígitos** (`docs/v3-no-privado.md` §3.6): o outro lado aceitou o
+    /// código, e este computador mostra o número certo para a pessoa achá-lo entre os três de lá.
+    /// Escrito por [`Receptor::olhar_o_codigo`].
+    pub codigo: Option<CartaoDoCodigo>,
+    /// **A2** (`docs/v3-no-privado.md` §3.5): a última conexão falhou fechado com um aparelho de que
+    /// este computador guarda vínculo — o id e o nome dele. A tela oferece "Esquecer este aparelho"
+    /// ([`Receptor::esquecer_este_aparelho`]); só depois disso (ou com o PIN) o código volta para ele.
+    pub esquecer_este: Option<(String, String)>,
+    /// **O QR do computador** (`docs/conexao.md` §10), para a coluna ao lado da lista. `None` com
+    /// `--so-local` (a bancada não abre escuta fora do laço local).
+    pub qr: Option<QrNaTela>,
 }
 
 impl EstadoDoReceptor {
@@ -320,6 +334,44 @@ pub struct Receptor {
     controle_do_som: Mutex<Option<Arc<ControleDoSom>>>,
     /// **R9b**: o controle da câmera de quem filma, nesta sessão (`camera_remota.rs`).
     camera_remota: Mutex<Option<Arc<ControleRemoto>>>,
+    /// **O confirmador do código da conexão em curso** (`docs/conexao.md` §4): só quando se conecta
+    /// sem PIN. O núcleo só o usa se não houver pareamento guardado e o outro lado aceitar o código.
+    confirmacao: Mutex<Option<ConfirmacaoPorCodigo>>,
+    /// **A sessão salva do Exibir** (`docs/conexao.md` §3), lida do disco ao abrir e trocada depois
+    /// de cada conexão autenticada.
+    sessao_salva: Mutex<Option<SessaoSalva>>,
+    /// Sobe quando a sessão salva muda: a lista (que a mostra quando a busca não a vê) se remonta.
+    revisao_da_sessao: AtomicU64,
+    /// **O QR do computador** (`docs/conexao.md` §10): a janela diz se o painel Exibir está à vista
+    /// ([`Receptor::mostrar_o_qr`]); só então existe convite (e a escuta do chamado).
+    qr_visivel: AtomicBool,
+    /// A thread do QR subiu ([`Receptor::comecar_o_qr`]); e o pedido para ela sair.
+    qr_ligado: AtomicBool,
+    qr_fim: AtomicBool,
+}
+
+/// **A conexão pelo QR**: o convite (a escuta fica aberta até a conexão voltar, para um segundo
+/// celular ouvir "usado" em vez de nada) e o chamado que valeu.
+struct PeloQr {
+    convite: quall_core::qr::Convite,
+    chamado: quall_core::qr::Chamado,
+}
+
+/// **O que a casca sabe de uma conexão que não fechou**, além do erro: como a troca pelo código
+/// terminou, se veio pelo QR, e o alvo (o id e o nome guardado) quando havia vínculo com ele.
+struct FalhaVista {
+    fase_do_codigo: Option<FaseDoCodigo>,
+    recusa_ja_pareado: bool,
+    pelo_qr: bool,
+    alvo_com_vinculo: bool,
+    procura: bool,
+    alvo: Option<(String, String)>,
+}
+
+/// O id do aparelho e se este computador guarda vínculo v3 com ele (a retomada pelas dicas). Só o
+/// vínculo autenticado conta — o anúncio e a sonda da busca nunca provam identidade.
+fn tem_vinculo(device_id: &str) -> bool {
+    !device_id.is_empty() && identidade::pares_conhecidos().get(&DeviceId(device_id.to_string())).is_some()
 }
 
 impl Receptor {
@@ -336,6 +388,12 @@ impl Receptor {
             vontade_do_som: Mutex::new(vontade),
             controle_do_som: Mutex::new(None),
             camera_remota: Mutex::new(None),
+            confirmacao: Mutex::new(None),
+            sessao_salva: Mutex::new(identidade::sessao_do_exibir()),
+            revisao_da_sessao: AtomicU64::new(0),
+            qr_visivel: AtomicBool::new(false),
+            qr_ligado: AtomicBool::new(false),
+            qr_fim: AtomicBool::new(false),
             estado: Mutex::new(EstadoDoReceptor {
                 fase: FaseDoReceptor::Parado,
                 versao: 1,
@@ -357,6 +415,9 @@ impl Receptor {
                 som_volume: vontade.volume,
                 som_com_camera: vontade.tocar_com_a_camera,
                 camera_remota: false,
+                codigo: None,
+                esquecer_este: None,
+                qr: (!argumentos.so_local).then(|| QrNaTela { matriz: None, fase: FaseDoQr::Preparando }),
             }),
             cancelamento: Mutex::new(None),
             parar: AtomicBool::new(false),
@@ -625,7 +686,16 @@ impl Receptor {
             crate::registro::linha("receptor: --so-local, sem a procura por mDNS");
             return;
         }
+        // O endereço da sessão salva é uma dica para a busca (`docs/v3-no-privado.md` §8.9).
+        if let Some(s) = self.sessao_salva() {
+            self.busca.dar_dica(&s.endereco);
+        }
         self.busca.comecar();
+    }
+
+    /// **"Procurar de novo"** no Exibir (`docs/v3-no-privado.md` §8.9): a varredura da /24 recomeça.
+    pub fn procurar_de_novo(&self) {
+        self.busca.procurar_de_novo();
     }
 
     /// Copia a lista publicada pela thread de mDNS para o estado que a janela lê.
@@ -634,12 +704,63 @@ impl Receptor {
     /// remontagem do controle depender de uma revisão só — a mesma razão pela qual o seletor de
     /// monitor tem `revisao_das_fontes`.
     pub fn pulsar(&self) {
-        let (aparelhos, revisao, ativa, motivo) = {
+        let (mut aparelhos, revisao, ativa, motivo) = {
             let l = self.busca.lista();
             (l.aparelhos.clone(), l.revisao, l.ativa, l.motivo.clone())
         };
+        // A revisão da lista que a janela vê junta a da busca e a da sessão salva: os dois contadores
+        // só sobem, e a soma muda quando qualquer um muda.
+        let revisao = revisao.wrapping_add(self.revisao_da_sessao.load(Ordering::SeqCst));
         if self.revisao_publicada.swap(revisao, Ordering::SeqCst) == revisao {
             return;
+        }
+        // **O nome local** (P3, `docs/v3-no-privado.md` §5.4): a rede só diz "Quall 1a2b3c4d"; o item
+        // que a sonda do núcleo reconheceu como um par guardado ganha o nome que a última sessão
+        // autenticada com ele deu (e conecta com o alvo, `exibir`).
+        let nomes = identidade::nomes_dos_pares();
+        for a in aparelhos.iter_mut() {
+            // O guardado vence o anunciado (§8.7), e então a linha diz "Pareado", sem o alias.
+            if let Some(n) = a.conhecido.as_deref().and_then(|id| nomes.nome(id)) {
+                a.nome = n.to_string();
+                a.alias = None;
+            }
+        }
+        // A sessão salva entra pelo nome guardado quando a sonda ainda não a achou entre os itens: a
+        // linha "Pareado" retoma com ele onde ele estiver (`conectar_ao_par`). Só enquanto o vínculo v3
+        // com ele existe.
+        // **Uma linha por aparelho** (bancada de 13/10): o item vivo no endereço da sessão salva que a
+        // sonda não reconheceu (ele esqueceu este computador) é o mesmo aparelho — ganha o nome e o alvo
+        // dela, e o toque segue a regra do núcleo (reconecta, ou pareia de novo pelo código, §8.6).
+        if let Some(s) = self.sessao_salva().filter(|s| tem_vinculo(&s.device_id)) {
+            let enderecos: Vec<String> = aparelhos.iter().map(|a| a.endereco.to_string()).collect();
+            let rotulos: Vec<Option<&str>> = aparelhos.iter().map(|a| a.conhecido.as_deref()).collect();
+            let mesmo = conexao::item_da_sessao_salva(&s, &enderecos, &rotulos);
+            drop(rotulos);
+            if let Some(i) = mesmo {
+                let a = &mut aparelhos[i];
+                a.conhecido = Some(s.device_id.clone());
+                if let Some(n) = nomes.nome(&s.device_id).or(Some(s.nome.as_str()).filter(|n| !n.is_empty())) {
+                    a.nome = n.to_string();
+                    a.alias = None;
+                }
+            }
+        }
+        let reconhecidos: Vec<&str> = aparelhos.iter().filter_map(|a| a.conhecido.as_deref()).collect();
+        let lembrar = self.sessao_salva().filter(|s| conexao::lembrar_na_lista(Some(s), tem_vinculo(&s.device_id), &reconhecidos));
+        if let Some(s) = lembrar {
+            if let Ok(endereco) = s.endereco.parse::<std::net::SocketAddr>() {
+                aparelhos.push(Aparelho {
+                    nome: if s.nome.is_empty() { s.endereco.clone() } else { s.nome.clone() },
+                    device_id: s.device_id.clone(),
+                    endereco,
+                    fullname: s.device_id.clone(),
+                    tem_tela: false,
+                    tem_camera: false,
+                    lembrado: true,
+                    conhecido: None,
+                    alias: None,
+                });
+            }
         }
         let mut e = self.estado();
         // **A escolha é preservada pelo id do aparelho, não pelo índice.** Um aparelho que some da
@@ -665,6 +786,195 @@ impl Receptor {
         }
     }
 
+    fn sessao_salva(&self) -> Option<SessaoSalva> {
+        self.sessao_salva.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    // MARK: - o código de 4 dígitos (`docs/v3-no-privado.md` §3)
+
+    fn confirmacao(&self) -> Option<ConfirmacaoPorCodigo> {
+        self.confirmacao.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// **Lê o confirmador e publica o cartão** (o número certo; o convidado não escolhe nada — quem
+    /// escolhe é o anfitrião, entre três). Chamado do relógio da janela, a cada pulso; a versão só
+    /// sobe quando o cartão muda. Para desistir, o Cancelar da cena.
+    pub fn olhar_o_codigo(&self) {
+        let cartao = self.confirmacao().and_then(|c| conexao::cartao(&conexao::ler(&c))).filter(|c| !c.do_anfitriao());
+        let mut e = self.estado();
+        let cartao = if e.fase == FaseDoReceptor::Conectando { cartao } else { None };
+        if e.codigo != cartao {
+            if let (Some(c), None) = (&cartao, &e.codigo) {
+                registro::linha(format!("código: na tela (tentativa {}), esperando a escolha no outro aparelho", c.tentativa));
+            }
+            e.codigo = cartao;
+            e.mudou();
+        }
+    }
+
+    /// **"Esquecer este aparelho"** (A2, `docs/v3-no-privado.md` §3.5): tira do `pares.json` só o
+    /// vínculo do aparelho que não reconheceu este pareamento, e a sessão salva dele. Depois disso, o
+    /// item dele na lista ("Quall 1a2b3c4d") volta a parear pelo código — ou pelo PIN.
+    pub fn esquecer_este_aparelho(&self) {
+        let Some((id, _nome)) = self.estado().esquecer_este.take() else { return };
+        let resultado = identidade::esquecer_par(&id);
+        identidade::esquecer_nome_do_par(&id);
+        registro::linha(format!("exibir: esquecer este aparelho — {resultado:?}"));
+        if self.sessao_salva().is_some_and(|s| s.device_id == id) {
+            identidade::esquecer_sessao_do_exibir();
+            *self.sessao_salva.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            self.revisao_da_sessao.fetch_add(1, Ordering::SeqCst);
+        }
+        let mut e = self.estado();
+        e.pede_pin = matches!(resultado, identidade::Esquecimento::Falhou(_));
+        e.conselho = match &resultado {
+            identidade::Esquecimento::Falhou(motivo) => tf("Não consegui esquecer este aparelho: {}", &[motivo]),
+            _ => t("Aparelho esquecido. Escolha-o na lista para parear pelo código, ou digite o PIN.").into(),
+        };
+        e.oferece_desparear = false;
+        e.mudou();
+    }
+
+    // MARK: - o QR do computador (`docs/conexao.md` §10)
+
+    /// A janela diz, a cada pulso, se o painel Exibir está à vista. Fora dele não há convite: a
+    /// escuta do chamado só fica aberta enquanto alguém pode estar olhando o QR.
+    pub fn mostrar_o_qr(&self, visivel: bool) {
+        self.qr_visivel.store(visivel, Ordering::SeqCst);
+    }
+
+    /// Sobe a thread do QR (uma vez). Com `--so-local`, não: a escuta seria fora do laço local.
+    pub fn comecar_o_qr(self: &Arc<Self>) {
+        if self.argumentos.so_local || self.qr_ligado.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let eu = Arc::clone(self);
+        let _ = std::thread::Builder::new().name("quall.qr".into()).spawn(move || eu.vigiar_o_qr());
+    }
+
+    /// Na saída do app: a thread solta o convite (e a escuta) e sai.
+    pub fn parar_o_qr(&self) {
+        self.qr_fim.store(true, Ordering::SeqCst);
+    }
+
+    fn publicar_o_qr(&self, qr: QrNaTela) {
+        let mut e = self.estado();
+        if e.qr.as_ref() != Some(&qr) {
+            e.qr = Some(qr);
+            e.mudou();
+        }
+    }
+
+    /// **A vida do QR**: com o Exibir à vista e nada em curso, um convite (3 min, um chamado); a fase
+    /// publicada a cada 250 ms; vencido, outro na hora; chamado, a conexão pelo convite. O texto do QR
+    /// leva o segredo e **nunca** vai ao diário — só os endereços e a porta.
+    fn vigiar_o_qr(self: Arc<Self>) {
+        let eu = DeviceId(identidade::device_id());
+        let nome = identidade::nome_do_aparelho();
+        let mut convite: Option<(quall_core::qr::Convite, Option<Arc<crate::qr_na_tela::Matriz>>)> = None;
+        let mut de_novo_em: Option<Instant> = None;
+        while !self.qr_fim.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(250));
+            let querer = self.qr_visivel.load(Ordering::SeqCst) && self.estado().fase == FaseDoReceptor::Parado;
+            if !querer {
+                if convite.take().is_some() {
+                    registro::linha("qr: convite solto (o Exibir saiu da tela, ou uma conexão começou)");
+                }
+                de_novo_em = None;
+                if self.estado().fase == FaseDoReceptor::Parado {
+                    self.publicar_o_qr(QrNaTela { matriz: None, fase: FaseDoQr::Preparando });
+                }
+                continue;
+            }
+            let Some((c, matriz)) = convite.as_ref() else {
+                if de_novo_em.is_some_and(|t| Instant::now() < t) {
+                    continue;
+                }
+                match quall_core::qr::Convite::novo(&eu, &nome, Duration::ZERO) {
+                    Ok(c) => {
+                        let conteudo = c.conteudo();
+                        registro::linha(format!(
+                            "qr: convite novo — escuta na porta {} ({} endereço(s)), vale 3 min e um chamado",
+                            conteudo.porta,
+                            conteudo.enderecos.len()
+                        ));
+                        let matriz = crate::qr_na_tela::matriz(&c.texto()).map(Arc::new);
+                        if matriz.is_none() {
+                            registro::linha("qr: !! o texto do convite não coube num QR");
+                        }
+                        convite = Some((c, matriz));
+                    }
+                    Err(erro) => {
+                        let sem_rede = matches!(erro, Error::NoRoute(_));
+                        registro::linha(format!("qr: o convite não nasceu: status={}", crate::diagnostico_rede::status(&erro)));
+                        self.publicar_o_qr(QrNaTela { matriz: None, fase: if sem_rede { FaseDoQr::SemRede } else { FaseDoQr::Falhou } });
+                        de_novo_em = Some(Instant::now() + Duration::from_secs(if sem_rede { 5 } else { 10 }));
+                    }
+                }
+                continue;
+            };
+            let r = c.retrato();
+            match (r.fase, r.chamado) {
+                ("chamado", Some(chamado)) => {
+                    let Some((c, _)) = convite.take() else { continue };
+                    self.exibir_pelo_qr(PeloQr { convite: c, chamado });
+                }
+                ("expirou", _) => {
+                    registro::linha("qr: o convite expirou sem chamado; outro no lugar");
+                    convite = None;
+                    self.publicar_o_qr(QrNaTela { matriz: None, fase: FaseDoQr::Renovando });
+                }
+                _ => {
+                    // Arredondado para cima: "0:00" só quando acabou.
+                    let segundos = r.expira_em.as_millis().div_ceil(1000) as u32;
+                    self.publicar_o_qr(QrNaTela { matriz: matriz.clone(), fase: FaseDoQr::Esperando { segundos } });
+                }
+            }
+        }
+        drop(convite);
+        registro::linha("qr: encerrado");
+    }
+
+    /// **Um celular leu o QR e chamou**: a conexão sai pelo convite, como um Exibir sem PIN — o
+    /// endereço é o que o chamado autenticou, e o pareamento é o do segredo do QR (§10.4).
+    fn exibir_pelo_qr(self: &Arc<Self>, qr: PeloQr) {
+        let nome = qr.chamado.nome.clone();
+        {
+            let mut e = self.estado();
+            if e.fase != FaseDoReceptor::Parado {
+                registro::linha("qr: chamado com outra conexão em curso; o convite cai");
+                return;
+            }
+            e.conselho.clear();
+            e.resumo.clear();
+            e.cadeia.clear();
+            e.cadeia_alerta = false;
+            e.par.clear();
+            e.pede_pin = false;
+            e.oferece_desparear = false;
+            e.esquecer_este = None;
+            e.codigo = None;
+            e.destino = if nome.is_empty() { qr.chamado.endpoint.to_string() } else { format!("{nome} ({})", qr.chamado.endpoint) };
+            e.qr = Some(QrNaTela { matriz: None, fase: FaseDoQr::Chamado { nome: nome.clone() } });
+            e.fase = FaseDoReceptor::Conectando;
+            e.mudou();
+        }
+        registro::linha(format!("qr: chamado autenticado de \"{nome}\" — conectando pelo convite"));
+        let cancelamento = Cancelamento::novo();
+        *self.cancelamento.lock().unwrap_or_else(|e| e.into_inner()) = Some(cancelamento.clone());
+        self.parar.store(false, Ordering::SeqCst);
+        let eu = Arc::clone(self);
+        let endereco = qr.chamado.endpoint;
+        let destino = self.estado().destino.clone();
+        let thread = std::thread::Builder::new()
+            .name("quall.receptor".into())
+            .spawn(move || eu.correr_sessao(destino, endereco, None, cancelamento, CaminhoDoExibir::Livre, Some(qr)));
+        if thread.is_err() {
+            registro::linha("qr: a thread da conexão não subiu");
+            self.voltar_ao_inicio();
+        }
+    }
+
     /// **Bancada.** O clique em "Exibir" que um agente não tem como dar.
     pub fn talvez_exibir_sozinho(self: &Arc<Self>) {
         let Some(destino) = self.argumentos.exibir_ja.clone() else { return };
@@ -686,7 +996,20 @@ impl Receptor {
     /// `endereco_digitado` vazio quer dizer "use o aparelho escolhido na lista". Os dois caminhos
     /// existem e o segundo é obrigatório (`PROMPT.md`); nenhum é o "modo avançado" do outro.
     pub fn exibir(self: &Arc<Self>, endereco_digitado: String, pin_digitado: String) {
-        let (destino_texto, endereco) = {
+        let salva = self.sessao_salva();
+        let com_pin = !pin_digitado.trim().is_empty();
+        // Lido antes de travar o estado: é o disco. O vínculo é o do aparelho da origem: o item que a
+        // lista reconheceu, ou o da sessão salva.
+        let escolhido = {
+            let e = self.estado();
+            e.escolhido.and_then(|i| e.aparelhos.get(i)).cloned()
+        };
+        let reconhecido = escolhido.as_ref().filter(|_| endereco_digitado.trim().is_empty()).and_then(|a| a.conhecido.clone());
+        let vinculo = match &reconhecido {
+            Some(id) => tem_vinculo(id),
+            None => salva.as_ref().is_some_and(|s| tem_vinculo(&s.device_id)),
+        };
+        let (destino_texto, endereco, caminho) = {
             let mut e = self.estado();
             if e.fase != FaseDoReceptor::Parado {
                 return;
@@ -694,7 +1017,7 @@ impl Receptor {
             let digitado = endereco_digitado.trim().to_string();
             let alvo = if !digitado.is_empty() {
                 match endereco_manual(&digitado) {
-                    Ok(a) => (digitado.clone(), a),
+                    Ok(a) => (digitado.clone(), a, conexao::caminho_do_exibir(OrigemDoDestino::Digitado(&digitado), com_pin, salva.as_ref(), vinculo)),
                     Err(erro) => {
                         e.conselho = tf("Não entendi \"{}\". Escreva o endereço como aparece no outro aparelho — por exemplo 192.168.1.41:7877. ({})", &[&digitado, &erro]);
                         e.mudou();
@@ -703,7 +1026,16 @@ impl Receptor {
                 }
             } else {
                 match e.escolhido.and_then(|i| e.aparelhos.get(i)).cloned() {
-                    Some(a) => (format!("{} ({})", a.nome, a.endereco), a.endereco),
+                    Some(a) => {
+                        // A linha "Pareado" (a sessão salva) e o item reconhecido vão ao alvo (o toque, §8.6); um
+                        // "Quall 1a2b3c4d" que a busca está vendo é anônimo: sem alvo.
+                        let origem = match (&reconhecido, a.lembrado) {
+                            (_, true) => OrigemDoDestino::LembradoNaLista,
+                            (Some(id), false) if a.conhecido.as_ref() == Some(id) => OrigemDoDestino::ReconhecidoNaLista(id),
+                            _ => OrigemDoDestino::VistoNaLista,
+                        };
+                        (format!("{} ({})", a.nome, a.endereco), a.endereco, conexao::caminho_do_exibir(origem, com_pin, salva.as_ref(), vinculo))
+                    }
                     None => {
                         e.conselho = t("Escolha um aparelho na lista, ou digite o endereço dele.").into();
                         e.mudou();
@@ -718,7 +1050,9 @@ impl Receptor {
             e.par.clear();
             e.pede_pin = false;
             e.oferece_desparear = false;
+            e.esquecer_este = None;
             e.destino = alvo.0.clone();
+            e.codigo = None;
             e.fase = FaseDoReceptor::Conectando;
             e.mudou();
             alvo
@@ -747,9 +1081,13 @@ impl Receptor {
         self.parar.store(false, Ordering::SeqCst);
 
         let eu = Arc::clone(self);
-        let _ = std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("quall.receptor".into())
-            .spawn(move || eu.correr_sessao(destino_texto, endereco, pin, cancelamento));
+            .spawn(move || eu.correr_sessao(destino_texto, endereco, pin, cancelamento, caminho, None));
+        if thread.is_err() {
+            registro::linha("exibir: a thread da conexão não subiu");
+            self.voltar_ao_inicio();
+        }
     }
 
     fn correr_sessao(
@@ -758,7 +1096,31 @@ impl Receptor {
         endereco: std::net::SocketAddr,
         pin: Option<Pin>,
         cancelamento: Cancelamento,
+        caminho: CaminhoDoExibir,
+        pelo_qr: Option<PeloQr>,
     ) {
+        // **A sessão salva, sem id no anúncio** (`docs/v3-no-privado.md` §5.2): o núcleo acha o
+        // aparelho (o endereço antigo e a busca) e retoma com ele **na mesma conexão**, só com o vínculo
+        // dele; nunca o código. **Nada é gravado aqui** (M3): a sessão salva só muda depois de
+        // autenticar, mais abaixo, com o endereço em que de fato conectou.
+        let id_do_alvo = match &caminho {
+            CaminhoDoExibir::AoAlvo { device_id } => Some(device_id.clone()),
+            CaminhoDoExibir::Livre => None,
+        };
+        // O nome local do alvo: o guardado pela última sessão autenticada com ele, ou o da sessão salva.
+        let nome_salvo = id_do_alvo
+            .as_deref()
+            .and_then(|id| identidade::nomes_dos_pares().nome(id).map(str::to_string))
+            .or_else(|| self.sessao_salva().map(|s| s.nome))
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| endereco.to_string());
+        // **O toque num aparelho pareado reconecta** (`docs/v3-no-privado.md` §8.6): a retomada pela rota
+        // de agora; se ele não reconhecer mais este computador, o código para parear de novo.
+        if let CaminhoDoExibir::AoAlvo { .. } = &caminho {
+            let mut e = self.estado();
+            e.destino = tf("Reconectando a {}…", &[&nome_salvo]);
+            e.mudou();
+        }
         let device_id = identidade::device_id();
         let nome = identidade::nome_do_aparelho();
         registro::linha(format!(
@@ -779,9 +1141,14 @@ impl Receptor {
             Capabilities { screen_source: false, camera_source: false, sink: true },
         );
 
-        let resultado = conectar(
-            endereco,
-            SessionConfig {
+        // **Sem PIN, o código fica à mão** (`docs/v3-no-privado.md` §3.4): um toque em Exibir, uma
+        // tentativa; o núcleo só o usa sem retomada pelas dicas e com um anfitrião que o aceita. Com
+        // PIN, nada muda. Pelo QR, o pareamento é o do segredo do QR; na procura da sessão salva,
+        // nunca (A1, A2): nos dois, sem código.
+        let sem_codigo = pin.is_some() || pelo_qr.is_some();
+        let confirmacao = (!sem_codigo).then(ConfirmacaoPorCodigo::nova);
+        *self.confirmacao.lock().unwrap_or_else(|e| e.into_inner()) = confirmacao.clone();
+        let cfg = SessionConfig {
                 announcement: eu_anuncio,
                 pin,
                 known: identidade::pares_conhecidos(),
@@ -799,17 +1166,49 @@ impl Receptor {
                 // continuamente é a casca. Ver `SessionConfig::silencio_do_caminho`.
                 silencio_do_caminho: None,
                 cancelamento,
-            },
-        );
+        };
+        // **Pelo QR** (`docs/v3-no-privado.md` §4): no endereço que o chamado autenticou, e quem atende
+        // tem de ser o celular do chamado. A sessão salva: a procura. O endereço salvo digitado: ao
+        // alvo, falhando fechado sem a dica dele (A2). Senão, o caminho de sempre (PIN, retomada ou
+        // código).
+        // A procura da sessão salva sem toque (`conectar_ao_par`) saiu do Exibir: todo caminho daqui é
+        // um toque, e o toque vai pela regra do núcleo (§8.6), que procura sozinho quando a rota cai.
+        let (alvo_com_vinculo, procura) = (matches!(caminho, CaminhoDoExibir::AoAlvo { .. }), false);
+        let resultado = match (&pelo_qr, &caminho) {
+            (Some(q), _) => quall_core::session::conectar_pelo_qr(&q.chamado, q.convite.chave_do_par(), cfg),
+            (None, CaminhoDoExibir::AoAlvo { device_id }) => conectar_com_codigo_ao_alvo(endereco, cfg, confirmacao.clone(), Some(&DeviceId(device_id.clone()))),
+            (None, CaminhoDoExibir::Livre) => conectar_com_codigo(endereco, cfg, confirmacao.clone()),
+        };
+        // A escuta do chamado fecha agora: a conexão voltou, com par ou sem.
+        let veio_pelo_qr = pelo_qr.is_some();
+        drop(pelo_qr);
+        // Como a troca pelo código terminou (`None` sem código à mão), lido antes de soltar o
+        // confirmador: a frase da falha é dele.
+        let leitura_do_codigo = confirmacao.as_ref().map(conexao::ler);
+        let fase_do_codigo = leitura_do_codigo.as_ref().map(|l| l.fase);
+        let recusa_ja_pareado = leitura_do_codigo.as_ref().is_some_and(|l| l.recusa.as_deref() == Some(conexao::RECUSA_JA_PAREADO));
+        *self.confirmacao.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.olhar_o_codigo();
 
         let mut pronto = match resultado {
             Ok(p) => p,
             Err(erro) => {
-                registro::linha(format!("conectar falhou: status={}", crate::diagnostico_rede::status(&erro)));
-                self.ao_falhar(erro);
+                registro::linha(format!(
+                    "conectar falhou: status={}{}",
+                    crate::diagnostico_rede::status(&erro),
+                    fase_do_codigo.map(|f| format!(" codigo={f:?}")).unwrap_or_default()
+                ));
+                let alvo = id_do_alvo.clone().map(|id| (id, nome_salvo.clone()));
+                self.ao_falhar(erro, FalhaVista { fase_do_codigo, recusa_ja_pareado, pelo_qr: veio_pelo_qr, alvo_com_vinculo, procura, alvo });
                 return;
             }
         };
+        // Onde de fato conectou: na procura, o endereço que o núcleo achou (e que só agora, autenticado,
+        // vale gravar); nos outros caminhos, o de sempre.
+        let endereco = pronto.endereco_do_par.unwrap_or(endereco);
+        if let Some(via) = pronto.via_do_par {
+            registro::linha(format!("exibir: sessão salva retomada (achada por {via})"));
+        }
 
         // O pareamento fechou: grava **antes** de qualquer outra coisa, exatamente como o emissor.
         // Se o app morrer no meio da exibição, o par continua conhecido e a próxima vez não pede
@@ -817,8 +1216,24 @@ impl Receptor {
         let mut novos = PairedPeers::new();
         novos.insert(&pronto.outcome);
         identidade::guardar_pares(&novos);
+        // O nome local do par (§5.4), da sessão autenticada: a lista o mostra no item reconhecido.
+        identidade::guardar_nome_do_par(&pronto.peer.device_id.0, &pronto.peer.display_name);
 
         let nome_do_par = pronto.peer.display_name.clone();
+        // **A sessão salva guarda quem é o outro lado** (`docs/conexao.md` §3), e só agora: o id é o
+        // que a sessão autenticada diz, e o endereço é o que de fato conectou (M3).
+        {
+            let antes = self.sessao_salva();
+            let nova = SessaoSalva::depois_de_conectar(antes.as_ref(), &pronto.peer.device_id.0, &nome_do_par, &endereco.to_string());
+            if antes.as_ref() != Some(&nova) {
+                if antes.as_ref().is_some_and(|a| a.device_id == nova.device_id && a.endereco != nova.endereco) {
+                    registro::linha("exibir: a sessão salva mudou de endereço (o mesmo aparelho, autenticado)");
+                }
+                identidade::guardar_sessao_do_exibir(&nova);
+                *self.sessao_salva.lock().unwrap_or_else(|e| e.into_inner()) = Some(nova);
+                self.revisao_da_sessao.fetch_add(1, Ordering::SeqCst);
+            }
+        }
         // A baia deste aparelho: pode já existir (o app subiu com ela) ou nascer agora, na
         // primeira vez que este aparelho conecta. `None` quando a frente está desligada.
         let baia = self
@@ -829,7 +1244,7 @@ impl Receptor {
         }
         registro::linha(format!(
             "conectado: pareamento={} caminho={}",
-            if pronto.outcome.novo { "novo, por PIN" } else { "retomado, sem PIN" },
+            match (pronto.outcome.novo, veio_pelo_qr) { (true, true) => "novo, pelo QR", (true, false) => "novo, por PIN ou código", _ => "retomado, sem PIN" },
             pronto
                 .session
                 .selected_pair()
@@ -1723,12 +2138,63 @@ impl Receptor {
     /// sem aviso, e errar em silêncio quando mudasse. O texto abaixo nomeia as duas causas sem
     /// fingir saber qual é, e dá a saída — que por sorte é a mesma nos dois casos. O conserto de
     /// verdade é um status do núcleo que as separe: é o pedido registrado como dívida 29.
-    fn ao_falhar(&self, erro: Error) {
+    ///
+    /// No v3 o A1, o A2 e o B2 têm variantes próprias (`Interferencia`, `ParNaoReconhecido`,
+    /// `JaPareado`, `docs/v3-no-privado.md` §8.3), traduzidas em frase num ponto só
+    /// (`conexao::falha_do_convidado`).
+    fn ao_falhar(&self, erro: Error, vista: FalhaVista) {
         if matches!(erro, Error::Cancelled) || self.parar.load(Ordering::SeqCst) {
             self.voltar_ao_inicio();
             return;
         }
         let mut e = self.estado();
+        // **Pelo QR** (`docs/v3-no-privado.md` §4): os dois já têm vínculo (B2), e o QR não o
+        // substitui; `PAIRING` é quem atendeu não ser o celular que leu; o resto (o prazo, a rede) é a
+        // conexão que não fechou depois do chamado. Um QR novo nasce sozinho quando a tela volta.
+        if vista.pelo_qr {
+            let ja_pareado = matches!(erro, Error::JaPareado(_));
+            e.conselho = match erro {
+                _ if ja_pareado => t(conexao::FRASE_JA_PAREADO_PELO_QR),
+                Error::Pairing(_) | Error::WrongPin(_) | Error::NeedsPin(_) => t("Quem atendeu não é o celular que leu o QR. Leia o QR de novo."),
+                _ => t("O celular chamou, mas a conexão não fechou. Leia o QR de novo."),
+            }
+            .into();
+            e.pede_pin = ja_pareado;
+            e.oferece_desparear = false;
+            drop(e);
+            self.voltar_ao_inicio();
+            return;
+        }
+        // **O código, a sessão salva e o alvo** (`docs/v3-no-privado.md` §3.4, §3.5, §8.3): A1, B2, A2
+        // (as variantes próprias do núcleo) e o desfecho do código têm frase própria, antes da do
+        // status. **Um ponto só** traduz o erro em frase: `conexao::falha_do_convidado`.
+        let tipo = match &erro {
+            Error::NeedsPin(_) => conexao::TipoDoErro::NeedsPin,
+            Error::Pairing(_) => conexao::TipoDoErro::Pairing,
+            Error::Timeout(_) => conexao::TipoDoErro::Timeout,
+            Error::Interferencia(_) => conexao::TipoDoErro::Interferencia,
+            Error::ParNaoReconhecido(_) => conexao::TipoDoErro::ParNaoReconhecido,
+            Error::JaPareado(_) => conexao::TipoDoErro::JaPareado,
+            _ => conexao::TipoDoErro::Outro,
+        };
+        let falha = conexao::FalhaDoConvidado {
+            tipo,
+            fase: vista.fase_do_codigo,
+            recusa_ja_pareado: vista.recusa_ja_pareado,
+            alvo_com_vinculo: vista.alvo_com_vinculo,
+            procura: vista.procura,
+        };
+        if let Some(c) = conexao::falha_do_convidado(&falha) {
+            let nome = vista.alvo.as_ref().map(|(_, n)| n.clone()).unwrap_or_default();
+            e.conselho = if c.com_nome { tf(c.frase, &[&nome]) } else { t(c.frase).into() };
+            e.pede_pin = c.pede_pin;
+            e.oferece_desparear = false;
+            e.esquecer_este = if c.esquecer { vista.alvo.clone() } else { None };
+            registro::linha(format!("exibir: conselho da falha (pede_pin={} esquecer={})", c.pede_pin, c.esquecer));
+            drop(e);
+            self.voltar_ao_inicio();
+            return;
+        }
         match erro {
             Error::NeedsPin(_) => {
                 e.conselho = t("O outro aparelho não reconhece mais este pareamento e pediu para recomeçar. Digite aqui o PIN que está aparecendo na tela dele.").into();
@@ -1763,6 +2229,11 @@ impl Receptor {
         e.resumo.clear();
         e.cadeia.clear();
         e.cadeia_alerta = false;
+        e.codigo = None;
+        // O QR da conexão que acabou já foi gasto: a thread do QR põe outro no lugar.
+        if e.qr.is_some() {
+            e.qr = Some(QrNaTela { matriz: None, fase: FaseDoQr::Preparando });
+        }
         e.mudou();
         drop(e);
         *self.cancelamento.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -1772,10 +2243,15 @@ impl Receptor {
     /// O mesmo botão do emissor, e o mesmo arquivo: `pares.json` é um só por computador.
     pub fn esquecer_pares(&self) {
         identidade::esquecer_pares();
+        // A sessão salva e os nomes locais saem junto (`identidade::esquecer_pares`): sem vínculo, a
+        // linha "Pareado" não volta à lista.
+        *self.sessao_salva.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.revisao_da_sessao.fetch_add(1, Ordering::SeqCst);
         let mut e = self.estado();
         e.oferece_desparear = false;
-        e.pede_pin = true;
-        e.conselho = t("Pareamentos esquecidos. Digite o PIN que está na tela do outro aparelho.").into();
+        e.esquecer_este = None;
+        e.pede_pin = false;
+        e.conselho = t("Pareamentos esquecidos. Escolha o aparelho na lista para parear pelo código, ou digite o PIN que está na tela dele.").into();
         e.mudou();
     }
 }

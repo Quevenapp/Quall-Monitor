@@ -9,6 +9,8 @@ pub fn status(erro: &quall_core::error::Error) -> &'static str {
         Error::NeedsPin(_) => "NEEDS_PIN", Error::Timeout(_) => "TIMEOUT",
         Error::Closed => "CLOSED", Error::Cancelled => "CANCELLED",
         Error::Io(_) => "IO", Error::Ocupado(_) => "BUSY",
+        Error::Interferencia(_) => "INTERFERENCE", Error::ParNaoReconhecido(_) => "PAIR_NOT_RECOGNIZED",
+        Error::JaPareado(_) => "ALREADY_PAIRED",
     }
 }
 

@@ -19,11 +19,15 @@ pub mod protocol;
 pub mod error;
 
 pub mod camera_remota;
+pub mod busca;
 pub mod cancel;
+pub mod confirmacao;
 pub mod discovery;
 pub mod jitter;
 pub mod media;
 pub mod pairing;
+pub mod qr;
+pub mod reconhecer;
 pub mod portao;
 pub mod relogio;
 pub mod reproducao;

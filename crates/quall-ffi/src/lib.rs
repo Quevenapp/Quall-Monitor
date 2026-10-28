@@ -1,4 +1,3 @@
-// Os identificadores e endereços de exemplos/fixtures são sintéticos; não identificam a bancada privada.
 //! Superfície C do núcleo, consumida pelas cascas: Swift (macOS/iOS), Kotlin via JNI (Android),
 //! C++ (plugin de OBS) e C/C++ (câmera virtual do Windows).
 //!
@@ -85,10 +84,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use quall_core::busca::{localizar, AparelhoVisto, Busca, Respondedor};
 use quall_core::cancel::Cancelamento;
+use quall_core::confirmacao::ConfirmacaoPorCodigo;
 use quall_core::discovery::{
     endereco_manual_com_porta, escolher_porta_do_teleprompter, ler_destino, porta_para_completar,
-    Advertiser, Browser, DiscoveredDevice, DiscoveryEvent, PORTA_DO_TELEPROMPTER,
+    Advertiser, PORTA_DO_TELEPROMPTER,
     PRAZO_DE_RESOLUCAO,
 };
 use quall_core::error::Error;
@@ -101,7 +102,7 @@ use quall_core::reproducao::{
     ContadoresDeReproducao, LeitorDeReproducao, Puxado, ReproducaoPuxada,
 };
 use quall_core::rtp::Contadores;
-use quall_core::session::{conectar, hospedar, EventoDeSessao, Ready, SessionConfig};
+use quall_core::session::{hospedar_com_codigo, EventoDeSessao, Ready, SessionConfig};
 use quall_core::signaling::{RelatoDoEnlace, SignalingServer};
 // `Politica` já é o do jitter neste arquivo; o da taxa entra com nome próprio para que
 // nenhuma das duas leituras dependa de qual `use` veio primeiro.
@@ -112,6 +113,7 @@ use quall_core::track::{
 };
 use quall_core::transport::TransportConfig;
 mod registro_seguro;
+mod vizinhos;
 
 // =============================================================================================
 // Erro
@@ -200,6 +202,17 @@ pub enum QuallStatus {
     /// `docs/contrato-teleprompter.md` §2. Entrou no fim, com o próximo valor livre, pela regra de
     /// sempre: nenhum valor que uma casca já conhece muda de significado.
     Busy = 16,
+    /// **Algo está interferindo na conexão com este aparelho: use o PIN** (`docs/v3-no-privado.md`
+    /// §3.4, A1). Três pernas do código caíram antes do código aparecer, para o mesmo endereço.
+    Interference = 17,
+    /// **O outro aparelho não reconheceu este pareamento** (§3.5, A2): falha fechado, na sessão salva e
+    /// num toque sem confirmador. Ofereça "Esquecer este aparelho" (e então o código) ou o PIN. Com
+    /// confirmador, o toque segue para o código sozinho (`quall_connect_with_code_to`, §8.6).
+    PairNotRecognized = 18,
+    /// **Já há um pareamento com este aparelho** (B2): só diante de um par de build anterior, que
+    /// recusava substituir pelo código ou pelo QR. Ofereça "Esquecer este aparelho" ou o PIN. Desde
+    /// 13/10 o código e o QR substituem o vínculo que não retomou (§8.4, §8.6).
+    AlreadyPaired = 19,
 }
 
 impl From<&Error> for QuallStatus {
@@ -219,6 +232,9 @@ impl From<&Error> for QuallStatus {
             Error::Cancelled => QuallStatus::Cancelled,
             Error::Io(_) => QuallStatus::Io,
             Error::Ocupado(_) => QuallStatus::Busy,
+            Error::Interferencia(_) => QuallStatus::Interference,
+            Error::ParNaoReconhecido(_) => QuallStatus::PairNotRecognized,
+            Error::JaPareado(_) => QuallStatus::AlreadyPaired,
         }
     }
 }
@@ -528,6 +544,7 @@ pub unsafe extern "C" fn quall_advertiser_start(
             return ptr::null_mut();
         }
     };
+    laco_local_nos_testes();
     match Advertiser::start(&anuncio, signaling_port) {
         Ok(interno) => Box::into_raw(Box::new(QuallAdvertiser {
             interno: Some(interno),
@@ -589,53 +606,168 @@ pub unsafe extern "C" fn quall_advertiser_stop(a: *mut QuallAdvertiser) {
     }
 }
 
-/// Navegador mDNS, com o que ele já achou.
+/// Navegador: a busca por três caminhos do núcleo (`quall_core::busca`), com a lista que ela mantém.
 ///
-/// # A lista fica atrás de um cadeado, e isso não é zelo (achado da auditoria)
+/// # Desde 12/10, três caminhos e uma thread do núcleo
 ///
-/// [`quall_browser_collect`] pedia `&mut` e [`quall_browser_devices_json`] pedia `&`, os dois
-/// sobre o mesmo ponteiro. A casca que atualizasse a lista numa thread enquanto desenha a tela
-/// noutra — que é exatamente como uma tela de aparelhos se escreve — produzia dois empréstimos
-/// conflitantes do mesmo `Vec`: corrida de dados de verdade, comportamento indefinido, não
-/// "provavelmente funciona".
+/// Era só mDNS, e a lista era montada aqui, chamada a chamada. Agora `quall_core::busca::Busca`
+/// roda mDNS, broadcast UDP e sondagem da /24 numa thread própria, e mantém a tabela por
+/// `DeviceId` com "visto há X s" (`docs/conexao.md` §2). As funções de antes continuam com o mesmo
+/// contrato: [`quall_browser_collect`] ainda bloqueia `ms` e devolve quantos há, e o JSON de
+/// [`quall_browser_devices_json`] tem as chaves de antes — mais algumas.
 ///
-/// Com o [`Mutex`], as duas funções passam a receber `*const` e a leitura é segura de qualquer
-/// thread.
+/// A tabela é da busca, atrás de um cadeado dela: ler de qualquer thread é seguro (o achado da
+/// auditoria que pôs o `Mutex` aqui continua valendo, um andar abaixo).
 pub struct QuallBrowser {
-    interno: Option<Browser>,
-    achados: std::sync::Mutex<Vec<DiscoveredDevice>>,
+    interno: Option<Busca>,
+    /// Os pares que a casca deu em [`quall_browser_set_known`]: rotulam a lista (`known_device_id`).
+    reconhecedor: std::sync::Mutex<Option<quall_core::reconhecer::Reconhecedor>>,
 }
 
-/// Começa a navegar `_quall._tcp` na LAN.
+/// Começa a procurar aparelhos Quall na LAN pelos três caminhos.
+///
+/// Não falha por falta de mDNS ou de porta UDP: a busca segue com o que abriu. Nulo só se nem a
+/// thread da busca subir.
 #[no_mangle]
 pub extern "C" fn quall_browser_start() -> *mut QuallBrowser {
-    match Browser::start() {
-        Ok(interno) => Box::into_raw(Box::new(QuallBrowser {
-            interno: Some(interno),
-            achados: std::sync::Mutex::new(Vec::new()),
-        })),
-        Err(e) => {
-            guardar_erro(&e);
-            ptr::null_mut()
+    laco_local_nos_testes();
+    Box::into_raw(Box::new(QuallBrowser {
+        interno: Some(Busca::iniciar()),
+        reconhecedor: std::sync::Mutex::new(None),
+    }))
+}
+
+/// **Os pares conhecidos, para a lista dizer quem é quem** (`docs/v3-no-privado.md` §5.4, P3). No
+/// v3 o anúncio não traz o id de ninguém; com isto, cada item novo da lista é sondado uma vez (um
+/// `Probe`, e a conexão fecha antes do `Hello`: nada é gasto do outro lado) e, se for um dos pares
+/// de `opcoes.known_peers_json`, o item de [`quall_browser_devices_json`] ganha `known_device_id`
+/// com o id que a casca guardou — mostre o nome local e conecte com
+/// [`quall_connect_with_code_to`] (`expected_device_id`) ou [`quall_connect_known`].
+///
+/// Só `opcoes.me` (o id deste aparelho) e `opcoes.known_peers_json` são lidos. `role`: `NULL`/`""`
+/// para vídeo, `"controle_remoto"` para o controle. Chame de novo quando a tabela mudar (parear,
+/// esquecer): o cache recomeça. `known_peers_json` vazio desliga. As sondas não andam sozinhas:
+/// cada [`quall_browser_devices_json`] põe para sondar os itens novos (no máximo 2 de uma vez, 2,5 s
+/// cada; quem não respondeu volta em 30 s), e o rótulo aparece numa das chamadas seguintes.
+///
+/// Devolve `0`, ou `-1` com [`quall_last_status`] (`INVALID`, `NULL_ARGUMENT`).
+///
+/// # Safety
+///
+/// `b` precisa vir de [`quall_browser_start`]; `opcoes` válido durante a chamada; `role` nulo ou
+/// uma string C válida.
+#[no_mangle]
+pub unsafe extern "C" fn quall_browser_set_known(
+    b: *const QuallBrowser,
+    opcoes: *const QuallSessionOptions,
+    role: *const c_char,
+) -> i32 {
+    let feito = (|| -> Saida<()> {
+        let navegador =
+            b.as_ref().ok_or_else(|| Falha::Nulo("quall_browser_set_known: navegador nulo".into()))?;
+        let opcoes =
+            opcoes.as_ref().ok_or_else(|| Falha::Nulo("quall_browser_set_known: `opcoes` é nulo".into()))?;
+        let papel = papel_da_fronteira(role, Papel::ControleRemoto, "quall_browser_set_known")?;
+        let eu = opcoes.me.para_anuncio()?.device_id;
+        let pares = match texto_opcional(opcoes.known_peers_json, "known_peers_json")? {
+            Some(j) if !j.trim().is_empty() => PairedPeers::from_json(j)?,
+            _ => PairedPeers::new(),
+        };
+        let novo = if pares.has_secure_peers() {
+            Some(quall_core::reconhecer::Reconhecedor::novo(eu, papel, pares)?)
+        } else {
+            None
+        };
+        *navegador.reconhecedor.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = novo;
+        Ok(())
+    })();
+    match feito {
+        Ok(()) => 0,
+        Err(f) => {
+            guardar_falha(&f);
+            -1
         }
     }
 }
 
-/// Junta o que aparecer durante `ms` milissegundos e devolve quantos aparelhos há **no total**.
+/// **Nos testes desta fronteira, só o laço local** (`quall_core::busca::so_o_laco_local`): eles
+/// usam a biblioteca de produto, sem o `cfg(test)` do núcleo, e uma busca ou um anúncio de teste
+/// não pode sair para a LAN da bancada — os celulares veriam aparelhos falsos. No produto, nada.
 ///
-/// **Bloqueia** por `ms`. Devolve negativo em erro.
+/// E, desde 14/10, o leitor da tabela ARP desta plataforma ([`vizinhos`], `docs/v3-no-privado.md`
+/// §8.9), uma vez: toda entrada que abre a rede passa por aqui.
+fn laco_local_nos_testes() {
+    if cfg!(test) {
+        quall_core::busca::so_o_laco_local();
+    }
+    vizinhos::instalar();
+}
+
+/// **"Procurar de novo"** (`docs/v3-no-privado.md` §8.9): a varredura da /24 recomeça agora, com a
+/// lista cheia ou não, no ritmo baixo de sempre (~5 s por /24). Sem isto, a busca só varre a /24
+/// sozinha com a lista vazia, uma vez por processo a cada 5 min; o resto do tempo ela pergunta só às
+/// dicas ([`quall_browser_add_hint`]) e aos vizinhos da tabela ARP. Ligue ao botão de procurar de
+/// novo da tela — não a um temporizador.
 ///
-/// # "Junta" passou a ser verdade (achado da auditoria)
+/// Devolve `0`, ou `-1` com [`quall_last_status`] (`NULL_ARGUMENT`).
 ///
-/// Antes, cada chamada **substituía** a lista pelo que tinha aparecido naquela janela. Como o
-/// mDNS entrega cada anúncio uma vez, a segunda chamada no mesmo navegador via **menos**
-/// aparelhos que a primeira — a lista da tela encolhia sozinha enquanto o usuário olhava para
-/// ela. O header prometia "junta" e o código trocava.
+/// # Safety
 ///
-/// Agora a lista é acumulada: aparelho novo entra, aparelho que já estava é atualizado, e
-/// aparelho que anunciou a saída é removido. É o que uma tela de aparelhos precisa.
+/// `b` precisa vir de [`quall_browser_start`].
+#[no_mangle]
+pub unsafe extern "C" fn quall_browser_rescan(b: *const QuallBrowser) -> i32 {
+    let Some(busca) = b.as_ref().and_then(|n| n.interno.as_ref()) else {
+        guardar_nulo("quall_browser_rescan: navegador nulo ou parado");
+        return -1;
+    };
+    busca.procurar_de_novo();
+    0
+}
+
+/// **Uma dica** (`docs/v3-no-privado.md` §8.9): um endereço onde um aparelho conhecido esteve — o
+/// último de um vínculo, o da sessão salva, o último do controle —, `"ip"` ou `"ip:porta"` (a porta
+/// é ignorada). A busca o pergunta por unicast aos 1 s e mais duas vezes (20 s e 40 s depois), só
+/// enquanto ele não está na lista e não foi tocado há pouco. Só IPv4 privado conta; o resto é
+/// ignorado sem erro. Pode chamar várias vezes (uma por vínculo).
 ///
-/// Chamar em laço com `ms` curto é o uso esperado; a lista só cresce com quem está na rede.
+/// Devolve `0`, ou `-1` com [`quall_last_status`] (`NULL_ARGUMENT`, `INVALID` para texto que não é
+/// endereço).
+///
+/// # Safety
+///
+/// `b` precisa vir de [`quall_browser_start`]; `endereco` uma string C válida.
+#[no_mangle]
+pub unsafe extern "C" fn quall_browser_add_hint(b: *const QuallBrowser, endereco: *const c_char) -> i32 {
+    let feito = (|| -> Saida<()> {
+        let busca = b
+            .as_ref()
+            .and_then(|n| n.interno.as_ref())
+            .ok_or_else(|| Falha::Nulo("quall_browser_add_hint: navegador nulo ou parado".into()))?;
+        let texto = texto_opcional(endereco, "endereco")?
+            .ok_or_else(|| Falha::Nulo("quall_browser_add_hint: `endereco` é nulo".into()))?;
+        let texto = texto.trim();
+        let ip: std::net::IpAddr = match texto.parse::<SocketAddr>() {
+            Ok(e) => e.ip(),
+            Err(_) => texto
+                .parse()
+                .map_err(|_| Error::Invalid(format!("quall_browser_add_hint: endereço inválido: {texto:?}")))?,
+        };
+        busca.dar_dica(ip);
+        Ok(())
+    })();
+    match feito {
+        Ok(()) => 0,
+        Err(f) => {
+            guardar_falha(&f);
+            -1
+        }
+    }
+}
+
+/// Espera `ms` milissegundos e devolve quantos aparelhos há **no total** na lista. Negativo em erro.
+///
+/// A busca anda sozinha numa thread do núcleo; esta função só dá a cadência de quem desenha a
+/// tela. Chamar em laço com `ms` curto (250–400) é o uso esperado.
 ///
 /// # Safety
 ///
@@ -646,67 +778,40 @@ pub unsafe extern "C" fn quall_browser_collect(b: *const QuallBrowser, ms: u32) 
         guardar_nulo("quall_browser_collect: navegador nulo");
         return -1;
     };
-    let Some(interno) = navegador.interno.as_ref() else {
+    let Some(busca) = navegador.interno.as_ref() else {
         guardar_texto("quall_browser_collect: o navegador já foi parado");
         return -1;
     };
-
-    let prazo = std::time::Instant::now() + Duration::from_millis(u64::from(ms));
-    loop {
-        let resta = prazo.saturating_duration_since(std::time::Instant::now());
-        if resta.is_zero() {
-            break;
-        }
-        match interno.next_event(resta) {
-            Ok(Some(DiscoveryEvent::Found(aparelho))) => {
-                let Ok(mut lista) = navegador.achados.lock() else {
-                    guardar_texto("quall_browser_collect: lista envenenada por um panic");
-                    return -1;
-                };
-                match lista
-                    .iter_mut()
-                    .find(|a| a.announcement.device_id == aparelho.announcement.device_id)
-                {
-                    Some(existente) => *existente = *aparelho,
-                    None => lista.push(*aparelho),
-                }
-            }
-            Ok(Some(DiscoveryEvent::Lost(fullname))) => {
-                let Ok(mut lista) = navegador.achados.lock() else {
-                    guardar_texto("quall_browser_collect: lista envenenada por um panic");
-                    return -1;
-                };
-                lista.retain(|a| a.fullname != fullname);
-            }
-            Ok(None) => break,
-            Err(e) => {
-                guardar_erro(&e);
-                return -1;
-            }
-        }
-    }
-
-    match navegador.achados.lock() {
-        Ok(lista) => i32::try_from(lista.len()).unwrap_or(i32::MAX),
-        Err(_) => {
-            guardar_texto("quall_browser_collect: lista envenenada por um panic");
-            -1
-        }
-    }
+    std::thread::sleep(Duration::from_millis(u64::from(ms)));
+    i32::try_from(busca.aparelhos().len()).unwrap_or(i32::MAX)
 }
 
 /// Escreve os aparelhos achados como **JSON**, no padrão `(buf, cap)` do topo do módulo.
 ///
-/// JSON, e não uma struct por aparelho, de propósito: a alternativa seria uma função com cinco
-/// buffers de saída e um índice, que toda casca erraria de um jeito diferente. Swift, Kotlin e
-/// C++ já têm um leitor de JSON à mão, e a lista de aparelhos é lida uma vez por tela — não é
-/// caminho quente.
+/// Um array de objetos com as chaves de sempre — `device_id`, `display_name`, `protocol_version`,
+/// `capabilities` (`screen_source`, `camera_source`, `sink`), `endpoint` (`"ip:porta"` ou `null`) e
+/// `papel` (só quando há) — e, desde 12/10 (`docs/conexao.md` §2.4 e §4):
 ///
 /// Formato: um array de objetos com `device_id`, `display_name`, `protocol_version`,
 /// `capabilities` (`screen_source`, `camera_source`, `sink`) e `endpoint` (`"ip:porta"` ou
 /// `null` quando o aparelho não anunciou endereço utilizável).
 /// `identity_authenticated` é `false`: o ID e nome desta lista são placeholders efêmeros,
 /// não servem para consultar ou persistir pareamentos. Use o peer da sessão após autenticar.
+/// - `"alive"`: visto há no máximo 12 s. `false` é "visto há X s": o item fica mais 30 s e sai.
+/// - `"seen_ms_ago"`: há quanto tempo veio o último sinal de vida (0 enquanto o mDNS o mantém).
+/// - `"via"`: por onde foi visto — `"mdns"`, `"udp"`, `"sondagem"`.
+/// - `"accepts_code"`: aceita a confirmação por código de 4 dígitos.
+/// - `"own"`: é um anúncio deste mesmo processo (o token é do anunciante daqui). Não liste.
+/// - `"known_device_id"`: o id guardado do par que este item é, quando a casca deu os pares em
+///   [`quall_browser_set_known`] e a sonda já reconheceu; `null` nos outros casos. Mostre o nome
+///   local e conecte com o alvo (A2).
+/// - `"announced_name"` (13/10, `docs/v3-no-privado.md` §8.7): o nome que o aparelho escolheu para a
+///   rede (`quall_set_announced_name` do lado de lá), saneado — até 40 bytes, sem controle; `null`
+///   quando o anúncio não traz nome (build das lojas, campo apagado). **Não autentica nada.** A linha
+///   mostra, nesta ordem: o nome guardado do par (`known_device_id`) > este nome, com o alias
+///   (`display_name`) pequeno embaixo > só o alias.
+///
+/// Vivos primeiro, depois pelo nome anunciado (ou o alias). Uma casca que não conhece as chaves novas segue funcionando.
 ///
 /// # Safety
 ///
@@ -721,34 +826,17 @@ pub unsafe extern "C" fn quall_browser_devices_json(
         guardar_nulo("quall_browser_devices_json: navegador nulo");
         return -1;
     };
-    let Ok(achados) = navegador.achados.lock() else {
-        guardar_texto("quall_browser_devices_json: lista envenenada por um panic");
+    let Some(busca) = navegador.interno.as_ref() else {
+        guardar_texto("quall_browser_devices_json: o navegador já foi parado");
         return -1;
     };
-    let lista: Vec<serde_json::Value> = achados
-        .iter()
-        .map(|a| {
-            let mut item = serde_json::json!({
-                "identity_authenticated": false,
-                "device_id": a.announcement.device_id.0,
-                "display_name": a.announcement.display_name,
-                "protocol_version": a.announcement.protocol_version,
-                "capabilities": {
-                    "screen_source": a.announcement.capabilities.screen_source,
-                    "camera_source": a.announcement.capabilities.camera_source,
-                    "sink": a.announcement.capabilities.sink,
-                },
-                "endpoint": a.endpoint().map(|e| e.to_string()),
-            });
-            // `"papel"` **só quando existe** (`docs/contrato-teleprompter.md` §2): um controle
-            // filtra `"teleprompter"`, um receptor de vídeo esconde quem tem papel. Sem papel, o
-            // objeto é o de antes.
-            if let (Some(p), Some(objeto)) = (a.announcement.papel, item.as_object_mut()) {
-                objeto.insert("papel".into(), serde_json::Value::from(p.como_texto()));
-            }
-            item
-        })
-        .collect();
+    let mut itens = busca.aparelhos();
+    if let Some(r) =
+        navegador.reconhecedor.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref()
+    {
+        r.rotular(&mut itens);
+    }
+    let lista: Vec<serde_json::Value> = itens.iter().map(aparelho_em_json).collect();
     match serde_json::to_string(&lista) {
         Ok(texto) => escrever_texto(&texto, buf, cap),
         Err(e) => {
@@ -758,7 +846,72 @@ pub unsafe extern "C" fn quall_browser_devices_json(
     }
 }
 
-/// Para de navegar e libera. Nulo é ignorado.
+fn aparelho_em_json(a: &AparelhoVisto) -> serde_json::Value {
+    let mut item = serde_json::json!({
+        "identity_authenticated": false,
+        "device_id": a.anuncio.device_id.0,
+        "display_name": a.anuncio.display_name,
+        "protocol_version": a.anuncio.protocol_version,
+        "capabilities": {
+            "screen_source": a.anuncio.capabilities.screen_source,
+            "camera_source": a.anuncio.capabilities.camera_source,
+            "sink": a.anuncio.capabilities.sink,
+        },
+        "endpoint": a.endpoint.map(|e| e.to_string()),
+        "alive": a.vivo,
+        "seen_ms_ago": u64::try_from(a.visto_ha.as_millis()).unwrap_or(u64::MAX),
+        "via": a.via,
+        "accepts_code": a.aceita_codigo,
+        "own": a.proprio,
+        "known_device_id": a.conhecido.as_ref().map(|d| d.0.clone()),
+        "announced_name": a.nome_anunciado,
+    });
+    // `"papel"` **só quando existe** (`docs/contrato-teleprompter.md` §2): um controle filtra
+    // `"teleprompter"`, um receptor de vídeo esconde quem tem papel. Sem papel, o objeto é o de
+    // antes.
+    if let (Some(p), Some(objeto)) = (a.anuncio.papel, item.as_object_mut()) {
+        objeto.insert("papel".into(), serde_json::Value::from(p.como_texto()));
+    }
+    item
+}
+
+/// **Por que a lista pode estar vazia**, como JSON (`docs/conexao.md` §2.5). Padrão `(buf, cap)`:
+///
+/// ```json
+/// {"causes":["firewall","isolamento"],"networks":["192.168.15.0/24"],"probes":1,"listening":true}
+/// ```
+///
+/// `causes`, da mais para a menos provável: `"sem_rede_local"`, `"sub_rede_diferente"`,
+/// `"firewall"`, `"isolamento"` — a casca traduz cada uma. `networks` são as redes deste aparelho,
+/// para a tela dizer "este aparelho está na rede 192.168.15.x; o outro precisa estar na mesma".
+/// Vazio de causas é "ainda procurando" ou "achou".
+///
+/// # Safety
+///
+/// `b` precisa vir de [`quall_browser_start`]; `buf` precisa ser nulo ou ter `cap` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn quall_browser_hint_json(
+    b: *const QuallBrowser,
+    buf: *mut c_char,
+    cap: usize,
+) -> isize {
+    let Some(busca) = b.as_ref().and_then(|n| n.interno.as_ref()) else {
+        guardar_nulo("quall_browser_hint_json: navegador nulo ou parado");
+        return -1;
+    };
+    let d = busca.diagnostico();
+    let causas: Vec<&str> = d.causas.iter().map(|c| c.como_texto()).collect();
+    let j = serde_json::json!({
+        "causes": causas,
+        "networks": d.redes,
+        "probes": d.sondagens,
+        "listening": d.escuta_aberta,
+    });
+    escrever_texto(&j.to_string(), buf, cap)
+}
+
+/// Para de procurar e libera. Nulo é ignorado. Bloqueia até a thread da busca sair (uma fatia,
+/// ~50 ms, mais o adeus do mDNS).
 ///
 /// # Safety
 ///
@@ -770,7 +923,717 @@ pub unsafe extern "C" fn quall_browser_stop(b: *mut QuallBrowser) {
     }
     let mut caixa = Box::from_raw(b);
     if let Some(interno) = caixa.interno.take() {
-        interno.stop();
+        interno.parar();
+    }
+}
+
+/// **Acha o aparelho da sessão salva pelo `device_id`**, quando o DHCP pode ter trocado o IP
+/// (`docs/conexao.md` §3). **Bloqueia** até achar ou até `timeout_ms` (0 = 8 s).
+///
+/// `last_endpoint` (`"ip:porta"`, ou nulo) é o endereço guardado: ele é tentado por TCP com prazo
+/// de 1 s enquanto a busca pergunta pelo id. Padrão `(buf, cap)`:
+///
+/// ```json
+/// {"endpoint":"192.168.15.9:7877","via":"udp","changed":true,"accepts_code":true}
+/// ```
+///
+/// `changed` verdadeiro: grave o endereço novo na sessão salva, **sem perguntar**, e conecte nele
+/// com `quall_connect*` — sem PIN, porque o par já é conhecido e a retomada fecha sozinha. `via`
+/// é `"endereco_antigo"`, `"udp"`, `"sondagem"` ou `"mdns"`. Não achou: `-1` com
+/// `QUALL_STATUS_TIMEOUT` e as causas prováveis em [`quall_last_error`].
+///
+/// # Safety
+///
+/// `device_id` precisa ser uma string C válida; `last_endpoint`, nula ou válida; `buf`, nulo ou
+/// com `cap` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn quall_locate_peer_json(
+    device_id: *const c_char,
+    last_endpoint: *const c_char,
+    timeout_ms: u32,
+    buf: *mut c_char,
+    cap: usize,
+) -> isize {
+    let feito = (|| -> Saida<String> {
+        let id = DeviceId(texto(device_id, "device_id")?.to_string());
+        let ultimo = match texto_opcional(last_endpoint, "last_endpoint")? {
+            Some(e) if !e.trim().is_empty() => Some(
+                e.trim()
+                    .parse::<SocketAddr>()
+                    .map_err(|_| Falha::Nucleo(Error::Invalid(format!("endereço guardado ilegível: {e}"))))?,
+            ),
+            _ => None,
+        };
+        let prazo = Duration::from_millis(if timeout_ms == 0 { 8_000 } else { u64::from(timeout_ms) });
+        let achado = localizar(&id, ultimo, prazo)?;
+        Ok(serde_json::json!({
+            "endpoint": achado.endpoint.to_string(),
+            "via": achado.via,
+            "changed": achado.mudou,
+            "accepts_code": achado.aceita_codigo,
+        })
+        .to_string())
+    })();
+    match feito {
+        Ok(j) => escrever_texto(&j, buf, cap),
+        Err(f) => {
+            guardar_falha(&f);
+            -1
+        }
+    }
+}
+
+/// **O nome que os outros aparelhos veem na lista** (`docs/v3-no-privado.md` §8.7, a P3 revista):
+/// define o nome que **todo anúncio deste processo que começar depois** leva na chave `nm` —
+/// [`quall_advertiser_start`] e as variantes, [`quall_udp_responder_start`] e a variante com token.
+/// O anúncio já no ar segue com o nome com que começou; a próxima espera leva o novo.
+///
+/// O nome é saneado aqui (sem controle nem quebra, sem caracteres invisíveis de formatação, espaços
+/// em sequência viram um, até 40 bytes UTF-8 sem partir caractere). `NULL`, `""` ou um nome que o
+/// saneamento esvazia **apaga**: os anúncios saem sem nome e a lista dos outros mostra o alias
+/// `Quall <8 hex>`. O id e as chaves nunca vão no anúncio.
+///
+/// Chame ao abrir o app (com o nome guardado nos Ajustes, ou o do sistema na primeira vez) e quando
+/// a pessoa mudar o campo. É do processo: a extensão de transmissão do iOS chama no próprio
+/// processo. Devolve `QUALL_STATUS_OK`, ou `QUALL_STATUS_NOT_UTF8` com `name` que não é UTF-8 (o
+/// nome anterior fica).
+///
+/// # Safety
+///
+/// `name` precisa ser nulo ou apontar para uma string terminada em zero.
+#[no_mangle]
+pub unsafe extern "C" fn quall_set_announced_name(name: *const c_char) -> QuallStatus {
+    match texto_opcional(name, "name") {
+        Ok(nome) => {
+            quall_core::discovery::definir_nome_anunciado(nome);
+            QuallStatus::Ok
+        }
+        Err(f) => guardar_falha(&f),
+    }
+}
+
+/// O nome que o próximo anúncio deste processo vai levar, **já saneado** — o que os outros vão ver
+/// —, ou `""` sem nome. Padrão `(buf, cap)`. Serve à casca que publica o mDNS por fora do núcleo (o
+/// iOS, no TXT do `mDNSResponder`, chave `nm`) e aos Ajustes, para mostrar como o nome ficou.
+///
+/// # Safety
+///
+/// `buf` precisa ser nulo ou apontar para `cap` bytes graváveis.
+#[no_mangle]
+pub unsafe extern "C" fn quall_announced_name(buf: *mut c_char, cap: usize) -> isize {
+    escrever_texto(&quall_core::discovery::nome_anunciado().unwrap_or_default(), buf, cap)
+}
+
+/// **Só o anúncio UDP**, sem mDNS (`docs/conexao.md` §2): responde perguntas na UDP 7875 e se
+/// anuncia por broadcast. É para a casca que anuncia o mDNS pelo sistema — o iOS, com `NetService`,
+/// porque o mDNS do núcleo é socket multicast cru e depende do entitlement de multicast. As
+/// respostas unicast (as da sondagem da /24) não dependem dele; o broadcast, sim, e falha calado.
+pub struct QuallUdpResponder {
+    _interno: Respondedor,
+}
+
+/// Começa a anunciar pela UDP. `role` e `accepts_code` como em [`quall_advertiser_start_with_code`].
+/// Libere com [`quall_udp_responder_stop`]. Nulo só em parâmetro inválido.
+///
+/// # Safety
+///
+/// As mesmas de [`quall_advertiser_start_with_code`].
+#[no_mangle]
+pub unsafe extern "C" fn quall_udp_responder_start(
+    me: *const QuallDeviceDesc,
+    signaling_port: u16,
+    role: *const c_char,
+    accepts_code: bool,
+) -> *mut QuallUdpResponder {
+    let feito = (|| -> Saida<Respondedor> {
+        let papel = papel_da_fronteira(role, Papel::Teleprompter, "quall_udp_responder_start")?;
+        let me = me
+            .as_ref()
+            .ok_or_else(|| Falha::Nulo("quall_udp_responder_start: `me` é nulo".into()))?;
+        let mut anuncio = me.para_anuncio()?;
+        anuncio.papel = papel;
+        laco_local_nos_testes();
+        Ok(Respondedor::iniciar(&anuncio, signaling_port, accepts_code))
+    })();
+    match feito {
+        Ok(r) => Box::into_raw(Box::new(QuallUdpResponder { _interno: r })),
+        Err(f) => {
+            guardar_falha(&f);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// [`quall_udp_responder_start`] com o **token** do anúncio que a casca publica por fora do núcleo
+/// (o iOS, pelo `mDNSResponder`): os dois anúncios dizem o mesmo token, e o aparelho é **um** item
+/// na lista dos outros (`docs/v3-no-privado.md` §5.3). `token`: 32 hex minúsculos; outro formato é
+/// `INVALID`.
+///
+/// # Safety
+///
+/// As de [`quall_udp_responder_start`]; `token` precisa apontar para uma string terminada em zero.
+#[no_mangle]
+pub unsafe extern "C" fn quall_udp_responder_start_with_token(
+    me: *const QuallDeviceDesc,
+    signaling_port: u16,
+    role: *const c_char,
+    accepts_code: bool,
+    token: *const c_char,
+) -> *mut QuallUdpResponder {
+    let feito = (|| -> Saida<Respondedor> {
+        let papel = papel_da_fronteira(role, Papel::Teleprompter, "quall_udp_responder_start_with_token")?;
+        let me = me
+            .as_ref()
+            .ok_or_else(|| Falha::Nulo("quall_udp_responder_start_with_token: `me` é nulo".into()))?;
+        let token = texto(token, "token")?;
+        if token.len() != 32 || !token.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+            return Err(Falha::Nucleo(Error::Invalid("token de descoberta inválido".into())));
+        }
+        let mut anuncio = me.para_anuncio()?;
+        anuncio.papel = papel;
+        laco_local_nos_testes();
+        Ok(Respondedor::iniciar_com_token(&anuncio, signaling_port, accepts_code, token))
+    })();
+    match feito {
+        Ok(r) => Box::into_raw(Box::new(QuallUdpResponder { _interno: r })),
+        Err(f) => {
+            guardar_falha(&f);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Para de anunciar pela UDP e libera. Nulo é ignorado. Bloqueia até a thread do respondedor sair
+/// quando este era o último anúncio do processo (~50 ms).
+///
+/// # Safety
+///
+/// `r` precisa vir de [`quall_udp_responder_start`] e não pode ter sido liberado antes.
+#[no_mangle]
+pub unsafe extern "C" fn quall_udp_responder_stop(r: *mut QuallUdpResponder) {
+    if !r.is_null() {
+        drop(Box::from_raw(r));
+    }
+}
+
+// =============================================================================================
+// Confirmação por código de 4 dígitos (`docs/conexao.md` §4)
+// =============================================================================================
+
+/// **A tela "os dois aparelhos mostram o mesmo código?"**, do lado do núcleo.
+///
+/// Crie antes de largar a thread de trabalho, passe a [`quall_host_with_code`] ou
+/// [`quall_connect_with_code`], e da tela leia [`quall_code_confirm_state_json`] (a cada 100–250
+/// ms) e chame [`quall_code_confirm_accept`] / [`quall_code_confirm_reject`] quando a pessoa tocar.
+/// Libere com [`quall_code_confirm_free`] depois que a chamada bloqueante voltar.
+///
+/// Um por espera: o anfitrião conta nele as tentativas (no máximo 3 por espera).
+pub struct QuallCodeConfirm {
+    interno: ConfirmacaoPorCodigo,
+}
+
+#[no_mangle]
+pub extern "C" fn quall_code_confirm_new() -> *mut QuallCodeConfirm {
+    Box::into_raw(Box::new(QuallCodeConfirm { interno: ConfirmacaoPorCodigo::nova() }))
+}
+
+/// O estado para a tela, como JSON. Padrão `(buf, cap)`:
+///
+/// ```json
+/// {"phase":"mostrando","code":"0427","peer":null,"attempts":1,"choices":[],"wrong_choice":false,"code_blocked":false}
+/// {"phase":"mostrando","code":null,"peer":"Galaxy A07","attempts":1,"choices":["8812","0427","5530"],"wrong_choice":false,"code_blocked":false}
+/// ```
+///
+/// O primeiro é o **convidado**: mostre `code` (e um Recusar). O segundo é o **anfitrião**
+/// (`docs/v3-no-privado.md` §3.6): `code` é sempre `null` — mostre os três `choices` como botões
+/// iguais, o nome de quem pede (`peer`) e "Nenhum destes"; o toque vai a
+/// [`quall_code_confirm_choose`]. O nome do anfitrião só chega ao convidado em `"conferiu"` (M2).
+///
+/// `phase`: `"esperando"` (nada a mostrar), `"mostrando"`, `"confirmado_aqui"` (esperando o outro
+/// lado), `"conferiu"`, `"recusado_aqui"`, `"recusado_la"`, `"nao_conferiu"` (alguém no meio, ou
+/// erro), `"expirou"`. `wrong_choice`: a escolha foi errada; `code_blocked`: o código desta espera
+/// acabou (P11), só o PIN serve. `code` e `peer` são `null` quando não há. `refusal`: por que o
+/// núcleo recusou a última troca, quando há o que dizer — `"already_paired"` (já há pareamento com
+/// esse aparelho aqui, B2: ofereça "Esquecer este aparelho" ou o PIN), nos dois lados;
+/// `"code_not_accepted"` (convidado: o outro aparelho fechou logo depois do pedido do código — ele
+/// não aceita o código; a chamada volta com `NEEDS_PIN` e o cartão fica em `"esperando"`: peça o PIN
+/// da tela de lá, nunca "recusou"); `null` nos outros desfechos. `"recusado_la"` só vem depois de um
+/// código na tela. `notice`: `"previous_pairing_invalid"` no convidado cujo toque tentou reconectar e
+/// o outro lado não reconheceu — o código é para parear de novo ([`quall_connect_with_code_to`]); `null`
+/// nos outros casos.
+///
+/// # Safety
+///
+/// `c` precisa vir de [`quall_code_confirm_new`]; `buf`, nulo ou com `cap` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn quall_code_confirm_state_json(
+    c: *const QuallCodeConfirm,
+    buf: *mut c_char,
+    cap: usize,
+) -> isize {
+    let Some(c) = c.as_ref() else {
+        guardar_nulo("quall_code_confirm_state_json: nulo");
+        return -1;
+    };
+    let r = c.interno.retrato();
+    // No anfitrião, `"code"` é `null`: ele mostra `"choices"` (revisão, baixo 1).
+    let j = serde_json::json!({
+        "phase": r.fase.como_texto(),
+        "code": r.codigo,
+        "peer": r.par,
+        "attempts": r.tentativas,
+        "choices": r.opcoes,
+        "wrong_choice": r.escolha_errada,
+        "code_blocked": c.interno.bloqueado(),
+        "refusal": r.recusa,
+        "notice": r.aviso,
+    });
+    escrever_texto(&j.to_string(), buf, cap)
+}
+
+/// **Anfitrião**: a pessoa tocou o número `index` de `"choices"` (`docs/v3-no-privado.md` §3.6) no
+/// cartão da tentativa `attempt`. O número que o outro aparelho mostra confirma; um falso recusa e
+/// encerra o código desta espera (`"code_blocked": true`; o PIN continua). Fora da tentativa ou da
+/// fase, ou no convidado, devolve `false` e não faz nada. No anfitrião,
+/// [`quall_code_confirm_accept`] não confirma mais: é preciso escolher.
+///
+/// # Safety
+///
+/// `c` precisa vir de [`quall_code_confirm_new`] e estar vivo.
+#[no_mangle]
+pub unsafe extern "C" fn quall_code_confirm_choose(c: *const QuallCodeConfirm, attempt: u32, index: u32) -> bool {
+    c.as_ref().is_some_and(|c| c.interno.escolher(attempt, index as usize))
+}
+
+/// A pessoa tocou **Confirmar** no cartão da tentativa `attempt` — o `"attempts"` do
+/// [`quall_code_confirm_state_json`] que a tela estava mostrando. Vale só se **essa** tentativa ainda
+/// está com o código na tela: um toque dado olhando o cartão de uma tentativa que já caiu **não**
+/// confirma a seguinte (revisão adversarial de 12/10, M2). `true` se o toque valeu. Nulo é ignorado
+/// (`false`). Qualquer thread.
+///
+/// # Safety
+///
+/// `c` precisa ser nulo ou vir de [`quall_code_confirm_new`].
+#[no_mangle]
+pub unsafe extern "C" fn quall_code_confirm_accept(c: *const QuallCodeConfirm, attempt: u32) -> bool {
+    c.as_ref().is_some_and(|c| c.interno.aceitar(attempt))
+}
+
+/// A pessoa tocou **Recusar**. Mesmas regras de [`quall_code_confirm_accept`].
+///
+/// # Safety
+///
+/// `c` precisa ser nulo ou vir de [`quall_code_confirm_new`].
+#[no_mangle]
+pub unsafe extern "C" fn quall_code_confirm_reject(c: *const QuallCodeConfirm, attempt: u32) -> bool {
+    c.as_ref().is_some_and(|c| c.interno.recusar(attempt))
+}
+
+/// Libera. Nulo é ignorado. Pode ser liberado depois que a chamada bloqueante voltar: ela segura a
+/// própria cópia do estado.
+///
+/// # Safety
+///
+/// `c` precisa vir de [`quall_code_confirm_new`] e não pode ter sido liberado antes.
+#[no_mangle]
+pub unsafe extern "C" fn quall_code_confirm_free(c: *mut QuallCodeConfirm) {
+    if !c.is_null() {
+        drop(Box::from_raw(c));
+    }
+}
+
+/// O confirmador de uma chamada, ou nenhum.
+///
+/// # Safety
+///
+/// `c` precisa ser nulo ou vir de [`quall_code_confirm_new`].
+unsafe fn confirmador_de(c: *const QuallCodeConfirm) -> Option<ConfirmacaoPorCodigo> {
+    c.as_ref().map(|x| x.interno.clone())
+}
+
+/// **Anuncia dizendo se aceita o código.** `role` como em [`quall_advertiser_start_with_role`]
+/// (`NULL`, `""` ou `"teleprompter"`); `accepts_code` só pode ser `true` se a casca vai hospedar com
+/// [`quall_host_with_code`] e tem a tela de confirmação. Com `false` e `role` nulo, é exatamente
+/// [`quall_advertiser_start`].
+///
+/// # Safety
+///
+/// As mesmas de [`quall_advertiser_start_with_role`].
+#[no_mangle]
+pub unsafe extern "C" fn quall_advertiser_start_with_code(
+    me: *const QuallDeviceDesc,
+    signaling_port: u16,
+    role: *const c_char,
+    accepts_code: bool,
+) -> *mut QuallAdvertiser {
+    let feito = (|| -> Saida<Advertiser> {
+        let papel = papel_da_fronteira(role, Papel::Teleprompter, "quall_advertiser_start_with_code")?;
+        let me = me
+            .as_ref()
+            .ok_or_else(|| Falha::Nulo("quall_advertiser_start_with_code: `me` é nulo".into()))?;
+        let mut anuncio = me.para_anuncio()?;
+        anuncio.papel = papel;
+        laco_local_nos_testes();
+        Ok(Advertiser::start_com_codigo(&anuncio, signaling_port, accepts_code)?)
+    })();
+    match feito {
+        Ok(interno) => Box::into_raw(Box::new(QuallAdvertiser { interno: Some(interno) })),
+        Err(f) => {
+            guardar_falha(&f);
+            ptr::null_mut()
+        }
+    }
+}
+
+// =============================================================================================
+// QR invertido: o computador mostra, o celular lê (`docs/conexao.md` §10)
+// =============================================================================================
+
+/// **O convite do desktop**: o segredo de 128 bits, a escuta do chamado e o texto do QR.
+///
+/// Crie com [`quall_qr_invite_new`], mostre [`quall_qr_invite_text`] como QR, leia
+/// [`quall_qr_invite_state_json`] da tela (a cada 250–500 ms) e passe o convite a
+/// [`quall_connect_with_invite`] numa thread de trabalho. Libere com [`quall_qr_invite_free`] depois
+/// que a chamada bloqueante voltar. Vale 3 min (ou o prazo dado) e **um** chamado: depois disso,
+/// crie outro (QR novo).
+pub struct QuallQrInvite {
+    interno: quall_core::qr::Convite,
+}
+
+/// Cria o convite: sorteia o segredo e abre a escuta TCP do chamado (porta 7874, ou efêmera se
+/// ocupada), com os endereços das redes locais deste aparelho. `ttl_ms` 0 = 180 000.
+///
+/// Nulo em erro, com o motivo em [`quall_last_status`]: `NO_ROUTE` quando o aparelho não está em
+/// rede local nenhuma (avião, só dados móveis) — a tela diz isso em vez de mostrar um QR inútil.
+///
+/// # Safety
+///
+/// `me` precisa apontar para um [`QuallDeviceDesc`] válido (`device_id` e `display_name`).
+#[no_mangle]
+pub unsafe extern "C" fn quall_qr_invite_new(me: *const QuallDeviceDesc, ttl_ms: u32) -> *mut QuallQrInvite {
+    let feito = (|| -> Saida<quall_core::qr::Convite> {
+        let me = me.as_ref().ok_or_else(|| Falha::Nulo("quall_qr_invite_new: `me` é nulo".into()))?;
+        let anuncio = me.para_anuncio()?;
+        laco_local_nos_testes();
+        Ok(quall_core::qr::Convite::novo(
+            &anuncio.device_id,
+            &anuncio.display_name,
+            Duration::from_millis(u64::from(ttl_ms)),
+        )?)
+    })();
+    match feito {
+        Ok(interno) => Box::into_raw(Box::new(QuallQrInvite { interno })),
+        Err(f) => {
+            guardar_falha(&f);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// O texto do QR, `quall://chamar?v=2&a=…&p=…&i=…&n=…&s=…`. Padrão `(buf, cap)`. **Leva o
+/// segredo**: vai para o desenho do QR e para mais nada — nem diário, nem área de transferência.
+///
+/// # Safety
+///
+/// `c` precisa vir de [`quall_qr_invite_new`]; `buf`, nulo ou com `cap` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn quall_qr_invite_text(c: *const QuallQrInvite, buf: *mut c_char, cap: usize) -> isize {
+    let Some(c) = c.as_ref() else {
+        guardar_nulo("quall_qr_invite_text: nulo");
+        return -1;
+    };
+    escrever_texto(&c.interno.texto(), buf, cap)
+}
+
+/// O estado para a tela, como JSON. Padrão `(buf, cap)`:
+///
+/// ```json
+/// {"phase":"esperando","expires_in_ms":171234,"addresses":["192.168.15.9"],"port":7874,
+///  "peer_id":null,"peer_name":null,"endpoint":null}
+/// ```
+///
+/// `phase`: `"esperando"` (mostre o QR e quanto falta), `"chamado"` (tire o QR e mostre
+/// "Conectando a `peer_name`…"; `peer_id` e `endpoint` preenchidos) ou `"expirou"` (troque por um
+/// convite novo). `addresses` e `port` são para o diário e para a dica "este computador está na
+/// rede 192.168.15.x".
+///
+/// # Safety
+///
+/// `c` precisa vir de [`quall_qr_invite_new`]; `buf`, nulo ou com `cap` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn quall_qr_invite_state_json(
+    c: *const QuallQrInvite,
+    buf: *mut c_char,
+    cap: usize,
+) -> isize {
+    let Some(c) = c.as_ref() else {
+        guardar_nulo("quall_qr_invite_state_json: nulo");
+        return -1;
+    };
+    let r = c.interno.retrato();
+    let q = c.interno.conteudo();
+    let j = serde_json::json!({
+        "phase": r.fase,
+        "expires_in_ms": u64::try_from(r.expira_em.as_millis()).unwrap_or(u64::MAX),
+        "addresses": q.enderecos.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "port": q.porta,
+        "peer_id": r.chamado.as_ref().map(|x| x.par.0.clone()),
+        "peer_name": r.chamado.as_ref().map(|x| x.nome.clone()),
+        "endpoint": r.chamado.as_ref().map(|x| x.endpoint.to_string()),
+    });
+    escrever_texto(&j.to_string(), buf, cap)
+}
+
+/// **O desktop recebe pelo QR.** Bloqueia até um celular chamar (ou o convite expirar, ou o
+/// cancelador disparar), e então conecta nele como receptor e pareia pela chave do QR — sem PIN.
+///
+/// `opcoes` como em [`quall_connect`] (`pin` é ignorado; `known_peers_json` é lido e o pareamento
+/// novo sai em [`quall_session_known_peers_json`] para a casca guardar, como sempre). Depois disso o
+/// par é conhecido e as próximas vezes são retomada, por `quall_connect*`.
+///
+/// Nulo em erro, com [`quall_last_status`]: `TIMEOUT` (o QR expirou sem chamado: mostre um novo),
+/// `CANCELLED`, `PAIRING` (quem atendeu não é quem leu o QR), e os de sempre de `quall_connect`.
+/// Um convite já usado numa chamada anterior devolve o mesmo chamado — crie outro para tentar de
+/// novo.
+///
+/// # Safety
+///
+/// `c` precisa vir de [`quall_qr_invite_new`] e continuar vivo durante a chamada; `opcoes`, válido
+/// durante a chamada; `cancelador`, nulo ou de [`quall_canceller_new`].
+#[no_mangle]
+pub unsafe extern "C" fn quall_connect_with_invite(
+    c: *const QuallQrInvite,
+    opcoes: *const QuallSessionOptions,
+    cancelador: *const QuallCanceller,
+) -> *mut QuallSession {
+    conectar_com_convite_pela_fronteira(c, opcoes, cancelador, None)
+}
+
+/// [`quall_connect_with_invite`] **com um papel**: `role` = `"controle_remoto"` é o controle que mostra
+/// o QR para o **teleprompter** ler (a espera dele, na 7979, só aceita controle remoto). `NULL` ou `""`
+/// é exatamente [`quall_connect_with_invite`]; outro texto é `INVALID`. Como em
+/// [`quall_connect_with_role`], diante de um aparelho que não serve ao papel a saída é `PROTOCOL`, e
+/// diante de um prompter que já tem controle, `BUSY`. A porta vem do chamado (o prompter chama com a
+/// dele), então não há porta a completar.
+///
+/// # Safety
+///
+/// As mesmas de [`quall_connect_with_invite`]; `role` precisa ser nulo ou uma string C válida.
+#[no_mangle]
+pub unsafe extern "C" fn quall_connect_with_invite_role(
+    c: *const QuallQrInvite,
+    opcoes: *const QuallSessionOptions,
+    cancelador: *const QuallCanceller,
+    role: *const c_char,
+) -> *mut QuallSession {
+    match papel_da_fronteira(role, Papel::ControleRemoto, "quall_connect_with_invite_role") {
+        Ok(papel) => conectar_com_convite_pela_fronteira(c, opcoes, cancelador, papel),
+        Err(f) => {
+            guardar_falha(&f);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// # Safety
+///
+/// As mesmas de [`quall_connect_with_invite`].
+unsafe fn conectar_com_convite_pela_fronteira(
+    c: *const QuallQrInvite,
+    opcoes: *const QuallSessionOptions,
+    cancelador: *const QuallCanceller,
+    papel: Option<Papel>,
+) -> *mut QuallSession {
+    let Some(c) = c.as_ref() else {
+        guardar_nulo("quall_connect_with_invite: convite nulo");
+        return ptr::null_mut();
+    };
+    let Some(opcoes) = opcoes.as_ref() else {
+        guardar_nulo("quall_connect_with_invite: `opcoes` é nulo");
+        return ptr::null_mut();
+    };
+    let cancelamento = cancelamento_de(cancelador);
+    let mut cfg = match montar_config(opcoes, cancelamento.clone()) {
+        Ok((c, _)) => c,
+        Err(f) => {
+            guardar_falha(&f);
+            return ptr::null_mut();
+        }
+    };
+    cfg.announcement.papel = papel;
+    if cfg.announcement.device_id != c.interno.conteudo().id {
+        guardar_texto("quall_connect_with_invite: o `me.device_id` não é o do convite");
+        return ptr::null_mut();
+    }
+    let feito = c.interno.esperar_chamado(&cancelamento).and_then(|chamado| {
+        quall_core::session::conectar_pelo_qr(&chamado, c.interno.chave_do_par(), cfg)
+    });
+    match feito {
+        Ok(pronto) => empacotar(pronto, None),
+        Err(e) => {
+            guardar_erro(&e);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Libera o convite e fecha a escuta. Nulo é ignorado. Bloqueia até a thread da escuta sair (~50
+/// ms).
+///
+/// # Safety
+///
+/// `c` precisa vir de [`quall_qr_invite_new`], não pode ter sido liberado antes, e nenhuma chamada
+/// com ele pode estar em andamento.
+#[no_mangle]
+pub unsafe extern "C" fn quall_qr_invite_free(c: *mut QuallQrInvite) {
+    if !c.is_null() {
+        drop(Box::from_raw(c));
+    }
+}
+
+/// **O celular lê um QR**: diz se é um código de conexão do Quall e de quem, sem rede e sem guardar
+/// nada. Para a tela mostrar "Conectar a MacBook do Pessoa?" antes de chamar. Padrão `(buf, cap)`:
+///
+/// ```json
+/// {"peer_id":"mac-3F2504E0","peer_name":"MacBook do Pessoa","addresses":["192.168.15.9"],"port":7874}
+/// ```
+///
+/// `-1` com `INVALID` quando não é um QR do Quall, está quebrado ou é de versão mais nova (a
+/// mensagem diz "atualize o app"). O segredo não sai daqui.
+///
+/// # Safety
+///
+/// `text` precisa ser uma string C válida; `buf`, nulo ou com `cap` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn quall_qr_read_json(text: *const c_char, buf: *mut c_char, cap: usize) -> isize {
+    let feito = (|| -> Saida<String> {
+        let lido = quall_core::qr::ConteudoDoQr::ler(texto(text, "text")?)?;
+        Ok(serde_json::json!({
+            "peer_id": lido.id.0,
+            "peer_name": lido.nome,
+            "addresses": lido.enderecos.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "port": lido.porta,
+        })
+        .to_string())
+    })();
+    match feito {
+        Ok(j) => escrever_texto(&j, buf, cap),
+        Err(f) => {
+            guardar_falha(&f);
+            -1
+        }
+    }
+}
+
+/// **O celular chama o desktop do QR.** Chame com a espera já de pé neste processo (`quall_host*`
+/// bloqueado numa thread, o PIN na tela) e `signaling_port` sendo a porta dela: o desktop conecta
+/// ali logo depois de aceitar, e a espera aceita o pareamento pelo QR sem mudança nenhuma de
+/// chamada. Bloqueia até a resposta (`timeout_ms` 0 = 5 000). **É ação, não consulta**: chame
+/// **uma vez**, com um buffer de **pelo menos 512 bytes** (a resposta é menor que isso): com `buf`
+/// nulo ou `cap` menor, volta `-1` com `INVALID` **sem ir à rede** — perguntar o tamanho antes faria
+/// o chamado, e a segunda chamada ouviria "usado". Devolve como o padrão
+/// `(buf, cap)`:
+///
+/// ```json
+/// {"result":"aceito","peer_id":"mac-3F2504E0","peer_name":"MacBook do Pessoa","via":"192.168.15.9:7874"}
+/// {"result":"recusado","reason":"expirou"}
+/// ```
+///
+/// `reason`: `"expirou"` (o QR do computador venceu: peça um novo), `"usado"` (outro aparelho chamou
+/// antes com este QR), `"invalido"` (o QR não é deste convite), `"endereco"` (o computador vê este
+/// celular por outro endereço: VPN ligada, ou outra rede — diga "Desligue a VPN ou use a mesma
+/// rede"). O chamado vai selado (`docs/v3-no-privado.md` §4): nem o id nem o nome deste aparelho
+/// passam em claro pela rede. `-1` com `NO_ROUTE` quando ninguém
+/// respondeu nos endereços do QR (outra rede, firewall), `PAIRING` quando quem respondeu não provou
+/// ser o computador do QR, `INVALID` para QR ilegível ou porta 0.
+///
+/// **Ler e hospedar no mesmo processo** (`docs/conexao.md` §10.6): a chave lida fica numa caixa do
+/// processo por 2 min e 3 tentativas, e é dali que a espera a tira.
+///
+/// # Safety
+///
+/// `text` e `me` válidos durante a chamada; `buf`, nulo ou com `cap` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn quall_qr_call_json(
+    text: *const c_char,
+    me: *const QuallDeviceDesc,
+    signaling_port: u16,
+    timeout_ms: u32,
+    buf: *mut c_char,
+    cap: usize,
+) -> isize {
+    use quall_core::qr::{chamar, ConteudoDoQr, ResultadoDoChamado};
+    let feito = (|| -> Saida<String> {
+        // **B4 da revisão do QR**: o buffer pequeno é recusado antes do chamado, não depois.
+        if buf.is_null() || cap < 512 {
+            return Err(Falha::Nucleo(Error::Invalid(
+                "quall_qr_call_json: passe um buffer de pelo menos 512 bytes (o chamado é ação)".into(),
+            )));
+        }
+        let lido = ConteudoDoQr::ler(texto(text, "text")?)?;
+        let me = me.as_ref().ok_or_else(|| Falha::Nulo("quall_qr_call_json: `me` é nulo".into()))?;
+        let anuncio = me.para_anuncio()?;
+        let prazo = Duration::from_millis(u64::from(timeout_ms));
+        laco_local_nos_testes();
+        let r = chamar(&lido, &anuncio.device_id, &anuncio.display_name, signaling_port, prazo)?;
+        Ok(match r {
+            ResultadoDoChamado::Aceito { par, nome, via } => serde_json::json!({
+                "result": "aceito",
+                "peer_id": par.0,
+                "peer_name": nome,
+                "via": via.to_string(),
+            }),
+            ResultadoDoChamado::Recusado(m) => serde_json::json!({
+                "result": "recusado",
+                "reason": m.como_texto(),
+            }),
+        }
+        .to_string())
+    })();
+    match feito {
+        Ok(j) => escrever_texto(&j, buf, cap),
+        Err(f) => {
+            guardar_falha(&f);
+            -1
+        }
+    }
+}
+
+/// **Como terminou o pareamento pelo QR, no celular que o leu** (B2). Depois de
+/// [`quall_qr_call_json`] dar `"aceito"`, o desktop conecta na espera deste processo; a espera não
+/// volta por um candidato recusado (ela segue esperando), então a tela de "Conectando a X…" lê isto
+/// para saber o desfecho. `peer_id` é o `peer_id` do QR. Padrão `(buf, cap)`:
+///
+/// ```json
+/// {"outcome":"pending"}
+/// ```
+///
+/// `outcome`: `"pending"` (ainda não terminou), `"connected"` (a sessão subiu: a espera voltou com
+/// ela — também quando o QR virou retomada, com o vínculo bom dos dois lados), `"already_paired"`
+/// (só diante de um computador de build anterior, que recusava o QR com vínculo: ofereça
+/// "Esquecer este aparelho" ou o PIN; desde 13/10 o QR reconecta ou substitui,
+/// `docs/v3-no-privado.md` §8.4), `"failed"` (a troca não fechou: peça um QR novo). O
+/// desfecho vale 2 min, e cada [`quall_qr_call_json`] novo ao mesmo computador o apaga: a
+/// tentativa nova começa em `"pending"`.
+///
+/// # Safety
+///
+/// `peer_id` precisa ser uma string C válida; `buf`, nulo ou com `cap` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn quall_qr_outcome_json(
+    peer_id: *const c_char,
+    buf: *mut c_char,
+    cap: usize,
+) -> isize {
+    match texto(peer_id, "peer_id") {
+        Ok(id) => {
+            let d = quall_core::qr::desfecho(&DeviceId(id.to_string())).unwrap_or("pending");
+            escrever_texto(&serde_json::json!({ "outcome": d }).to_string(), buf, cap)
+        }
+        Err(f) => {
+            guardar_falha(&f);
+            -1
+        }
     }
 }
 
@@ -1191,7 +2054,7 @@ pub unsafe extern "C" fn quall_host_cancelable(
     opcoes: *const QuallSessionOptions,
     cancelador: *const QuallCanceller,
 ) -> *mut QuallSession {
-    hospedar_pela_fronteira(opcoes, cancelador, None)
+    hospedar_pela_fronteira(opcoes, cancelador, None, None)
 }
 
 /// # Safety
@@ -1201,6 +2064,7 @@ unsafe fn hospedar_pela_fronteira(
     opcoes: *const QuallSessionOptions,
     cancelador: *const QuallCanceller,
     papel: Option<Papel>,
+    codigo: Option<ConfirmacaoPorCodigo>,
 ) -> *mut QuallSession {
     let Some(opcoes) = opcoes.as_ref() else {
         guardar_nulo("quall_host: `opcoes` é nulo");
@@ -1228,7 +2092,7 @@ unsafe fn hospedar_pela_fronteira(
             return ptr::null_mut();
         }
     };
-    match hospedar(&servidor, cfg) {
+    match hospedar_com_codigo(&servidor, cfg, codigo) {
         Ok(mut pronto) => {
             // O prompter atende a porta enquanto a sessão dura: todo controle que bate ouve
             // "ocupado" — inclusive o da sessão, voltando de uma queda —, e nada que chega pela
@@ -1279,7 +2143,7 @@ pub unsafe extern "C" fn quall_session_signaling_port(s: *const QuallSession) ->
 
 /// Sobe uma sessão como **receptor**: conecta no endereço, pareia e responde.
 ///
-/// `endpoint` é `"192.168.56.131:7877"` ou só `"192.168.56.131"` (a porta padrão entra sozinha).
+/// `endpoint` é `"192.168.1.131:7877"` ou só `"192.168.1.131"` (a porta padrão entra sozinha).
 /// É a **mesma** função para o endereço que veio do mDNS e para o que o usuário digitou — de
 /// propósito: o fallback de rede sem multicast não pode ser um caminho de código que ninguém
 /// exercita.
@@ -1314,7 +2178,7 @@ pub unsafe extern "C" fn quall_connect_cancelable(
     opcoes: *const QuallSessionOptions,
     cancelador: *const QuallCanceller,
 ) -> *mut QuallSession {
-    conectar_pela_fronteira(endpoint, opcoes, cancelador, None, None)
+    conectar_pela_fronteira(endpoint, opcoes, cancelador, None, None, None)
 }
 
 /// Igual a [`quall_connect_cancelable`], dizendo ao emissor **a tela deste aparelho**, em pixels
@@ -1354,7 +2218,7 @@ pub unsafe extern "C" fn quall_connect_with_screen(
             }
         }
     };
-    conectar_pela_fronteira(endpoint, opcoes, cancelador, tela, None)
+    conectar_pela_fronteira(endpoint, opcoes, cancelador, tela, None, None)
 }
 
 /// # Safety
@@ -1366,6 +2230,19 @@ unsafe fn conectar_pela_fronteira(
     cancelador: *const QuallCanceller,
     tela: Option<Screen>,
     papel: Option<Papel>,
+    codigo: Option<ConfirmacaoPorCodigo>,
+) -> *mut QuallSession {
+    conectar_pela_fronteira_ao_alvo(endpoint, opcoes, cancelador, tela, papel, codigo, None)
+}
+
+unsafe fn conectar_pela_fronteira_ao_alvo(
+    endpoint: *const c_char,
+    opcoes: *const QuallSessionOptions,
+    cancelador: *const QuallCanceller,
+    tela: Option<Screen>,
+    papel: Option<Papel>,
+    codigo: Option<ConfirmacaoPorCodigo>,
+    alvo: Option<&DeviceId>,
 ) -> *mut QuallSession {
     let Some(opcoes) = opcoes.as_ref() else {
         guardar_nulo("quall_connect: `opcoes` é nulo");
@@ -1399,7 +2276,9 @@ unsafe fn conectar_pela_fronteira(
     };
     cfg.announcement.screen = tela;
     cfg.announcement.papel = papel;
-    match conectar(destino, cfg) {
+    // A retomada do toque que cai por rede procura o aparelho pela busca (§8.6): nos testes, só no laço.
+    laco_local_nos_testes();
+    match quall_core::session::conectar_com_codigo_ao_alvo(destino, cfg, codigo, alvo) {
         Ok(pronto) => empacotar(pronto, None),
         Err(e) => {
             guardar_erro(&e);
@@ -1467,10 +2346,10 @@ pub unsafe extern "C" fn quall_session_descartados(s: *const QuallSession) -> i6
 /// Quatro campos, todos podendo ser `null`:
 ///
 /// ```json
-/// {"local_candidate":"a=candidate:1 1 UDP 2122317823 192.168.56.131 62493 typ host",
-///  "remote_candidate":"a=candidate:1 1 UDP 2122317823 192.168.56.131 51698 typ host",
-///  "local_address":"192.168.56.131:62493",
-///  "remote_address":"192.168.56.131:51698"}
+/// {"local_candidate":"a=candidate:1 1 UDP 2122317823 192.168.1.131 62493 typ host",
+///  "remote_candidate":"a=candidate:1 1 UDP 2122317823 192.168.1.131 51698 typ host",
+///  "local_address":"192.168.1.131:62493",
+///  "remote_address":"192.168.1.131:51698"}
 /// ```
 ///
 /// # `null` é "o ICE ainda não fechou", e não é erro
@@ -1484,7 +2363,7 @@ pub unsafe extern "C" fn quall_session_descartados(s: *const QuallSession) -> i6
 ///
 /// Porque **uma corrida "pelo cabo" pode fechar pela Wi-Fi e parecer sucesso**. Medido nesta
 /// bancada em 2026-09-01: duas pontas na mesma máquina, sinalização por `127.0.0.1`, e o par
-/// escolhido foi `192.168.56.131 <-> 192.168.56.131` — a mídia saiu pelo rádio. O `quall-probe`
+/// escolhido foi `192.168.1.131 <-> 192.168.1.131` — a mídia saiu pelo rádio. O `quall-probe`
 /// sempre soube disso porque lê o `Ready` do Rust; a casca não tinha nada equivalente, e foi
 /// exatamente essa linha que explicou os 8,6 s de `docs/receptor-ios.md:243`.
 ///
@@ -3510,6 +4389,37 @@ pub unsafe extern "C" fn quall_track_capture_offset_us(
     }
 }
 
+/// Deslocamento de captura para gravação. A guarda da reprodução não suprime este valor.
+/// Retorna 1 com saídas escritas, 0 enquanto a medida não existe, -1 para erro. `out_guard`
+/// recebe 1 (válida), 0 (pendente) ou -1 (recusada). As saídas não mudam com retorno 0/-1.
+/// Não usar no render de áudio: esta consulta toma o cadeado do relógio da sessão.
+///
+/// # Safety
+/// Handle receptor válido e duas saídas graváveis, distintas.
+#[no_mangle]
+pub unsafe extern "C" fn quall_track_capture_offset_raw_us(
+    t: *const QuallTrack,
+    out_us: *mut i64,
+    out_guard: *mut i32,
+) -> i32 {
+    let (Some(track), Some(saida), Some(guarda)) = (t.as_ref(), out_us.as_mut(), out_guard.as_mut()) else {
+        guardar_nulo("quall_track_capture_offset_raw_us: argumento nulo");
+        return -1;
+    };
+    let Lado::Receptor(receptor) = &track.lado else {
+        guardar_texto("quall_track_capture_offset_raw_us: track de emissão");
+        return -1;
+    };
+    let Some(us) = receptor.deslocamento_de_captura_cru() else { return 0; };
+    *saida = us;
+    *guarda = match receptor.deslocamento_de_captura() {
+        DeslocamentoDeCaptura::Valido { .. } => 1,
+        DeslocamentoDeCaptura::Ainda => 0,
+        DeslocamentoDeCaptura::Recusado { .. } => -1,
+    };
+    1
+}
+
 /// **`ao_pedir_idr` do contrato.** Registra o tratador do pedido de IDR do receptor.
 ///
 /// Disparado quando chega **PLI ou FIR**. A casca responde forçando um IDR pelo meio que a
@@ -4496,6 +5406,7 @@ pub unsafe extern "C" fn quall_advertiser_start_with_role(
         }
     };
     anuncio.papel = papel;
+    laco_local_nos_testes();
     match Advertiser::start(&anuncio, signaling_port) {
         Ok(interno) => Box::into_raw(Box::new(QuallAdvertiser {
             interno: Some(interno),
@@ -4543,7 +5454,7 @@ pub unsafe extern "C" fn quall_host_with_role(
     role: *const c_char,
 ) -> *mut QuallSession {
     match papel_da_fronteira(role, Papel::Teleprompter, "quall_host_with_role") {
-        Ok(papel) => hospedar_pela_fronteira(opcoes, cancelador, papel),
+        Ok(papel) => hospedar_pela_fronteira(opcoes, cancelador, papel, None),
         Err(f) => {
             guardar_falha(&f);
             ptr::null_mut()
@@ -4573,12 +5484,297 @@ pub unsafe extern "C" fn quall_connect_with_role(
     role: *const c_char,
 ) -> *mut QuallSession {
     match papel_da_fronteira(role, Papel::ControleRemoto, "quall_connect_with_role") {
-        Ok(papel) => conectar_pela_fronteira(endpoint, opcoes, cancelador, None, papel),
+        Ok(papel) => conectar_pela_fronteira(endpoint, opcoes, cancelador, None, papel, None),
         Err(f) => {
             guardar_falha(&f);
             ptr::null_mut()
         }
     }
+}
+
+/// **Hospeda aceitando também o código de 4 dígitos** (`docs/conexao.md` §4). `role` como em
+/// [`quall_host_with_role`]; `confirm` de [`quall_code_confirm_new`] — nulo é exatamente
+/// [`quall_host_with_role`].
+///
+/// Com `confirm`, quem conecta sem PIN e sem pareamento guardado pode parear tocando Confirmar dos
+/// dois lados: a tela daqui mostra o que [`quall_code_confirm_state_json`] disser. **O PIN de
+/// `opcoes` continua valendo ao mesmo tempo** — é o caminho do plugin de OBS publicado e de toda
+/// casca que ainda não conhece o código. Um código recusado (de qualquer lado) **não** encerra a
+/// espera; o terceiro encerra a oferta do código nesta espera.
+///
+/// Anuncie com [`quall_advertiser_start_with_code`] e `accepts_code = true` para a lista dos
+/// outros mostrar "Conectar" em vez do campo do PIN.
+///
+/// # Safety
+///
+/// As mesmas de [`quall_host_with_role`]; `confirm` precisa ser nulo ou vir de
+/// [`quall_code_confirm_new`] e continuar vivo durante a chamada.
+#[no_mangle]
+pub unsafe extern "C" fn quall_host_with_code(
+    opcoes: *const QuallSessionOptions,
+    cancelador: *const QuallCanceller,
+    role: *const c_char,
+    confirm: *const QuallCodeConfirm,
+) -> *mut QuallSession {
+    match papel_da_fronteira(role, Papel::Teleprompter, "quall_host_with_code") {
+        Ok(papel) => hospedar_pela_fronteira(opcoes, cancelador, papel, confirmador_de(confirm)),
+        Err(f) => {
+            guardar_falha(&f);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// **Conecta podendo parear pelo código de 4 dígitos** (`docs/conexao.md` §4). `role` como em
+/// [`quall_connect_with_role`]; `width_px`/`height_px` como em [`quall_connect_with_screen`] (0 e 0
+/// é "não digo"); `confirm` nulo é o `connect` de sempre.
+///
+/// A ordem: PIN das opções, se houver; senão o pareamento guardado (retomada); senão o código —
+/// se o outro lado disse que aceita. Diante de um aparelho que não aceita código, sem PIN e sem
+/// pareamento, volta logo com `QUALL_STATUS_NEEDS_PIN`, sem ter mandado quadro nenhum: mostre o
+/// campo do PIN (a espera do outro lado continua, com o PIN dele na tela).
+///
+/// # Safety
+///
+/// As mesmas de [`quall_connect_with_role`]; `confirm` precisa ser nulo ou vir de
+/// [`quall_code_confirm_new`] e continuar vivo durante a chamada.
+#[no_mangle]
+pub unsafe extern "C" fn quall_connect_with_code(
+    endpoint: *const c_char,
+    opcoes: *const QuallSessionOptions,
+    cancelador: *const QuallCanceller,
+    role: *const c_char,
+    confirm: *const QuallCodeConfirm,
+    width_px: u32,
+    height_px: u32,
+) -> *mut QuallSession {
+    let tela = if width_px == 0 && height_px == 0 {
+        None
+    } else {
+        match Screen::nova(width_px, height_px) {
+            Some(t) => Some(t),
+            None => {
+                guardar_texto(&format!(
+                    "quall_connect_with_code: tela {width_px}x{height_px} fora de 1..={}",
+                    Screen::LADO_MAXIMO
+                ));
+                return ptr::null_mut();
+            }
+        }
+    };
+    match papel_da_fronteira(role, Papel::ControleRemoto, "quall_connect_with_code") {
+        Ok(papel) => {
+            conectar_pela_fronteira(endpoint, opcoes, cancelador, tela, papel, confirmador_de(confirm))
+        }
+        Err(f) => {
+            guardar_falha(&f);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// **O toque em Conectar** (`docs/v3-no-privado.md` §8.6): [`quall_connect_with_code`] sabendo
+/// **quem** a pessoa tocou (`expected_device_id`: o item da lista com `known_device_id`, ou a sessão
+/// salva tocada). É a regra única das cascas para o toque; a reconexão automática continua em
+/// [`quall_connect_known`].
+///
+/// - Com vínculo v3 com esse aparelho em `known_peers_json`: **reconecta** em `endpoint` (a rota de
+///   agora), só com o vínculo dele, sem código — mostre "Reconectando…". Se o outro lado não
+///   reconhece o pareamento e há `confirm`, segue **no mesmo toque** para o código, para parear de
+///   novo: o estado do confirmador ganha `"notice": "previous_pairing_invalid"` (diga "O pareamento
+///   anterior não vale mais. Confirme o código para parear de novo."), e o vínculo velho só é trocado
+///   quando a sessão sobe e a casca grava os pares. Sem `confirm`, falha fechado com
+///   `PAIR_NOT_RECOGNIZED` (A2). Uma queda de rede na retomada **não** vira pareamento novo: o núcleo
+///   procura o aparelho de novo (o endereço e a busca) até `opcoes.timeout_ms` e devolve o erro de
+///   rede (`TIMEOUT`, `IO`, `NO_ROUTE`…) se ninguém aparecer.
+/// - Sem vínculo: é [`quall_connect_with_code`] (retomada se alguma dica casar, senão o código).
+/// - Com PIN em `opcoes`, o PIN pareia de novo, como sempre.
+///
+/// Nulo/vazio em `expected_device_id` é [`quall_connect_with_code`].
+///
+/// # Safety
+///
+/// As de [`quall_connect_with_code`]; `expected_device_id` nulo ou terminado em zero.
+#[no_mangle]
+pub unsafe extern "C" fn quall_connect_with_code_to(
+    endpoint: *const c_char,
+    opcoes: *const QuallSessionOptions,
+    cancelador: *const QuallCanceller,
+    role: *const c_char,
+    confirm: *const QuallCodeConfirm,
+    width_px: u32,
+    height_px: u32,
+    expected_device_id: *const c_char,
+) -> *mut QuallSession {
+    let alvo = if expected_device_id.is_null() {
+        None
+    } else {
+        match texto(expected_device_id, "expected_device_id") {
+            Ok("") => None,
+            Ok(t) => Some(DeviceId(t.to_string())),
+            Err(f) => {
+                guardar_falha(&f);
+                return ptr::null_mut();
+            }
+        }
+    };
+    let tela = if width_px == 0 && height_px == 0 {
+        None
+    } else {
+        match Screen::nova(width_px, height_px) {
+            Some(t) => Some(t),
+            None => {
+                guardar_texto(&format!(
+                    "quall_connect_with_code_to: tela {width_px}x{height_px} fora de 1..={}",
+                    Screen::LADO_MAXIMO
+                ));
+                return ptr::null_mut();
+            }
+        }
+    };
+    match papel_da_fronteira(role, Papel::ControleRemoto, "quall_connect_with_code_to") {
+        Ok(papel) => conectar_pela_fronteira_ao_alvo(
+            endpoint,
+            opcoes,
+            cancelador,
+            tela,
+            papel,
+            confirmador_de(confirm),
+            alvo.as_ref(),
+        ),
+        Err(f) => {
+            guardar_falha(&f);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// **A sessão salva, sem id no anúncio** (`docs/v3-no-privado.md` §5.2): acha o aparelho
+/// `device_id` — no endereço antigo `last_endpoint` (pode ser nulo) e nos anfitriões da busca
+/// (mDNS, broadcast, sondagem da /24) — e **retoma com ele na mesma conexão**, só com o vínculo
+/// dele (os outros pares de `known_peers_json` não entram). Nunca usa o código nem o PIN de
+/// `opcoes`. Bloqueia até `opcoes.timeout_ms` (0 = o padrão).
+///
+/// Devolve a sessão como [`quall_connect`]; o endereço em que conectou e por onde o achou saem
+/// em [`quall_session_endpoint_json`] — grave a sessão salva com eles **depois** desta chamada
+/// voltar (a retomada é o que autentica). Nulo: `NEEDS_PIN` (não há vínculo v3 com o aparelho:
+/// pareie de novo), `PAIR_NOT_RECOGNIZED` (o endereço antigo, ou o único candidato que serve ao
+/// papel, respondeu sem reconhecer este pareamento: ele esqueceu este aparelho — ofereça "Esquecer"
+/// e parear de novo), `TIMEOUT` (ninguém com a dica dele respondeu: outra rede, desligado, ou vários
+/// aparelhos sem a dica), `CANCELLED`, `INVALID`.
+///
+/// `role`: `NULL`/`""` para vídeo, `"controle_remoto"` para o controle de um teleprompter — o
+/// controle reconecta ao prompter guardado por aqui (a porta que falta é a 7979).
+///
+/// # Safety
+///
+/// `device_id` terminado em zero; `last_endpoint` nulo ou terminado em zero; `opcoes` válido;
+/// `cancelador` nulo ou vivo durante a chamada.
+#[no_mangle]
+pub unsafe extern "C" fn quall_connect_known(
+    device_id: *const c_char,
+    last_endpoint: *const c_char,
+    opcoes: *const QuallSessionOptions,
+    cancelador: *const QuallCanceller,
+    role: *const c_char,
+) -> *mut QuallSession {
+    conectar_ao_conhecido(device_id, last_endpoint, opcoes, cancelador, role, None)
+}
+
+/// [`quall_connect_known`] **com a tela do receptor** (como [`quall_connect_with_screen`]): o
+/// transmissor ajusta a captura ao tamanho dela. `0, 0` é exatamente [`quall_connect_known`]; um
+/// lado fora de `1..=Screen::LADO_MAXIMO` é `INVALID`.
+///
+/// # Safety
+///
+/// As mesmas de [`quall_connect_known`].
+#[no_mangle]
+pub unsafe extern "C" fn quall_connect_known_with_screen(
+    device_id: *const c_char,
+    last_endpoint: *const c_char,
+    opcoes: *const QuallSessionOptions,
+    cancelador: *const QuallCanceller,
+    role: *const c_char,
+    width_px: u32,
+    height_px: u32,
+) -> *mut QuallSession {
+    let tela = if width_px == 0 && height_px == 0 {
+        None
+    } else {
+        match Screen::nova(width_px, height_px) {
+            Some(t) => Some(t),
+            None => {
+                guardar_texto(&format!(
+                    "quall_connect_known_with_screen: tela {width_px}x{height_px} fora de 1..={}",
+                    Screen::LADO_MAXIMO
+                ));
+                return ptr::null_mut();
+            }
+        }
+    };
+    conectar_ao_conhecido(device_id, last_endpoint, opcoes, cancelador, role, tela)
+}
+
+/// # Safety
+///
+/// As mesmas de [`quall_connect_known`].
+unsafe fn conectar_ao_conhecido(
+    device_id: *const c_char,
+    last_endpoint: *const c_char,
+    opcoes: *const QuallSessionOptions,
+    cancelador: *const QuallCanceller,
+    role: *const c_char,
+    tela: Option<Screen>,
+) -> *mut QuallSession {
+    let feito = (|| -> Saida<Ready> {
+        let papel = papel_da_fronteira(role, Papel::ControleRemoto, "quall_connect_known")?;
+        let alvo = DeviceId(texto(device_id, "device_id")?.to_string());
+        let opcoes = opcoes
+            .as_ref()
+            .ok_or_else(|| Falha::Nulo("quall_connect_known: `opcoes` é nulo".into()))?;
+        let porta = porta_para_completar(papel);
+        let ultimo = if last_endpoint.is_null() {
+            None
+        } else {
+            match texto(last_endpoint, "last_endpoint")? {
+                "" => None,
+                t => Some(endereco_manual_com_porta(t, porta, PRAZO_DE_RESOLUCAO)?),
+            }
+        };
+        let (mut cfg, _) = montar_config(opcoes, cancelamento_de(cancelador))?;
+        cfg.announcement.papel = papel;
+        cfg.announcement.screen = tela;
+        cfg.pin = None;
+        laco_local_nos_testes();
+        Ok(quall_core::session::conectar_ao_par(&alvo, ultimo, cfg)?)
+    })();
+    match feito {
+        Ok(pronto) => empacotar(pronto, None),
+        Err(f) => {
+            guardar_falha(&f);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Onde a sessão do **convidado** conectou: `{"endpoint":"192.168.15.9:7877","via":"udp"}`. `via`
+/// só vem de [`quall_connect_known`] (`"endereco_antigo"`, `"mdns"`, `"udp"`, `"sondagem"`); nas
+/// outras é `null`. No anfitrião, `endpoint` é `null`. Padrão `(buf, cap)`.
+///
+/// # Safety
+///
+/// `s` precisa vir de [`quall_host`] ou [`quall_connect`] e estar viva; `buf` nulo ou com `cap` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn quall_session_endpoint_json(s: *const QuallSession, buf: *mut c_char, cap: usize) -> isize {
+    let Some(sessao) = s.as_ref() else {
+        guardar_nulo("quall_session_endpoint_json: sessão nula");
+        return -1;
+    };
+    let j = serde_json::json!({
+        "endpoint": sessao.pronto.endereco_do_par.map(|e| e.to_string()),
+        "via": sessao.pronto.via_do_par,
+    });
+    escrever_texto(&j.to_string(), buf, cap)
 }
 
 /// **A porta do teleprompter**: 7979. O prompter hospeda nela ([`quall_teleprompter_pick_port`]), e
@@ -4607,7 +5803,7 @@ pub extern "C" fn quall_teleprompter_pick_port(wait_ms: u32) -> u16 {
 /// o QR trouxe —, sem rede nenhuma. Padrão `(buf, cap)`:
 ///
 /// ```json
-/// {"endereco":"192.168.57.8:7979","pin":"424242"}
+/// {"endereco":"192.168.15.8:7979","pin":"424242"}
 /// ```
 ///
 /// `"pin"` é `null` quando a entrada não era um link. Sem porta, a do papel: `role`
@@ -4802,6 +5998,30 @@ pub unsafe extern "C" fn quall_messages_free(m: *mut QuallMessages) {
     }
 }
 
+/// **O mensageiro da câmera desta sessão** (`docs/controle-remoto-da-camera.md` §17.2): manda pelo
+/// mesmo canal que `m`, e lê de uma **caixa própria**, para onde vão as mensagens da câmera
+/// (`"app":"camera"`) que chegam à sessão. É como o controle remoto da câmera (R9b) passa pela
+/// sessão do **teleprompter**: o prompter R5 bombeia o seu `QuallCameraHost` com ele, e o controle o
+/// seu `QuallCameraRemote`, enquanto `quall_teleprompter_pump` lê o handle comum e nunca vê a câmera.
+///
+/// Na primeira vez **liga a triagem** da sessão: dali em diante, a câmera só chega por um handle
+/// destes. Pedido de novo (de `m` ou de um handle da câmera), é outro handle da mesma caixa.
+/// **Numa sessão de vídeo, não peça**: lá o leitor da câmera é o handle comum. É do chamador: libere
+/// com [`quall_messages_free`]; sobrevive a [`quall_session_close`] como o comum, e depois do fim lê
+/// `QUALL_STATUS_CLOSED`. `NULL` com `m` nulo.
+///
+/// # Safety
+///
+/// `m` precisa vir de [`quall_session_messages`] (ou desta função) e estar vivo.
+#[no_mangle]
+pub unsafe extern "C" fn quall_messages_for_camera(m: *const QuallMessages) -> *mut QuallMessages {
+    let Some(m) = m.as_ref() else {
+        guardar_nulo("quall_messages_for_camera: handle nulo");
+        return ptr::null_mut();
+    };
+    Box::into_raw(Box::new(QuallMessages(m.0.da_camera())))
+}
+
 // ---------------------------------------------------------------------------------------------
 // O teleprompter
 // ---------------------------------------------------------------------------------------------
@@ -4847,6 +6067,10 @@ pub enum QuallTeleprompterChange {
     /// ou parou (`"gravando_ha_ms"`), o pedido daqui foi respondido (`"pedido_de_gravacao"` voltou a
     /// `null`; `"gravacao_recusada"` diz se foi recusado), ou `"par_entende_gravar"` mudou.
     Recording = 8192,
+    /// **No controle**: `"par_entende_camera"` mudou — o prompter passou a dizer, ou deixou de dizer,
+    /// que tem a câmera para controlar (`docs/controle-remoto-da-camera.md` §17.3). Com ele, bombeie
+    /// o `QuallCameraRemote` sobre [`quall_messages_for_camera`]; sem ele, pare.
+    Camera = 16384,
 }
 
 /// **Uma réplica do estado do teleprompter.** Ver [`quall_teleprompter_new`].
@@ -5383,6 +6607,21 @@ pub unsafe extern "C" fn quall_teleprompter_enable_recording(
     editar_teleprompter(t, "quall_teleprompter_enable_recording", |tp| {
         tp.ligar_gravacao(enabled)
     })
+}
+
+/// **Diz se a tela deste prompter tem a câmera para o controle controlar** (R9b pelo canal do
+/// teleprompter, `docs/controle-remoto-da-camera.md` §17.3): a tela do prompter R5 liga
+/// (`enabled = true`) quando bombeia o seu `QuallCameraHost` sobre [`quall_messages_for_camera`] da
+/// sessão do teleprompter, e desliga ao fechar. Ligada, o estado leva `"entende_camera": true`, e o
+/// controle vê `"par_entende_camera"` (o bit `QUALL_TELEPROMPTER_CHANGE_CAMERA`). No controle, não
+/// muda nada.
+///
+/// # Safety
+///
+/// `t` precisa vir de [`quall_teleprompter_new`].
+#[no_mangle]
+pub unsafe extern "C" fn quall_teleprompter_enable_camera(t: *const QuallTeleprompter, enabled: bool) -> QuallStatus {
+    editar_teleprompter(t, "quall_teleprompter_enable_camera", |tp| tp.ligar_camera(enabled))
 }
 
 /// **O relato da gravação, por quem grava** (§13): `true` quando o arquivo começou, `false` quando
@@ -6121,7 +7360,7 @@ pub unsafe extern "C" fn quall_camera_remote_pump(
 ///
 /// ```json
 /// {"situacao":"pronto","capacidades":{…},"ajuste":{…},"aplicado":{…},"pendente":{"iso":800},
-///  "lido":{…},"autor":"Pixel do Pessoa Exemplo","versao":17,
+///  "lido":{…},"autor":"Pixel do Pessoa","versao":17,
 ///  "recusa":{"motivo":"superado","campo":"iso","ha_ms":300},"contadores":{…}}
 /// ```
 ///
@@ -6647,27 +7886,25 @@ mod tests {
         ]);
         let (announcement, signaling_port) =
             quall_core::discovery::announcement_from_txt(&props).unwrap();
-        let browser = QuallBrowser {
-            interno: None,
-            achados: Mutex::new(vec![DiscoveredDevice {
-                announcement,
-                signaling_port,
-                addresses: Vec::new(),
-                fullname: "Quall fixture._quall._tcp.local.".into(),
-            }]),
-        };
-        unsafe {
-            let length = quall_browser_devices_json(&browser, ptr::null_mut(), 0);
-            assert!(length > 0);
-            let mut buf = vec![0 as c_char; length as usize];
-            assert_eq!(quall_browser_devices_json(&browser, buf.as_mut_ptr(), buf.len()), length);
-            let items: serde_json::Value =
-                serde_json::from_str(CStr::from_ptr(buf.as_ptr()).to_str().unwrap()).unwrap();
-            assert_eq!(items[0]["identity_authenticated"], false);
-            assert_eq!(items[0]["device_id"], format!("discovery-{}", "12".repeat(16)));
-            assert_eq!(items[0]["display_name"], "Quall 12121212");
-            assert_eq!(items[0]["endpoint"], serde_json::Value::Null);
-        }
+        assert_eq!(signaling_port, 7877);
+        // A lista do privado vem da `Busca` (três caminhos); o item é o mesmo `aparelho_em_json`.
+        let item = aparelho_em_json(&AparelhoVisto {
+            anuncio: announcement,
+            endpoint: None,
+            via: vec!["mdns"],
+            visto_ha: Duration::ZERO,
+            vivo: true,
+            aceita_codigo: false,
+            proprio: false,
+            conhecido: None,
+            chave: "k".into(),
+            nome_anunciado: None,
+        });
+        assert_eq!(item["identity_authenticated"], false);
+        assert_eq!(item["announced_name"], serde_json::Value::Null, "sem `nm`, sem nome: o alias");
+        assert_eq!(item["device_id"], format!("discovery-{}", "12".repeat(16)));
+        assert_eq!(item["display_name"], "Quall 12121212");
+        assert_eq!(item["endpoint"], serde_json::Value::Null);
     }
 
     #[test]
@@ -6903,7 +8140,7 @@ mod tests {
     fn falta_de_rota_e_conexao_recusada_nao_chegam_com_o_mesmo_codigo() {
         assert_eq!(
             QuallStatus::from(&Error::NoRoute(
-                "não há rota até 192.168.56.131:47891".into()
+                "não há rota até 192.168.1.131:47891".into()
             )),
             QuallStatus::NoRoute
         );
@@ -7199,7 +8436,7 @@ mod tests {
     fn falhas_diferentes_da_mesma_funcao_saem_com_codigos_diferentes() {
         unsafe {
             // Sem opções: erro de programação da casca.
-            assert!(quall_connect(c"192.168.56.131:7877".as_ptr(), ptr::null()).is_null());
+            assert!(quall_connect(c"192.168.1.131:7877".as_ptr(), ptr::null()).is_null());
             assert_eq!(quall_last_status(), QuallStatus::NullPointer);
 
             // Endpoint nulo, com o mesmo caminho de código: continua sendo ponteiro nulo, mas o
@@ -8908,6 +10145,7 @@ mod testes_do_teleprompter {
             (B::TextCopy, mudou::COPIA_DO_TEXTO),
             (B::Hold, mudou::SEGURAR),
             (B::Recording, mudou::GRAVACAO),
+            (B::Camera, mudou::CAMERA),
         ];
         for (b, n) in pares {
             assert_eq!(b as u32, n, "{b:?}");
@@ -9288,25 +10526,25 @@ mod testes_do_teleprompter {
         };
         let controle = c"controle_remoto".as_ptr();
         assert_eq!(
-            ler(c"192.168.57.8", controle).as_deref(),
-            Some(r#"{"endereco":"192.168.57.8:7979","pin":null}"#)
+            ler(c"192.168.15.8", controle).as_deref(),
+            Some(r#"{"endereco":"192.168.15.8:7979","pin":null}"#)
         );
         assert_eq!(
-            ler(c"192.168.57.8", ptr::null()).as_deref(),
-            Some(r#"{"endereco":"192.168.57.8:7877","pin":null}"#)
+            ler(c"192.168.15.8", ptr::null()).as_deref(),
+            Some(r#"{"endereco":"192.168.15.8:7877","pin":null}"#)
         );
         assert_eq!(
-            ler(c"192.168.57.8", c"".as_ptr()).as_deref(),
-            Some(r#"{"endereco":"192.168.57.8:7877","pin":null}"#)
+            ler(c"192.168.15.8", c"".as_ptr()).as_deref(),
+            Some(r#"{"endereco":"192.168.15.8:7877","pin":null}"#)
         );
         assert_eq!(
             ler(c"quall://424242@[fe80::1]:7980/", controle).as_deref(),
             Some(r#"{"endereco":"[fe80::1]:7980","pin":"424242"}"#)
         );
         for (t, papel) in [
-            (c"quall://42424@192.168.57.8:7979", controle),
-            (c"192.168.57.8 : 7979", controle),
-            (c"192.168.57.8", c"teleprompter".as_ptr()),
+            (c"quall://42424@192.168.15.8:7979", controle),
+            (c"192.168.15.8 : 7979", controle),
+            (c"192.168.15.8", c"teleprompter".as_ptr()),
         ] {
             assert_eq!(ler(t, papel), None, "{t:?}");
             assert_eq!(quall_last_status(), QuallStatus::Invalid, "{t:?}");
@@ -10715,6 +11953,26 @@ mod testes_da_camera_remota {
     const CAPS: &CStr = c"{\"controles\":{\"exposicao\":{\"valores\":[\"auto\",\"manual\"]},\"ev\":{\"min\":-2,\"max\":2,\"passo\":0.1},\"toque\":{}},\"limites\":{\"iso\":\"fabricante\"}}";
     const AJUSTE: &CStr = c"{\"exposicao\":\"auto\",\"ev\":0}";
 
+    /// §17 do contrato da câmera, pela fronteira: o mensageiro da câmera com handle nulo é `NULL`, e
+    /// `enable_camera` com réplica nula é `NULL_POINTER`; no prompter liga, e o estado do controle tem
+    /// a chave `"par_entende_camera"`.
+    #[test]
+    fn a_camera_pelo_teleprompter_na_fronteira() {
+        unsafe {
+            assert!(quall_messages_for_camera(ptr::null()).is_null());
+            assert_eq!(quall_teleprompter_enable_camera(ptr::null(), true), QuallStatus::NullPointer);
+            let p = quall_teleprompter_new(c"p".as_ptr(), c"teleprompter".as_ptr(), ptr::null());
+            let c = quall_teleprompter_new(c"c".as_ptr(), c"controle_remoto".as_ptr(), ptr::null());
+            assert!(!p.is_null() && !c.is_null());
+            assert_eq!(quall_teleprompter_enable_camera(p, true), QuallStatus::Ok);
+            assert_eq!(quall_teleprompter_enable_camera(c, true), QuallStatus::Ok, "no controle não muda nada");
+            let e = texto_de(|b, n| quall_teleprompter_state_json(c, b, n));
+            assert!(e.contains(r#""par_entende_camera":false"#), "{e}");
+            quall_teleprompter_free(p);
+            quall_teleprompter_free(c);
+        }
+    }
+
     #[test]
     fn nulos_e_entradas_ruins_nao_derrubam() {
         unsafe {
@@ -10934,6 +12192,705 @@ mod testes_da_camera_remota {
             quall_messages_free(mr.0);
             quall_camera_host_free(h.0);
             quall_camera_remote_free(r.0);
+        }
+    }
+}
+
+/// A fronteira da conexão sem dor (`docs/conexao.md`): o confirmador do código, a lista com as
+/// chaves novas e a procura pelo id.
+#[cfg(test)]
+mod testes_da_conexao {
+    use super::*;
+
+    fn texto_de(f: impl Fn(*mut c_char, usize) -> isize) -> String {
+        let n = f(ptr::null_mut(), 0);
+        assert!(n > 0, "{}", ultima_mensagem());
+        let mut buf = vec![0u8; n as usize];
+        let escrito = f(buf.as_mut_ptr().cast(), buf.len());
+        assert_eq!(escrito, n);
+        buf.truncate(escrito as usize - 1);
+        String::from_utf8(buf).expect("UTF-8")
+    }
+
+    fn ultima_mensagem() -> String {
+        unsafe { CStr::from_ptr(quall_last_error()) }.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn o_confirmador_comeca_esperando_e_toque_fora_de_hora_nao_vale() {
+        let c = quall_code_confirm_new();
+        unsafe {
+            assert!(!quall_code_confirm_accept(c, 0), "sem código na tela");
+            let j: serde_json::Value =
+                serde_json::from_str(&texto_de(|b, n| quall_code_confirm_state_json(c, b, n)))
+                    .expect("json");
+            assert_eq!(j["phase"], "esperando");
+            assert!(j["code"].is_null() && j["peer"].is_null());
+            assert_eq!(j["attempts"], 0);
+            assert!(!quall_code_confirm_accept(ptr::null(), 1));
+            assert!(!quall_code_confirm_reject(ptr::null(), 1));
+            quall_code_confirm_free(c);
+            quall_code_confirm_free(ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn a_lista_traz_as_chaves_de_antes_e_as_novas() {
+        let a = Announcement {
+            protocol_version: PROTOCOL_VERSION,
+            device_id: DeviceId("ffi-1".into()),
+            display_name: "Câmera".into(),
+            capabilities: Capabilities { screen_source: false, camera_source: true, sink: false },
+            screen: None,
+            papel: Some(Papel::Teleprompter),
+        };
+        let visto = AparelhoVisto {
+            anuncio: a,
+            endpoint: Some("192.168.15.9:7979".parse().expect("e")),
+            via: vec!["mdns", "udp"],
+            visto_ha: Duration::from_millis(1500),
+            vivo: true,
+            aceita_codigo: true,
+            proprio: false,
+            conhecido: None,
+            chave: "k".into(),
+            nome_anunciado: Some("iPhone 7".into()),
+        };
+        let j = aparelho_em_json(&visto);
+        assert_eq!(j["announced_name"], "iPhone 7");
+        assert_eq!(j["display_name"], "Câmera", "o display_name segue o do anúncio (o alias, na lista)");
+        for chave in ["device_id", "display_name", "protocol_version", "capabilities", "endpoint", "papel"] {
+            assert!(j.get(chave).is_some(), "falta a chave de antes {chave}");
+        }
+        assert_eq!(j["endpoint"], "192.168.15.9:7979");
+        assert_eq!(j["alive"], true);
+        assert_eq!(j["seen_ms_ago"], 1500);
+        assert_eq!(j["via"], serde_json::json!(["mdns", "udp"]));
+        assert_eq!(j["accepts_code"], true);
+    }
+
+    #[test]
+    fn o_navegador_da_o_diagnostico_e_para_sem_pendurar() {
+        let b = quall_browser_start();
+        assert!(!b.is_null());
+        unsafe {
+            assert!(quall_browser_collect(b, 10) >= 0);
+            let j: serde_json::Value =
+                serde_json::from_str(&texto_de(|buf, n| quall_browser_hint_json(b, buf, n)))
+                    .expect("json");
+            assert!(j["causes"].is_array() && j["networks"].is_array());
+            assert!(j["listening"].is_boolean() && j["probes"].is_number());
+            let inicio = Instant::now();
+            quall_browser_stop(b);
+            assert!(inicio.elapsed() < Duration::from_secs(3));
+        }
+    }
+
+    #[test]
+    fn localizar_com_endereco_ilegivel_e_invalid_e_sem_id_e_nulo() {
+        let id = CString::new("x").expect("c");
+        let ruim = CString::new("não é endereço").expect("c");
+        unsafe {
+            assert_eq!(
+                quall_locate_peer_json(id.as_ptr(), ruim.as_ptr(), 100, ptr::null_mut(), 0),
+                -1
+            );
+            assert_eq!(quall_last_status(), QuallStatus::Invalid);
+            assert_eq!(
+                quall_locate_peer_json(ptr::null(), ptr::null(), 100, ptr::null_mut(), 0),
+                -1
+            );
+            assert_eq!(quall_last_status(), QuallStatus::NullPointer);
+        }
+    }
+}
+
+/// A fronteira do QR invertido (`docs/conexao.md` §10): o convite, a leitura, o chamado e a sessão
+/// inteira pela porta em C.
+#[cfg(test)]
+mod testes_do_qr {
+    use super::*;
+
+    fn texto_de(f: impl Fn(*mut c_char, usize) -> isize) -> String {
+        let n = f(ptr::null_mut(), 0);
+        assert!(n > 0, "{}", ultima_mensagem());
+        let mut buf = vec![0u8; n as usize];
+        let escrito = f(buf.as_mut_ptr().cast(), buf.len());
+        assert_eq!(escrito, n);
+        buf.truncate(escrito as usize - 1);
+        String::from_utf8(buf).expect("UTF-8")
+    }
+
+    fn ultima_mensagem() -> String {
+        unsafe { CStr::from_ptr(quall_last_error()) }.to_string_lossy().into_owned()
+    }
+
+    /// Uma chamada só, com buffer folgado: o chamado é ação, e chamá-lo duas vezes seria chamar
+    /// duas vezes (o padrão de perguntar o tamanho antes não serve para ele).
+    fn uma_vez(f: impl Fn(*mut c_char, usize) -> isize) -> String {
+        let mut buf = vec![0u8; 1024];
+        let n = f(buf.as_mut_ptr().cast(), buf.len());
+        assert!(n > 0 && (n as usize) <= buf.len(), "{n}: {:?} {}", quall_last_status(), ultima_mensagem());
+        buf.truncate(n as usize - 1);
+        String::from_utf8(buf).expect("UTF-8")
+    }
+
+    struct Eu {
+        _id: CString,
+        _nome: CString,
+        desc: QuallDeviceDesc,
+    }
+
+    fn eu(id: &str, nome: &str) -> Eu {
+        let (id, nome) = (CString::new(id).unwrap(), CString::new(nome).unwrap());
+        let desc = QuallDeviceDesc {
+            device_id: id.as_ptr(),
+            display_name: nome.as_ptr(),
+            screen_source: true,
+            camera_source: true,
+            sink: true,
+        };
+        Eu { _id: id, _nome: nome, desc }
+    }
+
+    struct Opcoes {
+        _eu: Eu,
+        _pin: Option<CString>,
+        opcoes: QuallSessionOptions,
+    }
+
+    fn opcoes(id: &str, pin: Option<&str>, porta: u16) -> Opcoes {
+        let e = eu(id, &format!("{id} de teste"));
+        let pin = pin.map(|p| CString::new(p).unwrap());
+        let opcoes = QuallSessionOptions {
+            me: QuallDeviceDesc { ..e.desc },
+            pin: pin.as_ref().map_or(ptr::null(), |p| p.as_ptr()),
+            known_peers_json: ptr::null(),
+            signaling_port: porta,
+            timeout_ms: 20_000,
+            tracks: ptr::null(),
+            track_count: 0,
+            bind_address: ptr::null(),
+        };
+        Opcoes { _eu: e, _pin: pin, opcoes }
+    }
+
+    struct Enviavel<T>(*mut T);
+    // SAFETY: só atravessa a thread do teste para ser fechado do lado de cá.
+    unsafe impl<T> Send for Enviavel<T> {}
+
+    /// **B4**: buffer nulo ou menor que 512 é `INVALID` sem chamar ninguém — o convite continua
+    /// esperando.
+    #[test]
+    fn o_chamado_com_buffer_pequeno_e_recusado_antes_da_rede() {
+        let mac = eu("ffi-qr-b4", "Mac");
+        let convite = unsafe { quall_qr_invite_new(&mac.desc, 30_000) };
+        assert!(!convite.is_null(), "{}", ultima_mensagem());
+        unsafe {
+            let texto = CString::new(texto_de(|b, n| quall_qr_invite_text(convite, b, n))).unwrap();
+            let me = eu("ffi-qr-b4-cel", "A07");
+            assert_eq!(quall_qr_call_json(texto.as_ptr(), &me.desc, 7877, 0, ptr::null_mut(), 0), -1);
+            assert_eq!(quall_last_status(), QuallStatus::Invalid);
+            let mut pequeno = [0 as c_char; 64];
+            assert_eq!(quall_qr_call_json(texto.as_ptr(), &me.desc, 7877, 0, pequeno.as_mut_ptr(), pequeno.len()), -1);
+            assert_eq!(quall_last_status(), QuallStatus::Invalid);
+            let estado: serde_json::Value =
+                serde_json::from_str(&texto_de(|b, n| quall_qr_invite_state_json(convite, b, n))).unwrap();
+            assert_eq!(estado["phase"], "esperando", "nenhum chamado saiu");
+            quall_qr_invite_free(convite);
+        }
+    }
+
+    #[test]
+    fn ler_um_qr_que_nao_e_do_quall_e_invalid_e_nulos_sao_nulos() {
+        unsafe {
+            for t in [c"quall://424242@192.168.0.2:7877", c"https://exemplo.com", c"quall://chamar?v=9&a=10.0.0.1&p=1&i=x&s=00"] {
+                assert_eq!(quall_qr_read_json(t.as_ptr(), ptr::null_mut(), 0), -1);
+                assert_eq!(quall_last_status(), QuallStatus::Invalid);
+            }
+            assert!(ultima_mensagem().contains("atualize"), "{}", ultima_mensagem());
+            assert_eq!(quall_qr_read_json(ptr::null(), ptr::null_mut(), 0), -1);
+            assert_eq!(quall_last_status(), QuallStatus::NullPointer);
+            assert!(quall_qr_invite_new(ptr::null(), 0).is_null());
+            assert_eq!(quall_last_status(), QuallStatus::NullPointer);
+            assert_eq!(quall_qr_invite_text(ptr::null(), ptr::null_mut(), 0), -1);
+            assert_eq!(quall_qr_invite_state_json(ptr::null(), ptr::null_mut(), 0), -1);
+            assert!(quall_connect_with_invite(ptr::null(), ptr::null(), ptr::null()).is_null());
+            quall_qr_invite_free(ptr::null_mut());
+            let me = eu("ffi-qr-celular", "A07");
+            assert_eq!(
+                quall_qr_call_json(c"lixo".as_ptr(), &me.desc, 7877, 100, ptr::null_mut(), 0),
+                -1
+            );
+            assert_eq!(quall_last_status(), QuallStatus::Invalid);
+        }
+    }
+
+    /// A sequência inteira pela porta em C, com a biblioteca de produto: o QR leva os endereços da
+    /// LAN desta máquina. Sem rede local, o convite é `NO_ROUTE` e o teste diz isso e para.
+    #[test]
+    fn a_sequencia_completa_pela_porta_em_c() {
+        let mac = eu("ffi-qr-mac", "MacBook de teste");
+        let convite = unsafe { quall_qr_invite_new(&mac.desc, 30_000) };
+        if convite.is_null() {
+            assert_eq!(quall_last_status(), QuallStatus::NoRoute, "{}", ultima_mensagem());
+            eprintln!("sem rede local nesta máquina: a sequência pela porta em C não roda");
+            return;
+        }
+        unsafe {
+            let texto = texto_de(|b, n| quall_qr_invite_text(convite, b, n));
+            assert!(texto.starts_with("quall://chamar?v=2&"), "{texto}");
+            let estado: serde_json::Value =
+                serde_json::from_str(&texto_de(|b, n| quall_qr_invite_state_json(convite, b, n))).unwrap();
+            assert_eq!(estado["phase"], "esperando");
+            assert!(estado["expires_in_ms"].as_u64().unwrap() > 20_000);
+            assert!(estado["peer_id"].is_null());
+
+            let ct = CString::new(texto.clone()).unwrap();
+            let lido: serde_json::Value =
+                serde_json::from_str(&texto_de(|b, n| quall_qr_read_json(ct.as_ptr(), b, n))).unwrap();
+            assert_eq!(lido["peer_id"], "ffi-qr-mac");
+            assert_eq!(lido["peer_name"], "MacBook de teste");
+            assert_eq!(lido["port"], estado["port"]);
+            let segredo = texto.rsplit("s=").next().unwrap();
+            assert!(!lido.to_string().contains(segredo), "a leitura não devolve o segredo");
+
+            // O celular hospeda com o PIN na tela, numa porta conhecida.
+            let porta = {
+                let l = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+                l.local_addr().unwrap().port()
+            };
+            let celular = std::thread::spawn(move || {
+                let o = opcoes("ffi-qr-celular", Some("424242"), porta);
+                Enviavel(quall_host_cancelable(&o.opcoes, ptr::null()))
+            });
+            std::thread::sleep(Duration::from_millis(200));
+
+            // O desktop espera o chamado numa thread, como a casca faria.
+            let c = Enviavel(convite);
+            let desktop = std::thread::spawn(move || {
+                let c = c;
+                let o = opcoes("ffi-qr-mac", None, 0);
+                Enviavel(quall_connect_with_invite(c.0, &o.opcoes, ptr::null()))
+            });
+
+            let me = eu("ffi-qr-celular", "Galaxy A07");
+            let r: serde_json::Value = serde_json::from_str(&uma_vez(|b, n| {
+                quall_qr_call_json(ct.as_ptr(), &me.desc, porta, 5_000, b, n)
+            }))
+            .unwrap();
+            assert_eq!(r["result"], "aceito", "{r}");
+            assert_eq!(r["peer_id"], "ffi-qr-mac");
+
+            let d = desktop.join().unwrap().0;
+            assert!(!d.is_null(), "o desktop não subiu: {:?} {}", quall_last_status(), ultima_mensagem());
+            let h = celular.join().unwrap().0;
+            assert!(!h.is_null(), "o celular não subiu");
+            assert!(quall_session_pairing_is_new(d) && quall_session_pairing_is_new(h));
+            let estado: serde_json::Value =
+                serde_json::from_str(&texto_de(|b, n| quall_qr_invite_state_json(convite, b, n))).unwrap();
+            assert_eq!(estado["phase"], "chamado");
+            assert_eq!(estado["peer_id"], "ffi-qr-celular");
+            assert_eq!(estado["peer_name"], "Galaxy A07");
+
+            // Um segundo celular com o mesmo QR ouve "usado".
+            std::thread::sleep(Duration::from_millis(300));
+            let outro = eu("ffi-qr-outro", "S24");
+            let r: serde_json::Value = serde_json::from_str(&uma_vez(|b, n| {
+                quall_qr_call_json(ct.as_ptr(), &outro.desc, 7877, 5_000, b, n)
+            }))
+            .unwrap();
+            assert_eq!(r, serde_json::json!({"result": "recusado", "reason": "usado"}));
+
+            assert_eq!(quall_session_close(d), QuallStatus::Ok);
+            assert_eq!(quall_session_close(h), QuallStatus::Ok);
+            quall_qr_invite_free(convite);
+        }
+    }
+
+    /// O controle mostra o QR e o **teleprompter** (a espera com papel, que só aceita controle remoto)
+    /// lê e chama: `quall_connect_with_invite_role` com `"controle_remoto"`.
+    #[test]
+    fn o_teleprompter_le_o_qr_do_controle() {
+        let controle = eu("ffi-qr-controle", "Controle de teste");
+        let convite = unsafe { quall_qr_invite_new(&controle.desc, 30_000) };
+        if convite.is_null() {
+            assert_eq!(quall_last_status(), QuallStatus::NoRoute, "{}", ultima_mensagem());
+            eprintln!("sem rede local nesta máquina: o teleprompter pelo QR não roda");
+            return;
+        }
+        unsafe {
+            // Papel errado é INVALID, sem esperar chamado nenhum.
+            let o = opcoes("ffi-qr-controle", None, 0);
+            assert!(quall_connect_with_invite_role(convite, &o.opcoes, ptr::null(), c"teleprompter".as_ptr()).is_null());
+            assert_eq!(quall_last_status(), QuallStatus::Invalid);
+
+            let texto = CString::new(texto_de(|b, n| quall_qr_invite_text(convite, b, n))).unwrap();
+            let porta = {
+                let l = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+                l.local_addr().unwrap().port()
+            };
+            let prompter = std::thread::spawn(move || {
+                let o = opcoes("ffi-qr-prompter", Some("424242"), porta);
+                Enviavel(quall_host_with_role(&o.opcoes, ptr::null(), c"teleprompter".as_ptr()))
+            });
+            std::thread::sleep(Duration::from_millis(200));
+            let c = Enviavel(convite);
+            let lado = std::thread::spawn(move || {
+                let c = c;
+                let o = opcoes("ffi-qr-controle", None, 0);
+                Enviavel(quall_connect_with_invite_role(c.0, &o.opcoes, ptr::null(), c"controle_remoto".as_ptr()))
+            });
+            let me = eu("ffi-qr-prompter", "iPhone prompter");
+            let r: serde_json::Value = serde_json::from_str(&uma_vez(|b, n| {
+                quall_qr_call_json(texto.as_ptr(), &me.desc, porta, 5_000, b, n)
+            }))
+            .unwrap();
+            assert_eq!(r["result"], "aceito", "{r}");
+            let ctl = lado.join().unwrap().0;
+            assert!(!ctl.is_null(), "o controle não subiu: {:?} {}", quall_last_status(), ultima_mensagem());
+            let p = prompter.join().unwrap().0;
+            assert!(!p.is_null(), "o prompter não subiu");
+            assert!(quall_session_pairing_is_new(ctl) && quall_session_pairing_is_new(p));
+            let par: serde_json::Value =
+                serde_json::from_str(&texto_de(|b, n| quall_session_peer_json(p, b, n))).unwrap();
+            assert_eq!(par["device_id"], "ffi-qr-controle");
+            assert_eq!(par["papel"], "controle_remoto", "{par}");
+            assert_eq!(quall_session_close(ctl), QuallStatus::Ok);
+            assert_eq!(quall_session_close(p), QuallStatus::Ok);
+            quall_qr_invite_free(convite);
+        }
+    }
+
+    #[test]
+    fn o_convite_que_expira_devolve_timeout_e_o_cancelar_cancelled() {
+        let mac = eu("ffi-qr-expira", "Mac");
+        let convite = unsafe { quall_qr_invite_new(&mac.desc, 100) };
+        if convite.is_null() {
+            assert_eq!(quall_last_status(), QuallStatus::NoRoute);
+            return;
+        }
+        unsafe {
+            let o = opcoes("ffi-qr-expira", None, 0);
+            assert!(quall_connect_with_invite(convite, &o.opcoes, ptr::null()).is_null());
+            assert_eq!(quall_last_status(), QuallStatus::Timeout, "{}", ultima_mensagem());
+            quall_qr_invite_free(convite);
+
+            let convite = quall_qr_invite_new(&mac.desc, 60_000);
+            let cancelar = quall_canceller_new();
+            quall_session_cancel(cancelar);
+            assert!(quall_connect_with_invite(convite, &o.opcoes, cancelar).is_null());
+            assert_eq!(quall_last_status(), QuallStatus::Cancelled);
+            // `me` de outro aparelho não serve: o convite é de um id só.
+            let outro = opcoes("ffi-qr-outro-id", None, 0);
+            assert!(quall_connect_with_invite(convite, &outro.opcoes, ptr::null()).is_null());
+            assert_eq!(quall_last_status(), QuallStatus::Invalid);
+            quall_canceller_free(cancelar);
+            quall_qr_invite_free(convite);
+        }
+    }
+}
+
+/// O código de 4 dígitos e a sessão salva sobre o v3, pela porta em C com a biblioteca de produto
+/// (`docs/v3-no-privado.md` §3 e §5): a escolha entre três no anfitrião, o endereço da sessão, e
+/// `quall_connect_known` retomando no endereço novo.
+#[cfg(test)]
+mod testes_do_codigo_v3 {
+    use super::*;
+
+    fn ultima_mensagem() -> String {
+        unsafe { CStr::from_ptr(quall_last_error()) }.to_string_lossy().into_owned()
+    }
+
+    fn texto_de(f: impl Fn(*mut c_char, usize) -> isize) -> String {
+        let n = f(ptr::null_mut(), 0);
+        assert!(n > 0, "{}", ultima_mensagem());
+        let mut buf = vec![0u8; n as usize];
+        let escrito = f(buf.as_mut_ptr().cast(), buf.len());
+        assert_eq!(escrito, n);
+        buf.truncate(escrito as usize - 1);
+        String::from_utf8(buf).expect("UTF-8")
+    }
+
+    struct Opcoes {
+        _id: CString,
+        _nome: CString,
+        _pin: Option<CString>,
+        _pares: Option<CString>,
+        opcoes: QuallSessionOptions,
+    }
+
+    fn opcoes(id: &str, pin: Option<&str>, pares: Option<&str>, porta: u16) -> Opcoes {
+        let (id, nome) = (CString::new(id).unwrap(), CString::new(format!("{id} de teste")).unwrap());
+        let pin = pin.map(|p| CString::new(p).unwrap());
+        let pares = pares.map(|p| CString::new(p).unwrap());
+        let opcoes = QuallSessionOptions {
+            me: QuallDeviceDesc {
+                device_id: id.as_ptr(),
+                display_name: nome.as_ptr(),
+                screen_source: true,
+                camera_source: true,
+                sink: true,
+            },
+            pin: pin.as_ref().map_or(ptr::null(), |p| p.as_ptr()),
+            known_peers_json: pares.as_ref().map_or(ptr::null(), |p| p.as_ptr()),
+            signaling_port: porta,
+            timeout_ms: 20_000,
+            tracks: ptr::null(),
+            track_count: 0,
+            bind_address: ptr::null(),
+        };
+        Opcoes { _id: id, _nome: nome, _pin: pin, _pares: pares, opcoes }
+    }
+
+    struct Enviavel<T>(*mut T);
+    // SAFETY: só atravessa a thread do teste; quem usa é uma thread por vez.
+    unsafe impl<T> Send for Enviavel<T> {}
+
+    fn porta_livre() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    fn estado(c: *const QuallCodeConfirm) -> serde_json::Value {
+        serde_json::from_str(&texto_de(|b, n| unsafe { quall_code_confirm_state_json(c, b, n) })).unwrap()
+    }
+
+    #[test]
+    fn o_codigo_pela_porta_em_c_e_a_sessao_salva_pelo_id() {
+        let porta = porta_livre();
+        let (c_h, c_g) = (quall_code_confirm_new(), quall_code_confirm_new());
+        let (eh, eg) = (Enviavel(c_h), Enviavel(c_g));
+        let anfitriao = std::thread::spawn(move || {
+            let o = opcoes("ffi-cod-h", Some("424242"), None, porta);
+            let eh = eh;
+            Enviavel(unsafe { quall_host_with_code(&o.opcoes, ptr::null(), ptr::null(), eh.0) })
+        });
+        let convidado = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            let o = opcoes("ffi-cod-g", None, None, 0);
+            let destino = CString::new(format!("127.0.0.1:{porta}")).unwrap();
+            let eg = eg;
+            Enviavel(unsafe {
+                quall_connect_with_code(destino.as_ptr(), &o.opcoes, ptr::null(), ptr::null(), eg.0, 0, 0)
+            })
+        });
+        // A pessoa diante do anfitrião.
+        let fim = Instant::now() + Duration::from_secs(20);
+        loop {
+            assert!(Instant::now() < fim, "o código não apareceu");
+            let (h, g) = (estado(c_h), estado(c_g));
+            if h["phase"] == "mostrando" && g["code"].is_string() {
+                let tentativa = h["attempts"].as_u64().unwrap() as u32;
+                let opcoes: Vec<String> = serde_json::from_value(h["choices"].clone()).unwrap();
+                assert_eq!(opcoes.len(), 3);
+                assert_eq!(h["peer"], "ffi-cod-g de teste", "o cartão diz quem pede");
+                assert!(g["choices"].as_array().unwrap().is_empty());
+                assert!(h["code"].is_null(), "o anfitrião não recebe o código, só os três números");
+                assert!(unsafe { !quall_code_confirm_accept(c_h, tentativa) }, "no anfitrião, é preciso escolher");
+                let i = opcoes.iter().position(|o| g["code"] == o.as_str()).expect("o código está entre os três");
+                assert!(unsafe { quall_code_confirm_choose(c_h, tentativa, i as u32) });
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let (h, g) = (anfitriao.join().unwrap().0, convidado.join().unwrap().0);
+        assert!(!h.is_null() && !g.is_null(), "{}", ultima_mensagem());
+        assert_eq!(estado(c_g)["peer"], "ffi-cod-h de teste", "o nome do anfitrião chegou no fim");
+        unsafe {
+            let fim_g: serde_json::Value =
+                serde_json::from_str(&texto_de(|b, n| quall_session_endpoint_json(g, b, n))).unwrap();
+            assert_eq!(fim_g["endpoint"], format!("127.0.0.1:{porta}"));
+            assert!(fim_g["via"].is_null());
+            let fim_h: serde_json::Value =
+                serde_json::from_str(&texto_de(|b, n| quall_session_endpoint_json(h, b, n))).unwrap();
+            assert!(fim_h["endpoint"].is_null());
+            let pares_g = texto_de(|b, n| quall_session_known_peers_json(g, ptr::null(), b, n));
+            let pares_h = texto_de(|b, n| quall_session_known_peers_json(h, ptr::null(), b, n));
+            quall_session_close(g);
+            quall_session_close(h);
+            quall_code_confirm_free(c_h);
+            quall_code_confirm_free(c_g);
+            // A sessão salva pelo id (`quall_connect_known`) é provada no núcleo, com os candidatos
+            // injetados (`session::testes_do_codigo`, `testes_da_revisao_do_codigo`): por aqui ela
+            // abriria a busca de produto.
+            assert!(!pares_g.is_empty() && !pares_h.is_empty());
+        }
+    }
+
+    /// **O toque com o vínculo só deste lado** (`docs/v3-no-privado.md` §8.6), pela porta em C: o
+    /// anfitrião esqueceu, a retomada não é reconhecida, o confirmador diz `"notice":
+    /// "previous_pairing_invalid"`, e o código pareia de novo no mesmo `quall_connect_with_code_to`.
+    #[test]
+    fn o_toque_pela_porta_em_c_pareia_de_novo_quando_o_outro_esqueceu() {
+        let porta = porta_livre();
+        let mut velho = quall_core::pairing::PairedPeers::new();
+        velho.insert(&quall_core::pairing::PairOutcome {
+            peer: DeviceId("ffi-tq-h".into()),
+            secret: [0x5a; 32],
+            novo: true,
+        });
+        let pares = velho.to_json().unwrap();
+        let (c_h, c_g) = (quall_code_confirm_new(), quall_code_confirm_new());
+        let (eh, eg) = (Enviavel(c_h), Enviavel(c_g));
+        let anfitriao = std::thread::spawn(move || {
+            let o = opcoes("ffi-tq-h", Some("525252"), None, porta);
+            let eh = eh;
+            Enviavel(unsafe { quall_host_with_code(&o.opcoes, ptr::null(), ptr::null(), eh.0) })
+        });
+        let convidado = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            let o = opcoes("ffi-tq-g", None, Some(&pares), 0);
+            let destino = CString::new(format!("127.0.0.1:{porta}")).unwrap();
+            let eg = eg;
+            Enviavel(unsafe {
+                quall_connect_with_code_to(
+                    destino.as_ptr(), &o.opcoes, ptr::null(), ptr::null(), eg.0, 0, 0, c"ffi-tq-h".as_ptr(),
+                )
+            })
+        });
+        let fim = Instant::now() + Duration::from_secs(20);
+        loop {
+            assert!(Instant::now() < fim, "o código não apareceu");
+            let (h, g) = (estado(c_h), estado(c_g));
+            if h["phase"] == "mostrando" && g["code"].is_string() {
+                assert_eq!(g["notice"], "previous_pairing_invalid", "o cartão do convidado diz por quê");
+                assert!(h["notice"].is_null());
+                let tentativa = h["attempts"].as_u64().unwrap() as u32;
+                let opcoes: Vec<String> = serde_json::from_value(h["choices"].clone()).unwrap();
+                let i = opcoes.iter().position(|o| g["code"] == o.as_str()).expect("certo");
+                assert!(unsafe { quall_code_confirm_choose(c_h, tentativa, i as u32) });
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let (h, g) = (anfitriao.join().unwrap().0, convidado.join().unwrap().0);
+        assert!(!h.is_null() && !g.is_null(), "{}", ultima_mensagem());
+        unsafe {
+            assert!(quall_session_pairing_is_new(g));
+            let pares_g = texto_de(|b, n| quall_session_known_peers_json(g, ptr::null(), b, n));
+            let novo = quall_core::pairing::PairedPeers::from_json(&pares_g).unwrap();
+            assert_ne!(novo.get(&DeviceId("ffi-tq-h".into())), Some([0x5a; 32]), "o vínculo velho saiu");
+            quall_session_close(g);
+            quall_session_close(h);
+            quall_code_confirm_free(c_h);
+            quall_code_confirm_free(c_g);
+        }
+    }
+
+    #[test]
+    fn connect_known_sem_vinculo_e_needs_pin_e_o_token_invalido_e_invalid() {
+        unsafe {
+            let o = opcoes("ffi-sem-vinculo", None, None, 0);
+            assert!(quall_connect_known(c"alguem".as_ptr(), ptr::null(), &o.opcoes, ptr::null(), ptr::null()).is_null());
+            assert_eq!(quall_last_status(), QuallStatus::NeedsPin);
+            assert!(quall_connect_known(ptr::null(), ptr::null(), &o.opcoes, ptr::null(), ptr::null()).is_null());
+            assert_eq!(quall_last_status(), QuallStatus::NullPointer);
+            assert!(quall_udp_responder_start_with_token(&o.opcoes.me, 7877, ptr::null(), false, c"curto".as_ptr()).is_null());
+            assert_eq!(quall_last_status(), QuallStatus::Invalid);
+            let r = quall_udp_responder_start_with_token(
+                &o.opcoes.me,
+                7877,
+                ptr::null(),
+                true,
+                c"0123456789abcdef0123456789abcdef".as_ptr(),
+            );
+            assert!(!r.is_null());
+            quall_udp_responder_stop(r);
+            assert!(!quall_code_confirm_choose(ptr::null(), 1, 0));
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod testes_das_lacunas_das_cascas {
+    use super::*;
+
+    #[test]
+    fn os_tres_status_novos_sao_distintos() {
+        assert_eq!(QuallStatus::from(&Error::Interferencia("x".into())) as i32, 17);
+        assert_eq!(QuallStatus::from(&Error::ParNaoReconhecido("x".into())) as i32, 18);
+        assert_eq!(QuallStatus::from(&Error::JaPareado("x".into())) as i32, 19);
+        // O texto mantém o prefixo `pareamento:` de quem casava por ele.
+        assert!(Error::JaPareado("já".into()).to_string().starts_with("pareamento:"));
+    }
+
+    #[test]
+    fn o_desfecho_do_qr_comeca_pendente() {
+        let id = std::ffi::CString::new("ffi-qr-ninguem").unwrap();
+        let mut buf = [0 as c_char; 64];
+        let n = unsafe { quall_qr_outcome_json(id.as_ptr(), buf.as_mut_ptr(), buf.len()) };
+        assert!(n > 0);
+        let texto = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_str().unwrap();
+        assert_eq!(texto, r#"{"outcome":"pending"}"#);
+        assert_eq!(unsafe { quall_qr_outcome_json(ptr::null(), buf.as_mut_ptr(), buf.len()) }, -1);
+    }
+
+    #[test]
+    fn connect_known_com_tela_fora_do_limite_e_invalido() {
+        let id = std::ffi::CString::new("ffi-alvo").unwrap();
+        let s = unsafe {
+            quall_connect_known_with_screen(id.as_ptr(), ptr::null(), ptr::null(), ptr::null(), ptr::null(), 0, 10)
+        };
+        assert!(s.is_null());
+        assert_eq!(quall_last_status(), QuallStatus::Invalid);
+    }
+
+    #[test]
+    fn o_navegador_aceita_e_desliga_os_pares() {
+        let b = quall_browser_start();
+        assert!(!b.is_null());
+        assert_eq!(unsafe { quall_browser_set_known(b, ptr::null(), ptr::null()) }, -1);
+        let mut buf = vec![0 as c_char; 4096];
+        assert!(unsafe { quall_browser_devices_json(b, buf.as_mut_ptr(), buf.len()) } >= 0);
+        unsafe { quall_browser_stop(b) };
+    }
+
+    /// §8.7, pela porta em C: o nome definido sai saneado no anúncio que começa depois e chega à
+    /// lista em `"announced_name"`; o `"display_name"` continua o alias, e o nome da sessão
+    /// (`QuallDeviceDesc::display_name`) não sai.
+    #[test]
+    fn o_nome_anunciado_chega_na_lista_pela_porta_em_c() {
+        let desc = QuallDeviceDesc {
+            device_id: c"ffi-nome-anunciado".as_ptr(),
+            display_name: c"NOME-DA-SESSAO-SENTINELA".as_ptr(),
+            screen_source: false,
+            camera_source: true,
+            sink: false,
+        };
+        let nome = "Câmera do teste ffi 7f3a";
+        fn texto_de(f: impl Fn(*mut c_char, usize) -> isize) -> String {
+            let n = f(ptr::null_mut(), 0);
+            assert!(n > 0);
+            let mut buf = vec![0u8; n as usize];
+            assert_eq!(f(buf.as_mut_ptr().cast(), buf.len()), n);
+            buf.pop();
+            String::from_utf8(buf).expect("utf-8")
+        }
+        unsafe {
+            let pedido = std::ffi::CString::new(" Câmera do\nteste ffi\u{202E} 7f3a ").unwrap();
+            assert_eq!(quall_set_announced_name(pedido.as_ptr()), QuallStatus::Ok);
+            assert_eq!(texto_de(|buf, n| quall_announced_name(buf, n)), nome);
+            let a = quall_advertiser_start_with_code(&desc, 65531, ptr::null(), true);
+            // O anúncio já começou: apagar agora não muda o que ele diz.
+            assert_eq!(quall_set_announced_name(ptr::null()), QuallStatus::Ok);
+            assert_eq!(texto_de(|buf, n| quall_announced_name(buf, n)), "");
+            assert!(!a.is_null());
+            let b = quall_browser_start();
+            let fim = Instant::now() + Duration::from_secs(4);
+            let mut achado = None;
+            while achado.is_none() && Instant::now() < fim {
+                quall_browser_collect(b, 100);
+                let lista: Vec<serde_json::Value> =
+                    serde_json::from_str(&texto_de(|buf, n| quall_browser_devices_json(b, buf, n))).expect("json");
+                achado = lista.into_iter().find(|i| i["announced_name"] == nome);
+            }
+            quall_browser_stop(b);
+            quall_advertiser_stop(a);
+            let item = achado.expect("o item com o nome anunciado");
+            assert!(item["display_name"].as_str().is_some_and(|d| d.starts_with("Quall ") && d.len() == 14));
+            assert!(!item.to_string().contains("SENTINELA"), "o nome da sessão não vai na rede: {item}");
+            assert_eq!(item["accepts_code"], true);
         }
     }
 }

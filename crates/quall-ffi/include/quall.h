@@ -186,6 +186,23 @@ typedef enum QuallStatus {
      * sempre: nenhum valor que uma casca já conhece muda de significado.
      */
     QUALL_STATUS_BUSY = 16,
+    /**
+     * **Algo está interferindo na conexão com este aparelho: use o PIN** (`docs/v3-no-privado.md`
+     * §3.4, A1). Três pernas do código caíram antes do código aparecer, para o mesmo endereço.
+     */
+    QUALL_STATUS_INTERFERENCE = 17,
+    /**
+     * **O outro aparelho não reconheceu este pareamento** (§3.5, A2): falha fechado, na sessão salva e
+     * num toque sem confirmador. Ofereça "Esquecer este aparelho" (e então o código) ou o PIN. Com
+     * confirmador, o toque segue para o código sozinho (`quall_connect_with_code_to`, §8.6).
+     */
+    QUALL_STATUS_PAIR_NOT_RECOGNIZED = 18,
+    /**
+     * **Já há um pareamento com este aparelho** (B2): só diante de um par de build anterior, que
+     * recusava substituir pelo código ou pelo QR. Ofereça "Esquecer este aparelho" ou o PIN. Desde
+     * 13/10 o código e o QR substituem o vínculo que não retomou (§8.4, §8.6).
+     */
+    QUALL_STATUS_ALREADY_PAIRED = 19,
 } QuallStatus;
 
 /**
@@ -396,6 +413,12 @@ typedef enum QuallTeleprompterChange {
      * `null`; `"gravacao_recusada"` diz se foi recusado), ou `"par_entende_gravar"` mudou.
      */
     QUALL_TELEPROMPTER_CHANGE_RECORDING = 8192,
+    /**
+     * **No controle**: `"par_entende_camera"` mudou — o prompter passou a dizer, ou deixou de dizer,
+     * que tem a câmera para controlar (`docs/controle-remoto-da-camera.md` §17.3). Com ele, bombeie
+     * o `QuallCameraRemote` sobre [`quall_messages_for_camera`]; sem ele, pare.
+     */
+    QUALL_TELEPROMPTER_CHANGE_CAMERA = 16384,
 } QuallTeleprompterChange;
 
 /**
@@ -471,18 +494,18 @@ typedef struct QuallAudioEncoder QuallAudioEncoder;
 typedef struct QuallAudioPlayout QuallAudioPlayout;
 
 /**
- * Navegador mDNS, com o que ele já achou.
+ * Navegador: a busca por três caminhos do núcleo (`quall_core::busca`), com a lista que ela mantém.
  *
- * # A lista fica atrás de um cadeado, e isso não é zelo (achado da auditoria)
+ * # Desde 12/10, três caminhos e uma thread do núcleo
  *
- * [`quall_browser_collect`] pedia `&mut` e [`quall_browser_devices_json`] pedia `&`, os dois
- * sobre o mesmo ponteiro. A casca que atualizasse a lista numa thread enquanto desenha a tela
- * noutra — que é exatamente como uma tela de aparelhos se escreve — produzia dois empréstimos
- * conflitantes do mesmo `Vec`: corrida de dados de verdade, comportamento indefinido, não
- * "provavelmente funciona".
+ * Era só mDNS, e a lista era montada aqui, chamada a chamada. Agora `quall_core::busca::Busca`
+ * roda mDNS, broadcast UDP e sondagem da /24 numa thread própria, e mantém a tabela por
+ * `DeviceId` com "visto há X s" (`docs/conexao.md` §2). As funções de antes continuam com o mesmo
+ * contrato: [`quall_browser_collect`] ainda bloqueia `ms` e devolve quantos há, e o JSON de
+ * [`quall_browser_devices_json`] tem as chaves de antes — mais algumas.
  *
- * Com o [`Mutex`], as duas funções passam a receber `*const` e a leitura é segura de qualquer
- * thread.
+ * A tabela é da busca, atrás de um cadeado dela: ler de qualquer thread é seguro (o achado da
+ * auditoria que pôs o `Mutex` aqui continua valendo, um andar abaixo).
  */
 typedef struct QuallBrowser QuallBrowser;
 
@@ -518,9 +541,32 @@ typedef struct QuallCameraRemote QuallCameraRemote;
 typedef struct QuallCanceller QuallCanceller;
 
 /**
+ * **A tela "os dois aparelhos mostram o mesmo código?"**, do lado do núcleo.
+ *
+ * Crie antes de largar a thread de trabalho, passe a [`quall_host_with_code`] ou
+ * [`quall_connect_with_code`], e da tela leia [`quall_code_confirm_state_json`] (a cada 100–250
+ * ms) e chame [`quall_code_confirm_accept`] / [`quall_code_confirm_reject`] quando a pessoa tocar.
+ * Libere com [`quall_code_confirm_free`] depois que a chamada bloqueante voltar.
+ *
+ * Um por espera: o anfitrião conta nele as tentativas (no máximo 3 por espera).
+ */
+typedef struct QuallCodeConfirm QuallCodeConfirm;
+
+/**
  * **As mensagens de uma sessão.** Ver [`quall_session_messages`].
  */
 typedef struct QuallMessages QuallMessages;
+
+/**
+ * **O convite do desktop**: o segredo de 128 bits, a escuta do chamado e o texto do QR.
+ *
+ * Crie com [`quall_qr_invite_new`], mostre [`quall_qr_invite_text`] como QR, leia
+ * [`quall_qr_invite_state_json`] da tela (a cada 250–500 ms) e passe o convite a
+ * [`quall_connect_with_invite`] numa thread de trabalho. Libere com [`quall_qr_invite_free`] depois
+ * que a chamada bloqueante voltar. Vale 3 min (ou o prazo dado) e **um** chamado: depois disso,
+ * crie outro (QR novo).
+ */
+typedef struct QuallQrInvite QuallQrInvite;
 
 /**
  * O controlador de taxa. Ver `quall_core::taxa`.
@@ -541,6 +587,14 @@ typedef struct QuallTeleprompter QuallTeleprompter;
  * Handle de track entregue à casca. É dono de uma referência, não do recurso.
  */
 typedef struct QuallTrack QuallTrack;
+
+/**
+ * **Só o anúncio UDP**, sem mDNS (`docs/conexao.md` §2): responde perguntas na UDP 7875 e se
+ * anuncia por broadcast. É para a casca que anuncia o mDNS pelo sistema — o iOS, com `NetService`,
+ * porque o mDNS do núcleo é socket multicast cru e depende do entitlement de multicast. As
+ * respostas unicast (as da sondagem da /24) não dependem dele; o broadcast, sim, e falha calado.
+ */
+typedef struct QuallUdpResponder QuallUdpResponder;
 
 /**
  * Quem é este aparelho, para o outro lado.
@@ -934,46 +988,110 @@ intptr_t quall_advertiser_label(const struct QuallAdvertiser *a, char *buf, uint
 void quall_advertiser_stop(struct QuallAdvertiser *a);
 
 /**
- * Começa a navegar `_quall._tcp` na LAN.
+ * Começa a procurar aparelhos Quall na LAN pelos três caminhos.
+ *
+ * Não falha por falta de mDNS ou de porta UDP: a busca segue com o que abriu. Nulo só se nem a
+ * thread da busca subir.
  */
 struct QuallBrowser *quall_browser_start(void);
 
 /**
- * Junta o que aparecer durante `ms` milissegundos e devolve quantos aparelhos há **no total**.
+ * **Os pares conhecidos, para a lista dizer quem é quem** (`docs/v3-no-privado.md` §5.4, P3). No
+ * v3 o anúncio não traz o id de ninguém; com isto, cada item novo da lista é sondado uma vez (um
+ * `Probe`, e a conexão fecha antes do `Hello`: nada é gasto do outro lado) e, se for um dos pares
+ * de `opcoes.known_peers_json`, o item de [`quall_browser_devices_json`] ganha `known_device_id`
+ * com o id que a casca guardou — mostre o nome local e conecte com
+ * [`quall_connect_with_code_to`] (`expected_device_id`) ou [`quall_connect_known`].
  *
- * **Bloqueia** por `ms`. Devolve negativo em erro.
+ * Só `opcoes.me` (o id deste aparelho) e `opcoes.known_peers_json` são lidos. `role`: `NULL`/`""`
+ * para vídeo, `"controle_remoto"` para o controle. Chame de novo quando a tabela mudar (parear,
+ * esquecer): o cache recomeça. `known_peers_json` vazio desliga. As sondas não andam sozinhas:
+ * cada [`quall_browser_devices_json`] põe para sondar os itens novos (no máximo 2 de uma vez, 2,5 s
+ * cada; quem não respondeu volta em 30 s), e o rótulo aparece numa das chamadas seguintes.
  *
- * # "Junta" passou a ser verdade (achado da auditoria)
+ * Devolve `0`, ou `-1` com [`quall_last_status`] (`INVALID`, `NULL_ARGUMENT`).
  *
- * Antes, cada chamada **substituía** a lista pelo que tinha aparecido naquela janela. Como o
- * mDNS entrega cada anúncio uma vez, a segunda chamada no mesmo navegador via **menos**
- * aparelhos que a primeira — a lista da tela encolhia sozinha enquanto o usuário olhava para
- * ela. O header prometia "junta" e o código trocava.
+ * # Safety
  *
- * Agora a lista é acumulada: aparelho novo entra, aparelho que já estava é atualizado, e
- * aparelho que anunciou a saída é removido. É o que uma tela de aparelhos precisa.
+ * `b` precisa vir de [`quall_browser_start`]; `opcoes` válido durante a chamada; `role` nulo ou
+ * uma string C válida.
+ */
+int32_t quall_browser_set_known(const struct QuallBrowser *b,
+                                const struct QuallSessionOptions *opcoes,
+                                const char *role);
+
+/**
+ * **"Procurar de novo"** (`docs/v3-no-privado.md` §8.9): a varredura da /24 recomeça agora, com a
+ * lista cheia ou não, no ritmo baixo de sempre (~5 s por /24). Sem isto, a busca só varre a /24
+ * sozinha com a lista vazia, uma vez por processo a cada 5 min; o resto do tempo ela pergunta só às
+ * dicas ([`quall_browser_add_hint`]) e aos vizinhos da tabela ARP. Ligue ao botão de procurar de
+ * novo da tela — não a um temporizador.
  *
- * Chamar em laço com `ms` curto é o uso esperado; a lista só cresce com quem está na rede.
+ * Devolve `0`, ou `-1` com [`quall_last_status`] (`NULL_ARGUMENT`).
  *
  * # Safety
  *
  * `b` precisa vir de [`quall_browser_start`].
  */
-int32_t quall_browser_collect(const struct QuallBrowser *b, uint32_t ms);
+int32_t quall_browser_rescan(const struct QuallBrowser *b);
+
+/**
+ * **Uma dica** (`docs/v3-no-privado.md` §8.9): um endereço onde um aparelho conhecido esteve — o
+ * último de um vínculo, o da sessão salva, o último do controle —, `"ip"` ou `"ip:porta"` (a porta
+ * é ignorada). A busca o pergunta por unicast aos 1 s e mais duas vezes (20 s e 40 s depois), só
+ * enquanto ele não está na lista e não foi tocado há pouco. Só IPv4 privado conta; o resto é
+ * ignorado sem erro. Pode chamar várias vezes (uma por vínculo).
+ *
+ * Devolve `0`, ou `-1` com [`quall_last_status`] (`NULL_ARGUMENT`, `INVALID` para texto que não é
+ * endereço).
+ *
+ * # Safety
+ *
+ * `b` precisa vir de [`quall_browser_start`]; `endereco` uma string C válida.
+ */
+int32_t quall_browser_add_hint(const struct QuallBrowser *b,
+                               const char *endereco);
+
+/**
+ * Espera `ms` milissegundos e devolve quantos aparelhos há **no total** na lista. Negativo em erro.
+ *
+ * A busca anda sozinha numa thread do núcleo; esta função só dá a cadência de quem desenha a
+ * tela. Chamar em laço com `ms` curto (250–400) é o uso esperado.
+ *
+ * # Safety
+ *
+ * `b` precisa vir de [`quall_browser_start`].
+ */
+int32_t quall_browser_collect(const struct QuallBrowser *b,
+                              uint32_t ms);
 
 /**
  * Escreve os aparelhos achados como **JSON**, no padrão `(buf, cap)` do topo do módulo.
  *
- * JSON, e não uma struct por aparelho, de propósito: a alternativa seria uma função com cinco
- * buffers de saída e um índice, que toda casca erraria de um jeito diferente. Swift, Kotlin e
- * C++ já têm um leitor de JSON à mão, e a lista de aparelhos é lida uma vez por tela — não é
- * caminho quente.
+ * Um array de objetos com as chaves de sempre — `device_id`, `display_name`, `protocol_version`,
+ * `capabilities` (`screen_source`, `camera_source`, `sink`), `endpoint` (`"ip:porta"` ou `null`) e
+ * `papel` (só quando há) — e, desde 12/10 (`docs/conexao.md` §2.4 e §4):
  *
  * Formato: um array de objetos com `device_id`, `display_name`, `protocol_version`,
  * `capabilities` (`screen_source`, `camera_source`, `sink`) e `endpoint` (`"ip:porta"` ou
  * `null` quando o aparelho não anunciou endereço utilizável).
  * `identity_authenticated` é `false`: o ID e nome desta lista são placeholders efêmeros,
  * não servem para consultar ou persistir pareamentos. Use o peer da sessão após autenticar.
+ * - `"alive"`: visto há no máximo 12 s. `false` é "visto há X s": o item fica mais 30 s e sai.
+ * - `"seen_ms_ago"`: há quanto tempo veio o último sinal de vida (0 enquanto o mDNS o mantém).
+ * - `"via"`: por onde foi visto — `"mdns"`, `"udp"`, `"sondagem"`.
+ * - `"accepts_code"`: aceita a confirmação por código de 4 dígitos.
+ * - `"own"`: é um anúncio deste mesmo processo (o token é do anunciante daqui). Não liste.
+ * - `"known_device_id"`: o id guardado do par que este item é, quando a casca deu os pares em
+ *   [`quall_browser_set_known`] e a sonda já reconheceu; `null` nos outros casos. Mostre o nome
+ *   local e conecte com o alvo (A2).
+ * - `"announced_name"` (13/10, `docs/v3-no-privado.md` §8.7): o nome que o aparelho escolheu para a
+ *   rede (`quall_set_announced_name` do lado de lá), saneado — até 40 bytes, sem controle; `null`
+ *   quando o anúncio não traz nome (build das lojas, campo apagado). **Não autentica nada.** A linha
+ *   mostra, nesta ordem: o nome guardado do par (`known_device_id`) > este nome, com o alias
+ *   (`display_name`) pequeno embaixo > só o alias.
+ *
+ * Vivos primeiro, depois pelo nome anunciado (ou o alias). Uma casca que não conhece as chaves novas segue funcionando.
  *
  * # Safety
  *
@@ -984,13 +1102,410 @@ intptr_t quall_browser_devices_json(const struct QuallBrowser *b,
                                     uintptr_t cap);
 
 /**
- * Para de navegar e libera. Nulo é ignorado.
+ * **Por que a lista pode estar vazia**, como JSON (`docs/conexao.md` §2.5). Padrão `(buf, cap)`:
+ *
+ * ```json
+ * {"causes":["firewall","isolamento"],"networks":["192.168.15.0/24"],"probes":1,"listening":true}
+ * ```
+ *
+ * `causes`, da mais para a menos provável: `"sem_rede_local"`, `"sub_rede_diferente"`,
+ * `"firewall"`, `"isolamento"` — a casca traduz cada uma. `networks` são as redes deste aparelho,
+ * para a tela dizer "este aparelho está na rede 192.168.15.x; o outro precisa estar na mesma".
+ * Vazio de causas é "ainda procurando" ou "achou".
+ *
+ * # Safety
+ *
+ * `b` precisa vir de [`quall_browser_start`]; `buf` precisa ser nulo ou ter `cap` bytes.
+ */
+intptr_t quall_browser_hint_json(const struct QuallBrowser *b,
+                                 char *buf,
+                                 uintptr_t cap);
+
+/**
+ * Para de procurar e libera. Nulo é ignorado. Bloqueia até a thread da busca sair (uma fatia,
+ * ~50 ms, mais o adeus do mDNS).
  *
  * # Safety
  *
  * `b` precisa vir de [`quall_browser_start`] e não pode ter sido liberado antes.
  */
 void quall_browser_stop(struct QuallBrowser *b);
+
+/**
+ * **Acha o aparelho da sessão salva pelo `device_id`**, quando o DHCP pode ter trocado o IP
+ * (`docs/conexao.md` §3). **Bloqueia** até achar ou até `timeout_ms` (0 = 8 s).
+ *
+ * `last_endpoint` (`"ip:porta"`, ou nulo) é o endereço guardado: ele é tentado por TCP com prazo
+ * de 1 s enquanto a busca pergunta pelo id. Padrão `(buf, cap)`:
+ *
+ * ```json
+ * {"endpoint":"192.168.15.9:7877","via":"udp","changed":true,"accepts_code":true}
+ * ```
+ *
+ * `changed` verdadeiro: grave o endereço novo na sessão salva, **sem perguntar**, e conecte nele
+ * com `quall_connect*` — sem PIN, porque o par já é conhecido e a retomada fecha sozinha. `via`
+ * é `"endereco_antigo"`, `"udp"`, `"sondagem"` ou `"mdns"`. Não achou: `-1` com
+ * `QUALL_STATUS_TIMEOUT` e as causas prováveis em [`quall_last_error`].
+ *
+ * # Safety
+ *
+ * `device_id` precisa ser uma string C válida; `last_endpoint`, nula ou válida; `buf`, nulo ou
+ * com `cap` bytes.
+ */
+intptr_t quall_locate_peer_json(const char *device_id,
+                                const char *last_endpoint,
+                                uint32_t timeout_ms,
+                                char *buf,
+                                uintptr_t cap);
+
+/**
+ * **O nome que os outros aparelhos veem na lista** (`docs/v3-no-privado.md` §8.7, a P3 revista):
+ * define o nome que **todo anúncio deste processo que começar depois** leva na chave `nm` —
+ * [`quall_advertiser_start`] e as variantes, [`quall_udp_responder_start`] e a variante com token.
+ * O anúncio já no ar segue com o nome com que começou; a próxima espera leva o novo.
+ *
+ * O nome é saneado aqui (sem controle nem quebra, sem caracteres invisíveis de formatação, espaços
+ * em sequência viram um, até 40 bytes UTF-8 sem partir caractere). `NULL`, `""` ou um nome que o
+ * saneamento esvazia **apaga**: os anúncios saem sem nome e a lista dos outros mostra o alias
+ * `Quall <8 hex>`. O id e as chaves nunca vão no anúncio.
+ *
+ * Chame ao abrir o app (com o nome guardado nos Ajustes, ou o do sistema na primeira vez) e quando
+ * a pessoa mudar o campo. É do processo: a extensão de transmissão do iOS chama no próprio
+ * processo. Devolve `QUALL_STATUS_OK`, ou `QUALL_STATUS_NOT_UTF8` com `name` que não é UTF-8 (o
+ * nome anterior fica).
+ *
+ * # Safety
+ *
+ * `name` precisa ser nulo ou apontar para uma string terminada em zero.
+ */
+enum QuallStatus quall_set_announced_name(const char *name);
+
+/**
+ * O nome que o próximo anúncio deste processo vai levar, **já saneado** — o que os outros vão ver
+ * —, ou `""` sem nome. Padrão `(buf, cap)`. Serve à casca que publica o mDNS por fora do núcleo (o
+ * iOS, no TXT do `mDNSResponder`, chave `nm`) e aos Ajustes, para mostrar como o nome ficou.
+ *
+ * # Safety
+ *
+ * `buf` precisa ser nulo ou apontar para `cap` bytes graváveis.
+ */
+intptr_t quall_announced_name(char *buf,
+                              uintptr_t cap);
+
+/**
+ * Começa a anunciar pela UDP. `role` e `accepts_code` como em [`quall_advertiser_start_with_code`].
+ * Libere com [`quall_udp_responder_stop`]. Nulo só em parâmetro inválido.
+ *
+ * # Safety
+ *
+ * As mesmas de [`quall_advertiser_start_with_code`].
+ */
+struct QuallUdpResponder *quall_udp_responder_start(const struct QuallDeviceDesc *me,
+                                                    uint16_t signaling_port,
+                                                    const char *role,
+                                                    bool accepts_code);
+
+/**
+ * [`quall_udp_responder_start`] com o **token** do anúncio que a casca publica por fora do núcleo
+ * (o iOS, pelo `mDNSResponder`): os dois anúncios dizem o mesmo token, e o aparelho é **um** item
+ * na lista dos outros (`docs/v3-no-privado.md` §5.3). `token`: 32 hex minúsculos; outro formato é
+ * `INVALID`.
+ *
+ * # Safety
+ *
+ * As de [`quall_udp_responder_start`]; `token` precisa apontar para uma string terminada em zero.
+ */
+struct QuallUdpResponder *quall_udp_responder_start_with_token(const struct QuallDeviceDesc *me,
+                                                               uint16_t signaling_port,
+                                                               const char *role,
+                                                               bool accepts_code,
+                                                               const char *token);
+
+/**
+ * Para de anunciar pela UDP e libera. Nulo é ignorado. Bloqueia até a thread do respondedor sair
+ * quando este era o último anúncio do processo (~50 ms).
+ *
+ * # Safety
+ *
+ * `r` precisa vir de [`quall_udp_responder_start`] e não pode ter sido liberado antes.
+ */
+void quall_udp_responder_stop(struct QuallUdpResponder *r);
+
+struct QuallCodeConfirm *quall_code_confirm_new(void);
+
+/**
+ * O estado para a tela, como JSON. Padrão `(buf, cap)`:
+ *
+ * ```json
+ * {"phase":"mostrando","code":"0427","peer":null,"attempts":1,"choices":[],"wrong_choice":false,"code_blocked":false}
+ * {"phase":"mostrando","code":null,"peer":"Galaxy A07","attempts":1,"choices":["8812","0427","5530"],"wrong_choice":false,"code_blocked":false}
+ * ```
+ *
+ * O primeiro é o **convidado**: mostre `code` (e um Recusar). O segundo é o **anfitrião**
+ * (`docs/v3-no-privado.md` §3.6): `code` é sempre `null` — mostre os três `choices` como botões
+ * iguais, o nome de quem pede (`peer`) e "Nenhum destes"; o toque vai a
+ * [`quall_code_confirm_choose`]. O nome do anfitrião só chega ao convidado em `"conferiu"` (M2).
+ *
+ * `phase`: `"esperando"` (nada a mostrar), `"mostrando"`, `"confirmado_aqui"` (esperando o outro
+ * lado), `"conferiu"`, `"recusado_aqui"`, `"recusado_la"`, `"nao_conferiu"` (alguém no meio, ou
+ * erro), `"expirou"`. `wrong_choice`: a escolha foi errada; `code_blocked`: o código desta espera
+ * acabou (P11), só o PIN serve. `code` e `peer` são `null` quando não há. `refusal`: por que o
+ * núcleo recusou a última troca, quando há o que dizer — `"already_paired"` (já há pareamento com
+ * esse aparelho aqui, B2: ofereça "Esquecer este aparelho" ou o PIN), nos dois lados;
+ * `"code_not_accepted"` (convidado: o outro aparelho fechou logo depois do pedido do código — ele
+ * não aceita o código; a chamada volta com `NEEDS_PIN` e o cartão fica em `"esperando"`: peça o PIN
+ * da tela de lá, nunca "recusou"); `null` nos outros desfechos. `"recusado_la"` só vem depois de um
+ * código na tela. `notice`: `"previous_pairing_invalid"` no convidado cujo toque tentou reconectar e
+ * o outro lado não reconheceu — o código é para parear de novo ([`quall_connect_with_code_to`]); `null`
+ * nos outros casos.
+ *
+ * # Safety
+ *
+ * `c` precisa vir de [`quall_code_confirm_new`]; `buf`, nulo ou com `cap` bytes.
+ */
+intptr_t quall_code_confirm_state_json(const struct QuallCodeConfirm *c,
+                                       char *buf,
+                                       uintptr_t cap);
+
+/**
+ * **Anfitrião**: a pessoa tocou o número `index` de `"choices"` (`docs/v3-no-privado.md` §3.6) no
+ * cartão da tentativa `attempt`. O número que o outro aparelho mostra confirma; um falso recusa e
+ * encerra o código desta espera (`"code_blocked": true`; o PIN continua). Fora da tentativa ou da
+ * fase, ou no convidado, devolve `false` e não faz nada. No anfitrião,
+ * [`quall_code_confirm_accept`] não confirma mais: é preciso escolher.
+ *
+ * # Safety
+ *
+ * `c` precisa vir de [`quall_code_confirm_new`] e estar vivo.
+ */
+bool quall_code_confirm_choose(const struct QuallCodeConfirm *c,
+                               uint32_t attempt,
+                               uint32_t index);
+
+/**
+ * A pessoa tocou **Confirmar** no cartão da tentativa `attempt` — o `"attempts"` do
+ * [`quall_code_confirm_state_json`] que a tela estava mostrando. Vale só se **essa** tentativa ainda
+ * está com o código na tela: um toque dado olhando o cartão de uma tentativa que já caiu **não**
+ * confirma a seguinte (revisão adversarial de 12/10, M2). `true` se o toque valeu. Nulo é ignorado
+ * (`false`). Qualquer thread.
+ *
+ * # Safety
+ *
+ * `c` precisa ser nulo ou vir de [`quall_code_confirm_new`].
+ */
+bool quall_code_confirm_accept(const struct QuallCodeConfirm *c,
+                               uint32_t attempt);
+
+/**
+ * A pessoa tocou **Recusar**. Mesmas regras de [`quall_code_confirm_accept`].
+ *
+ * # Safety
+ *
+ * `c` precisa ser nulo ou vir de [`quall_code_confirm_new`].
+ */
+bool quall_code_confirm_reject(const struct QuallCodeConfirm *c, uint32_t attempt);
+
+/**
+ * Libera. Nulo é ignorado. Pode ser liberado depois que a chamada bloqueante voltar: ela segura a
+ * própria cópia do estado.
+ *
+ * # Safety
+ *
+ * `c` precisa vir de [`quall_code_confirm_new`] e não pode ter sido liberado antes.
+ */
+void quall_code_confirm_free(struct QuallCodeConfirm *c);
+
+/**
+ * **Anuncia dizendo se aceita o código.** `role` como em [`quall_advertiser_start_with_role`]
+ * (`NULL`, `""` ou `"teleprompter"`); `accepts_code` só pode ser `true` se a casca vai hospedar com
+ * [`quall_host_with_code`] e tem a tela de confirmação. Com `false` e `role` nulo, é exatamente
+ * [`quall_advertiser_start`].
+ *
+ * # Safety
+ *
+ * As mesmas de [`quall_advertiser_start_with_role`].
+ */
+struct QuallAdvertiser *quall_advertiser_start_with_code(const struct QuallDeviceDesc *me,
+                                                         uint16_t signaling_port,
+                                                         const char *role,
+                                                         bool accepts_code);
+
+/**
+ * Cria o convite: sorteia o segredo e abre a escuta TCP do chamado (porta 7874, ou efêmera se
+ * ocupada), com os endereços das redes locais deste aparelho. `ttl_ms` 0 = 180 000.
+ *
+ * Nulo em erro, com o motivo em [`quall_last_status`]: `NO_ROUTE` quando o aparelho não está em
+ * rede local nenhuma (avião, só dados móveis) — a tela diz isso em vez de mostrar um QR inútil.
+ *
+ * # Safety
+ *
+ * `me` precisa apontar para um [`QuallDeviceDesc`] válido (`device_id` e `display_name`).
+ */
+struct QuallQrInvite *quall_qr_invite_new(const struct QuallDeviceDesc *me,
+                                          uint32_t ttl_ms);
+
+/**
+ * O texto do QR, `quall://chamar?v=2&a=…&p=…&i=…&n=…&s=…`. Padrão `(buf, cap)`. **Leva o
+ * segredo**: vai para o desenho do QR e para mais nada — nem diário, nem área de transferência.
+ *
+ * # Safety
+ *
+ * `c` precisa vir de [`quall_qr_invite_new`]; `buf`, nulo ou com `cap` bytes.
+ */
+intptr_t quall_qr_invite_text(const struct QuallQrInvite *c,
+                              char *buf,
+                              uintptr_t cap);
+
+/**
+ * O estado para a tela, como JSON. Padrão `(buf, cap)`:
+ *
+ * ```json
+ * {"phase":"esperando","expires_in_ms":171234,"addresses":["192.168.15.9"],"port":7874,
+ *  "peer_id":null,"peer_name":null,"endpoint":null}
+ * ```
+ *
+ * `phase`: `"esperando"` (mostre o QR e quanto falta), `"chamado"` (tire o QR e mostre
+ * "Conectando a `peer_name`…"; `peer_id` e `endpoint` preenchidos) ou `"expirou"` (troque por um
+ * convite novo). `addresses` e `port` são para o diário e para a dica "este computador está na
+ * rede 192.168.15.x".
+ *
+ * # Safety
+ *
+ * `c` precisa vir de [`quall_qr_invite_new`]; `buf`, nulo ou com `cap` bytes.
+ */
+intptr_t quall_qr_invite_state_json(const struct QuallQrInvite *c, char *buf, uintptr_t cap);
+
+/**
+ * **O desktop recebe pelo QR.** Bloqueia até um celular chamar (ou o convite expirar, ou o
+ * cancelador disparar), e então conecta nele como receptor e pareia pela chave do QR — sem PIN.
+ *
+ * `opcoes` como em [`quall_connect`] (`pin` é ignorado; `known_peers_json` é lido e o pareamento
+ * novo sai em [`quall_session_known_peers_json`] para a casca guardar, como sempre). Depois disso o
+ * par é conhecido e as próximas vezes são retomada, por `quall_connect*`.
+ *
+ * Nulo em erro, com [`quall_last_status`]: `TIMEOUT` (o QR expirou sem chamado: mostre um novo),
+ * `CANCELLED`, `PAIRING` (quem atendeu não é quem leu o QR), e os de sempre de `quall_connect`.
+ * Um convite já usado numa chamada anterior devolve o mesmo chamado — crie outro para tentar de
+ * novo.
+ *
+ * # Safety
+ *
+ * `c` precisa vir de [`quall_qr_invite_new`] e continuar vivo durante a chamada; `opcoes`, válido
+ * durante a chamada; `cancelador`, nulo ou de [`quall_canceller_new`].
+ */
+struct QuallSession *quall_connect_with_invite(const struct QuallQrInvite *c,
+                                               const struct QuallSessionOptions *opcoes,
+                                               const struct QuallCanceller *cancelador);
+
+/**
+ * [`quall_connect_with_invite`] **com um papel**: `role` = `"controle_remoto"` é o controle que mostra
+ * o QR para o **teleprompter** ler (a espera dele, na 7979, só aceita controle remoto). `NULL` ou `""`
+ * é exatamente [`quall_connect_with_invite`]; outro texto é `INVALID`. Como em
+ * [`quall_connect_with_role`], diante de um aparelho que não serve ao papel a saída é `PROTOCOL`, e
+ * diante de um prompter que já tem controle, `BUSY`. A porta vem do chamado (o prompter chama com a
+ * dele), então não há porta a completar.
+ *
+ * # Safety
+ *
+ * As mesmas de [`quall_connect_with_invite`]; `role` precisa ser nulo ou uma string C válida.
+ */
+struct QuallSession *quall_connect_with_invite_role(const struct QuallQrInvite *c,
+                                                    const struct QuallSessionOptions *opcoes,
+                                                    const struct QuallCanceller *cancelador,
+                                                    const char *role);
+
+/**
+ * Libera o convite e fecha a escuta. Nulo é ignorado. Bloqueia até a thread da escuta sair (~50
+ * ms).
+ *
+ * # Safety
+ *
+ * `c` precisa vir de [`quall_qr_invite_new`], não pode ter sido liberado antes, e nenhuma chamada
+ * com ele pode estar em andamento.
+ */
+void quall_qr_invite_free(struct QuallQrInvite *c);
+
+/**
+ * **O celular lê um QR**: diz se é um código de conexão do Quall e de quem, sem rede e sem guardar
+ * nada. Para a tela mostrar "Conectar a MacBook do Pessoa?" antes de chamar. Padrão `(buf, cap)`:
+ *
+ * ```json
+ * {"peer_id":"mac-3F2504E0","peer_name":"MacBook do Pessoa","addresses":["192.168.15.9"],"port":7874}
+ * ```
+ *
+ * `-1` com `INVALID` quando não é um QR do Quall, está quebrado ou é de versão mais nova (a
+ * mensagem diz "atualize o app"). O segredo não sai daqui.
+ *
+ * # Safety
+ *
+ * `text` precisa ser uma string C válida; `buf`, nulo ou com `cap` bytes.
+ */
+intptr_t quall_qr_read_json(const char *text,
+                            char *buf,
+                            uintptr_t cap);
+
+/**
+ * **O celular chama o desktop do QR.** Chame com a espera já de pé neste processo (`quall_host*`
+ * bloqueado numa thread, o PIN na tela) e `signaling_port` sendo a porta dela: o desktop conecta
+ * ali logo depois de aceitar, e a espera aceita o pareamento pelo QR sem mudança nenhuma de
+ * chamada. Bloqueia até a resposta (`timeout_ms` 0 = 5 000). **É ação, não consulta**: chame
+ * **uma vez**, com um buffer de **pelo menos 512 bytes** (a resposta é menor que isso): com `buf`
+ * nulo ou `cap` menor, volta `-1` com `INVALID` **sem ir à rede** — perguntar o tamanho antes faria
+ * o chamado, e a segunda chamada ouviria "usado". Devolve como o padrão
+ * `(buf, cap)`:
+ *
+ * ```json
+ * {"result":"aceito","peer_id":"mac-3F2504E0","peer_name":"MacBook do Pessoa","via":"192.168.15.9:7874"}
+ * {"result":"recusado","reason":"expirou"}
+ * ```
+ *
+ * `reason`: `"expirou"` (o QR do computador venceu: peça um novo), `"usado"` (outro aparelho chamou
+ * antes com este QR), `"invalido"` (o QR não é deste convite), `"endereco"` (o computador vê este
+ * celular por outro endereço: VPN ligada, ou outra rede — diga "Desligue a VPN ou use a mesma
+ * rede"). O chamado vai selado (`docs/v3-no-privado.md` §4): nem o id nem o nome deste aparelho
+ * passam em claro pela rede. `-1` com `NO_ROUTE` quando ninguém
+ * respondeu nos endereços do QR (outra rede, firewall), `PAIRING` quando quem respondeu não provou
+ * ser o computador do QR, `INVALID` para QR ilegível ou porta 0.
+ *
+ * **Ler e hospedar no mesmo processo** (`docs/conexao.md` §10.6): a chave lida fica numa caixa do
+ * processo por 2 min e 3 tentativas, e é dali que a espera a tira.
+ *
+ * # Safety
+ *
+ * `text` e `me` válidos durante a chamada; `buf`, nulo ou com `cap` bytes.
+ */
+intptr_t quall_qr_call_json(const char *text,
+                            const struct QuallDeviceDesc *me,
+                            uint16_t signaling_port,
+                            uint32_t timeout_ms,
+                            char *buf,
+                            uintptr_t cap);
+
+/**
+ * **Como terminou o pareamento pelo QR, no celular que o leu** (B2). Depois de
+ * [`quall_qr_call_json`] dar `"aceito"`, o desktop conecta na espera deste processo; a espera não
+ * volta por um candidato recusado (ela segue esperando), então a tela de "Conectando a X…" lê isto
+ * para saber o desfecho. `peer_id` é o `peer_id` do QR. Padrão `(buf, cap)`:
+ *
+ * ```json
+ * {"outcome":"pending"}
+ * ```
+ *
+ * `outcome`: `"pending"` (ainda não terminou), `"connected"` (a sessão subiu: a espera voltou com
+ * ela — também quando o QR virou retomada, com o vínculo bom dos dois lados), `"already_paired"`
+ * (só diante de um computador de build anterior, que recusava o QR com vínculo: ofereça
+ * "Esquecer este aparelho" ou o PIN; desde 13/10 o QR reconecta ou substitui,
+ * `docs/v3-no-privado.md` §8.4), `"failed"` (a troca não fechou: peça um QR novo). O
+ * desfecho vale 2 min, e cada [`quall_qr_call_json`] novo ao mesmo computador o apaga: a
+ * tentativa nova começa em `"pending"`.
+ *
+ * # Safety
+ *
+ * `peer_id` precisa ser uma string C válida; `buf`, nulo ou com `cap` bytes.
+ */
+intptr_t quall_qr_outcome_json(const char *peer_id,
+                               char *buf,
+                               uintptr_t cap);
 
 /**
  * **Espaça a saída de vídeo das próximas sessões** a no máximo `kbps` kbit/s. `0` desliga, e é o
@@ -1090,7 +1605,7 @@ uint16_t quall_session_signaling_port(const struct QuallSession *s);
 /**
  * Sobe uma sessão como **receptor**: conecta no endereço, pareia e responde.
  *
- * `endpoint` é `"192.168.56.131:7877"` ou só `"192.168.56.131"` (a porta padrão entra sozinha).
+ * `endpoint` é `"192.168.1.131:7877"` ou só `"192.168.1.131"` (a porta padrão entra sozinha).
  * É a **mesma** função para o endereço que veio do mDNS e para o que o usuário digitou — de
  * propósito: o fallback de rede sem multicast não pode ser um caminho de código que ninguém
  * exercita.
@@ -1182,10 +1697,10 @@ int64_t quall_session_descartados(const struct QuallSession *s);
  * Quatro campos, todos podendo ser `null`:
  *
  * ```json
- * {"local_candidate":"a=candidate:1 1 UDP 2122317823 192.168.56.131 62493 typ host",
- *  "remote_candidate":"a=candidate:1 1 UDP 2122317823 192.168.56.131 51698 typ host",
- *  "local_address":"192.168.56.131:62493",
- *  "remote_address":"192.168.56.131:51698"}
+ * {"local_candidate":"a=candidate:1 1 UDP 2122317823 192.168.1.131 62493 typ host",
+ *  "remote_candidate":"a=candidate:1 1 UDP 2122317823 192.168.1.131 51698 typ host",
+ *  "local_address":"192.168.1.131:62493",
+ *  "remote_address":"192.168.1.131:51698"}
  * ```
  *
  * # `null` é "o ICE ainda não fechou", e não é erro
@@ -1199,7 +1714,7 @@ int64_t quall_session_descartados(const struct QuallSession *s);
  *
  * Porque **uma corrida "pelo cabo" pode fechar pela Wi-Fi e parecer sucesso**. Medido nesta
  * bancada em 2026-09-01: duas pontas na mesma máquina, sinalização por `127.0.0.1`, e o par
- * escolhido foi `192.168.56.131 <-> 192.168.56.131` — a mídia saiu pelo rádio. O `quall-probe`
+ * escolhido foi `192.168.1.131 <-> 192.168.1.131` — a mídia saiu pelo rádio. O `quall-probe`
  * sempre soube disso porque lê o `Ready` do Rust; a casca não tinha nada equivalente, e foi
  * exatamente essa linha que explicou os 8,6 s de `docs/receptor-ios.md:243`.
  *
@@ -1978,6 +2493,19 @@ enum QuallStatus quall_audio_playout_free(struct QuallAudioPlayout *p);
 int32_t quall_track_capture_offset_us(const struct QuallTrack *t, int64_t *out_us);
 
 /**
+ * Deslocamento de captura para gravação. A guarda da reprodução não suprime este valor.
+ * Retorna 1 com saídas escritas, 0 enquanto a medida não existe, -1 para erro. `out_guard`
+ * recebe 1 (válida), 0 (pendente) ou -1 (recusada). As saídas não mudam com retorno 0/-1.
+ * Não usar no render de áudio: esta consulta toma o cadeado do relógio da sessão.
+ *
+ * # Safety
+ * Handle receptor válido e duas saídas graváveis, distintas.
+ */
+int32_t quall_track_capture_offset_raw_us(const struct QuallTrack *t,
+                                          int64_t *out_us,
+                                          int32_t *out_guard);
+
+/**
  * **`ao_pedir_idr` do contrato.** Registra o tratador do pedido de IDR do receptor.
  *
  * Disparado quando chega **PLI ou FIR**. A casca responde forçando um IDR pelo meio que a
@@ -2484,6 +3012,145 @@ struct QuallSession *quall_connect_with_role(const char *endpoint,
                                              const char *role);
 
 /**
+ * **Hospeda aceitando também o código de 4 dígitos** (`docs/conexao.md` §4). `role` como em
+ * [`quall_host_with_role`]; `confirm` de [`quall_code_confirm_new`] — nulo é exatamente
+ * [`quall_host_with_role`].
+ *
+ * Com `confirm`, quem conecta sem PIN e sem pareamento guardado pode parear tocando Confirmar dos
+ * dois lados: a tela daqui mostra o que [`quall_code_confirm_state_json`] disser. **O PIN de
+ * `opcoes` continua valendo ao mesmo tempo** — é o caminho do plugin de OBS publicado e de toda
+ * casca que ainda não conhece o código. Um código recusado (de qualquer lado) **não** encerra a
+ * espera; o terceiro encerra a oferta do código nesta espera.
+ *
+ * Anuncie com [`quall_advertiser_start_with_code`] e `accepts_code = true` para a lista dos
+ * outros mostrar "Conectar" em vez do campo do PIN.
+ *
+ * # Safety
+ *
+ * As mesmas de [`quall_host_with_role`]; `confirm` precisa ser nulo ou vir de
+ * [`quall_code_confirm_new`] e continuar vivo durante a chamada.
+ */
+struct QuallSession *quall_host_with_code(const struct QuallSessionOptions *opcoes,
+                                          const struct QuallCanceller *cancelador,
+                                          const char *role,
+                                          const struct QuallCodeConfirm *confirm);
+
+/**
+ * **Conecta podendo parear pelo código de 4 dígitos** (`docs/conexao.md` §4). `role` como em
+ * [`quall_connect_with_role`]; `width_px`/`height_px` como em [`quall_connect_with_screen`] (0 e 0
+ * é "não digo"); `confirm` nulo é o `connect` de sempre.
+ *
+ * A ordem: PIN das opções, se houver; senão o pareamento guardado (retomada); senão o código —
+ * se o outro lado disse que aceita. Diante de um aparelho que não aceita código, sem PIN e sem
+ * pareamento, volta logo com `QUALL_STATUS_NEEDS_PIN`, sem ter mandado quadro nenhum: mostre o
+ * campo do PIN (a espera do outro lado continua, com o PIN dele na tela).
+ *
+ * # Safety
+ *
+ * As mesmas de [`quall_connect_with_role`]; `confirm` precisa ser nulo ou vir de
+ * [`quall_code_confirm_new`] e continuar vivo durante a chamada.
+ */
+struct QuallSession *quall_connect_with_code(const char *endpoint,
+                                             const struct QuallSessionOptions *opcoes,
+                                             const struct QuallCanceller *cancelador,
+                                             const char *role,
+                                             const struct QuallCodeConfirm *confirm,
+                                             uint32_t width_px,
+                                             uint32_t height_px);
+
+/**
+ * **O toque em Conectar** (`docs/v3-no-privado.md` §8.6): [`quall_connect_with_code`] sabendo
+ * **quem** a pessoa tocou (`expected_device_id`: o item da lista com `known_device_id`, ou a sessão
+ * salva tocada). É a regra única das cascas para o toque; a reconexão automática continua em
+ * [`quall_connect_known`].
+ *
+ * - Com vínculo v3 com esse aparelho em `known_peers_json`: **reconecta** em `endpoint` (a rota de
+ *   agora), só com o vínculo dele, sem código — mostre "Reconectando…". Se o outro lado não
+ *   reconhece o pareamento e há `confirm`, segue **no mesmo toque** para o código, para parear de
+ *   novo: o estado do confirmador ganha `"notice": "previous_pairing_invalid"` (diga "O pareamento
+ *   anterior não vale mais. Confirme o código para parear de novo."), e o vínculo velho só é trocado
+ *   quando a sessão sobe e a casca grava os pares. Sem `confirm`, falha fechado com
+ *   `PAIR_NOT_RECOGNIZED` (A2). Uma queda de rede na retomada **não** vira pareamento novo: o núcleo
+ *   procura o aparelho de novo (o endereço e a busca) até `opcoes.timeout_ms` e devolve o erro de
+ *   rede (`TIMEOUT`, `IO`, `NO_ROUTE`…) se ninguém aparecer.
+ * - Sem vínculo: é [`quall_connect_with_code`] (retomada se alguma dica casar, senão o código).
+ * - Com PIN em `opcoes`, o PIN pareia de novo, como sempre.
+ *
+ * Nulo/vazio em `expected_device_id` é [`quall_connect_with_code`].
+ *
+ * # Safety
+ *
+ * As de [`quall_connect_with_code`]; `expected_device_id` nulo ou terminado em zero.
+ */
+struct QuallSession *quall_connect_with_code_to(const char *endpoint,
+                                                const struct QuallSessionOptions *opcoes,
+                                                const struct QuallCanceller *cancelador,
+                                                const char *role,
+                                                const struct QuallCodeConfirm *confirm,
+                                                uint32_t width_px,
+                                                uint32_t height_px,
+                                                const char *expected_device_id);
+
+/**
+ * **A sessão salva, sem id no anúncio** (`docs/v3-no-privado.md` §5.2): acha o aparelho
+ * `device_id` — no endereço antigo `last_endpoint` (pode ser nulo) e nos anfitriões da busca
+ * (mDNS, broadcast, sondagem da /24) — e **retoma com ele na mesma conexão**, só com o vínculo
+ * dele (os outros pares de `known_peers_json` não entram). Nunca usa o código nem o PIN de
+ * `opcoes`. Bloqueia até `opcoes.timeout_ms` (0 = o padrão).
+ *
+ * Devolve a sessão como [`quall_connect`]; o endereço em que conectou e por onde o achou saem
+ * em [`quall_session_endpoint_json`] — grave a sessão salva com eles **depois** desta chamada
+ * voltar (a retomada é o que autentica). Nulo: `NEEDS_PIN` (não há vínculo v3 com o aparelho:
+ * pareie de novo), `PAIR_NOT_RECOGNIZED` (o endereço antigo, ou o único candidato que serve ao
+ * papel, respondeu sem reconhecer este pareamento: ele esqueceu este aparelho — ofereça "Esquecer"
+ * e parear de novo), `TIMEOUT` (ninguém com a dica dele respondeu: outra rede, desligado, ou vários
+ * aparelhos sem a dica), `CANCELLED`, `INVALID`.
+ *
+ * `role`: `NULL`/`""` para vídeo, `"controle_remoto"` para o controle de um teleprompter — o
+ * controle reconecta ao prompter guardado por aqui (a porta que falta é a 7979).
+ *
+ * # Safety
+ *
+ * `device_id` terminado em zero; `last_endpoint` nulo ou terminado em zero; `opcoes` válido;
+ * `cancelador` nulo ou vivo durante a chamada.
+ */
+struct QuallSession *quall_connect_known(const char *device_id,
+                                         const char *last_endpoint,
+                                         const struct QuallSessionOptions *opcoes,
+                                         const struct QuallCanceller *cancelador,
+                                         const char *role);
+
+/**
+ * [`quall_connect_known`] **com a tela do receptor** (como [`quall_connect_with_screen`]): o
+ * transmissor ajusta a captura ao tamanho dela. `0, 0` é exatamente [`quall_connect_known`]; um
+ * lado fora de `1..=Screen::LADO_MAXIMO` é `INVALID`.
+ *
+ * # Safety
+ *
+ * As mesmas de [`quall_connect_known`].
+ */
+struct QuallSession *quall_connect_known_with_screen(const char *device_id,
+                                                     const char *last_endpoint,
+                                                     const struct QuallSessionOptions *opcoes,
+                                                     const struct QuallCanceller *cancelador,
+                                                     const char *role,
+                                                     uint32_t width_px,
+                                                     uint32_t height_px);
+
+/**
+ * Onde a sessão do **convidado** conectou: `{"endpoint":"192.168.15.9:7877","via":"udp"}`. `via`
+ * só vem de [`quall_connect_known`] (`"endereco_antigo"`, `"mdns"`, `"udp"`, `"sondagem"`); nas
+ * outras é `null`. No anfitrião, `endpoint` é `null`. Padrão `(buf, cap)`.
+ *
+ * # Safety
+ *
+ * `s` precisa vir de [`quall_host`] ou [`quall_connect`] e estar viva; `buf` nulo ou com `cap` bytes.
+ */
+intptr_t quall_session_endpoint_json(const struct QuallSession *s,
+                                     char *buf,
+                                     uintptr_t cap);
+
+/**
  * **A porta do teleprompter**: 7979. O prompter hospeda nela ([`quall_teleprompter_pick_port`]), e
  * [`quall_connect_with_role`] a usa para completar o endereço sem porta do controle. Uma função, e
  * não um `#define`, pelo motivo de [`quall_protocol_version`] (`docs/contrato-teleprompter.md`
@@ -2508,7 +3175,7 @@ uint16_t quall_teleprompter_pick_port(uint32_t wait_ms);
  * o QR trouxe —, sem rede nenhuma. Padrão `(buf, cap)`:
  *
  * ```json
- * {"endereco":"192.168.57.8:7979","pin":"424242"}
+ * {"endereco":"192.168.15.8:7979","pin":"424242"}
  * ```
  *
  * `"pin"` é `null` quando a entrada não era um link. Sem porta, a do papel: `role`
@@ -2618,6 +3285,25 @@ intptr_t quall_messages_stats_json(const struct QuallMessages *m, char *buf, uin
  * `m` precisa vir de [`quall_session_messages`] e não pode ter sido liberado antes.
  */
 void quall_messages_free(struct QuallMessages *m);
+
+/**
+ * **O mensageiro da câmera desta sessão** (`docs/controle-remoto-da-camera.md` §17.2): manda pelo
+ * mesmo canal que `m`, e lê de uma **caixa própria**, para onde vão as mensagens da câmera
+ * (`"app":"camera"`) que chegam à sessão. É como o controle remoto da câmera (R9b) passa pela
+ * sessão do **teleprompter**: o prompter R5 bombeia o seu `QuallCameraHost` com ele, e o controle o
+ * seu `QuallCameraRemote`, enquanto `quall_teleprompter_pump` lê o handle comum e nunca vê a câmera.
+ *
+ * Na primeira vez **liga a triagem** da sessão: dali em diante, a câmera só chega por um handle
+ * destes. Pedido de novo (de `m` ou de um handle da câmera), é outro handle da mesma caixa.
+ * **Numa sessão de vídeo, não peça**: lá o leitor da câmera é o handle comum. É do chamador: libere
+ * com [`quall_messages_free`]; sobrevive a [`quall_session_close`] como o comum, e depois do fim lê
+ * `QUALL_STATUS_CLOSED`. `NULL` com `m` nulo.
+ *
+ * # Safety
+ *
+ * `m` precisa vir de [`quall_session_messages`] (ou desta função) e estar vivo.
+ */
+struct QuallMessages *quall_messages_for_camera(const struct QuallMessages *m);
 
 /**
  * **O teto do roteiro**, em bytes de UTF-8: 131 072.
@@ -2947,6 +3633,20 @@ enum QuallStatus quall_teleprompter_release(const struct QuallTeleprompter *t);
  */
 enum QuallStatus quall_teleprompter_enable_recording(const struct QuallTeleprompter *t,
                                                      bool enabled);
+
+/**
+ * **Diz se a tela deste prompter tem a câmera para o controle controlar** (R9b pelo canal do
+ * teleprompter, `docs/controle-remoto-da-camera.md` §17.3): a tela do prompter R5 liga
+ * (`enabled = true`) quando bombeia o seu `QuallCameraHost` sobre [`quall_messages_for_camera`] da
+ * sessão do teleprompter, e desliga ao fechar. Ligada, o estado leva `"entende_camera": true`, e o
+ * controle vê `"par_entende_camera"` (o bit `QUALL_TELEPROMPTER_CHANGE_CAMERA`). No controle, não
+ * muda nada.
+ *
+ * # Safety
+ *
+ * `t` precisa vir de [`quall_teleprompter_new`].
+ */
+enum QuallStatus quall_teleprompter_enable_camera(const struct QuallTeleprompter *t, bool enabled);
 
 /**
  * **O relato da gravação, por quem grava** (§13): `true` quando o arquivo começou, `false` quando
@@ -3337,7 +4037,7 @@ enum QuallStatus quall_camera_remote_pump(const struct QuallCameraRemote *r,
  *
  * ```json
  * {"situacao":"pronto","capacidades":{…},"ajuste":{…},"aplicado":{…},"pendente":{"iso":800},
- *  "lido":{…},"autor":"Pixel do Pessoa Exemplo","versao":17,
+ *  "lido":{…},"autor":"Pixel do Pessoa","versao":17,
  *  "recusa":{"motivo":"superado","campo":"iso","ha_ms":300},"contadores":{…}}
  * ```
  *
@@ -3353,6 +4053,13 @@ enum QuallStatus quall_camera_remote_pump(const struct QuallCameraRemote *r,
 intptr_t quall_camera_remote_state_json(const struct QuallCameraRemote *r,
                                         char *buf,
                                         uintptr_t cap);
+
+extern int sysctl(int *name,
+                  unsigned int namelen,
+                  void *oldp,
+                  uintptr_t *oldlenp,
+                  void *newp,
+                  uintptr_t newlen);
 
 #ifdef __cplusplus
 }  // extern "C"

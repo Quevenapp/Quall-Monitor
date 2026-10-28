@@ -17,10 +17,10 @@ import Foundation
 ///
 /// Nenhum perfil de provisionamento do projeto tem `com.apple.developer.networking.multicast`,
 /// e por isso o iPhone não pode usar **este** caminho — o do núcleo, que abre socket multicast
-/// cru. **Ele passou a anunciar por outro:** `AnuncianteBonjour`, com `NetService`, pelo
+/// cru. **Ele anuncia por outro:** `AnuncianteBonjour`, com DNSServiceRegister/RegisterRecord, pelo
 /// `mDNSResponder` do sistema, sem entitlement (medido em 01/09/2026). No macOS não há o teto e
 /// este caminho serve: este Mac aparece na lista. A tela de espera daqui mostra as duas coisas mesmo assim —
-/// o nome, para quem vê a lista, e o endereço, para quem está numa rede que bloqueia multicast,
+/// o alias efêmero, para quem vê a lista, e o endereço, para quem está numa rede que bloqueia multicast,
 /// que é o fallback obrigatório do `PROMPT.md` e já se pagou nesta bancada.
 public final class Anunciante {
     private let trava = NSLock()
@@ -28,13 +28,6 @@ public final class Anunciante {
     private var vivas: [UnsafeMutablePointer<CChar>] = []
 
     public init() {}
-
-    /// Protocol 3 advertises an ephemeral label; the real host identity is shared after pairing.
-    public var rotulo: String {
-        trava.lock(); defer { trava.unlock() }
-        guard let handle else { return "" }
-        return NucleoDeRede.lerTexto { out, cap in Int(quall_advertiser_label(handle, out, cap)) }
-    }
 
     deinit {
         parar()
@@ -50,8 +43,13 @@ public final class Anunciante {
     /// Devolve `false` quando o daemon de mDNS recusou — em rede com multicast bloqueado isso é
     /// esperado, **não é erro de produto**, e a interface deve continuar mostrando o endereço em
     /// vez de dizer que algo falhou.
+    ///
+    /// `aceitaCodigo` (`docs/conexao.md` §4.3): diz no anúncio (`cc` no TXT e na UDP) que esta espera
+    /// hospeda com o confirmador, e a lista dos outros mostra "Conectar" sem pedir PIN. Só `true`
+    /// quando a espera vai mesmo por `quall_host_with_code` e a janela tem o cartão.
     @discardableResult
-    public func comecar(deviceId: String, nome: String, porta: UInt16, emiteTela: Bool, emiteCamera: Bool) -> Bool {
+    public func comecar(deviceId: String, nome: String, porta: UInt16, emiteTela: Bool, emiteCamera: Bool,
+                        aceitaCodigo: Bool = false) -> Bool {
         let idC = guardar(deviceId)
         let nomeC = guardar(nome)
         var eu = QuallDeviceDesc(
@@ -60,10 +58,14 @@ public final class Anunciante {
             screen_source: emiteTela,
             camera_source: emiteCamera,
             sink: false)
-        let novo = withUnsafePointer(to: &eu) { quall_advertiser_start($0, porta) }
+        // `quall_advertiser_start_with_code` com `false` e papel nulo é exatamente o `quall_advertiser_start`.
+        let novo = withUnsafePointer(to: &eu) { quall_advertiser_start_with_code($0, porta, nil, aceitaCodigo) }
         guard let novo else { return false }
+        // O nome que este anúncio leva (`nm`, §8.7): o do processo agora, quando ele subiu.
+        let nome = NucleoDeRede.lerTexto { quall_announced_name($0, $1) }
         trava.lock()
         handle = novo
+        nomeDoAnuncio = nome
         trava.unlock()
         return true
     }
@@ -74,7 +76,8 @@ public final class Anunciante {
     /// listas de vídeo o deixam de fora. Mesma regra de falha de `comecar`: multicast bloqueado não é
     /// erro de produto, e o endereço continua na tela.
     @discardableResult
-    public func comecarComoTeleprompter(deviceId: String, nome: String, porta: UInt16) -> Bool {
+    public func comecarComoTeleprompter(deviceId: String, nome: String, porta: UInt16,
+                                        aceitaCodigo: Bool = false) -> Bool {
         let idC = guardar(deviceId)
         let nomeC = guardar(nome)
         let papelC = guardar("teleprompter")
@@ -84,12 +87,41 @@ public final class Anunciante {
             screen_source: false,
             camera_source: false,
             sink: false)
-        let novo = withUnsafePointer(to: &eu) { quall_advertiser_start_with_role($0, porta, papelC) }
+        let novo = withUnsafePointer(to: &eu) { quall_advertiser_start_with_code($0, porta, papelC, aceitaCodigo) }
         guard let novo else { return false }
+        // O nome que este anúncio leva (`nm`, §8.7): o do processo agora, quando ele subiu.
+        let nome = NucleoDeRede.lerTexto { quall_announced_name($0, $1) }
         trava.lock()
         handle = novo
+        nomeDoAnuncio = nome
         trava.unlock()
         return true
+    }
+
+    /// O `nm` com que o anúncio no ar subiu (14/10, §8.7.1); vazio sem nome. Não muda com o campo.
+    private var nomeDoAnuncio = ""
+
+    /// O nome que os outros veem na lista, deste anúncio; `nil` sem anúncio ou sem nome.
+    public var nomeAnunciadoNoAr: String? {
+        trava.lock()
+        defer { trava.unlock() }
+        guard handle != nil, !nomeDoAnuncio.isEmpty else { return nil }
+        return nomeDoAnuncio
+    }
+
+    /// Alias efêmero exato que a descoberta v3 apresenta na lista.
+    /// A trava mantém o handle vivo durante a leitura; o nome pessoal permanece
+    /// reservado para o payload autenticado da sessão.
+    public var nomePublico: String? {
+        trava.lock()
+        defer { trava.unlock() }
+        guard let handle else { return nil }
+        var bytes = [CChar](repeating: 0, count: 64)
+        let tamanho = bytes.withUnsafeMutableBufferPointer {
+            quall_advertiser_label(handle, $0.baseAddress, UInt($0.count))
+        }
+        guard tamanho > 0, tamanho <= bytes.count else { return nil }
+        return String(cString: bytes)
     }
 
     /// **Bloqueia** por até ~1 s esperando o adeus do mDNS sair (dívida 3: a versão antiga só
@@ -99,6 +131,7 @@ public final class Anunciante {
         trava.lock()
         let atual = handle
         handle = nil
+        nomeDoAnuncio = ""
         trava.unlock()
         if let atual { quall_advertiser_stop(atual) }
     }

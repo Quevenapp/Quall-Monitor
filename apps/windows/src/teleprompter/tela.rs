@@ -1963,6 +1963,7 @@ impl Tela {
             pedido_de_gravacao: None,
             gravacao_recusada: None,
             par_entende_gravar: false,
+            par_entende_camera: false,
         })
     }
 

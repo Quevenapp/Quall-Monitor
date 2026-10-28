@@ -53,12 +53,57 @@ fn caminho_do_id() -> PathBuf {
     pasta_de_dados().join("device-id.txt")
 }
 
-/// O nome com que este computador aparece na lista dos outros aparelhos.
-///
-/// É o nome do computador que a pessoa já conhece (o mesmo de Configurações > Sistema > Sobre),
-/// não um nome inventado por nós: quem está do outro lado da sala precisa reconhecer a máquina na
-/// lista sem ter aprendido um segundo nome para ela.
+fn caminho_do_nome() -> PathBuf {
+    pasta_de_dados().join("nome-na-rede.txt")
+}
+
+/// O que a pessoa escreveu no campo "Nome que os outros aparelhos veem" — vazio inclusive. `None`
+/// enquanto ela não escolheu nada.
+fn nome_guardado() -> Option<String> {
+    std::fs::read_to_string(caminho_do_nome()).ok()
+}
+
+/// **O nome da sessão** (o `display_name` que o `Hello` leva, cifrado): o do campo da barra
+/// (`docs/v3-no-privado.md` §8.7), ou o do computador quando o campo está vazio ou nunca foi mexido.
 pub fn nome_do_aparelho() -> String {
+    crate::conexao::nome_da_sessao(nome_guardado().as_deref(), &nome_do_computador())
+}
+
+/// **O nome que os outros aparelhos veem na lista** (§8.7): o do campo, o do computador enquanto a
+/// pessoa não escolheu outro, ou vazio (os anúncios saem sem nome, e a lista dos outros mostra o
+/// alias `Quall <8 hex>`).
+pub fn nome_na_rede() -> String {
+    crate::conexao::nome_na_rede(nome_guardado().as_deref(), &nome_do_computador())
+}
+
+/// Guarda o que a pessoa escreveu e já passa ao núcleo (`aplicar_nome_na_rede`): a próxima espera
+/// anuncia com ele. O mesmo nome de agora não vira escolha guardada.
+pub fn guardar_nome_na_rede(nome: &str) {
+    if crate::conexao::nome_na_rede(Some(nome), "") == nome_na_rede() {
+        return;
+    }
+    if let Err(e) = std::fs::write(caminho_do_nome(), nome.trim()) {
+        registro::linha(format!("aviso: não consegui gravar o nome na rede: {e}"));
+    }
+    aplicar_nome_na_rede();
+}
+
+/// **Passa o nome ao núcleo** (`quall_core::discovery::definir_nome_anunciado`): vale para todo
+/// anúncio que começar depois. Na abertura da janela e a cada mudança do campo. O diário diz só o
+/// tamanho, nunca o nome.
+pub fn aplicar_nome_na_rede() {
+    let nome = nome_na_rede();
+    let ficou = quall_core::discovery::definir_nome_anunciado(Some(&nome));
+    registro::linha(match ficou {
+        Some(n) => format!("nome na rede: definido, {} bytes", n.len()),
+        None => "nome na rede: nenhum (os outros veem o alias)".to_string(),
+    });
+}
+
+/// O nome do computador, o que a pessoa já conhece (o mesmo de Configurações > Sistema > Sobre),
+/// com a marca do produto: o Quall Monitor e o Quall Studio podem estar no mesmo computador, e a
+/// lista dos outros aparelhos precisa distinguir os dois. É o padrão do nome na rede.
+pub fn nome_do_computador() -> String {
     use windows::Win32::System::SystemInformation::{
         ComputerNameDnsHostname, GetComputerNameExW,
     };
@@ -298,4 +343,85 @@ pub fn esquecer_pares() {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => registro::linha(format!("aviso: não consegui apagar pares.json: {e}")),
     }
+    // Sem vínculo, o nome local e a sessão salva não servem para nada (a lista só mostra a linha
+    // "Pareado" com o vínculo de pé): saem juntos.
+    let _vez = ESCRITA_DOS_PARES.lock().unwrap_or_else(|e| e.into_inner());
+    for c in [caminho_dos_nomes(), caminho_da_sessao_do_exibir()] {
+        match std::fs::remove_file(&c) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => registro::linha(format!("aviso: não consegui apagar {}: {e}", c.display())),
+        }
+    }
+}
+
+// --- a sessão salva do Exibir (`docs/conexao.md` §3) --------------------------------------------
+
+fn caminho_da_sessao_do_exibir() -> PathBuf {
+    pasta_de_dados().join(crate::conexao::ARQUIVO_DA_SESSAO)
+}
+
+/// **A última sessão do Exibir**: quem era o outro lado (o id), o nome e o último endereço. Ausente
+/// ou ilegível: nenhuma (a lista fica sem a linha "Pareado", e nada mais muda).
+pub fn sessao_do_exibir() -> Option<crate::conexao::SessaoSalva> {
+    let texto = std::fs::read_to_string(caminho_da_sessao_do_exibir()).ok()?;
+    crate::conexao::SessaoSalva::ler(&texto)
+}
+
+/// Grava a sessão do Exibir. **Só depois de conectar e autenticar** (M3, `conexao::SessaoSalva::
+/// depois_de_conectar`): quem chama é o `receptor.rs`, com a sessão de pé. Por troca de arquivo, como
+/// `pares.json`.
+pub fn guardar_sessao_do_exibir(s: &crate::conexao::SessaoSalva) {
+    let destino = caminho_da_sessao_do_exibir();
+    let provisorio = destino.with_extension("txt.gravando");
+    let gravou = std::fs::write(&provisorio, s.escrever()).and_then(|_| std::fs::rename(&provisorio, &destino));
+    match gravou {
+        Ok(()) => registro::linha(format!("sessão salva do Exibir gravada (com id: {})", !s.device_id.is_empty())),
+        Err(e) => registro::linha(format!("aviso: não consegui gravar a sessão salva do Exibir: {e}")),
+    }
+}
+
+/// Apaga a sessão salva do Exibir ("Esquecer este aparelho", A2 de `docs/v3-no-privado.md` §3.5).
+pub fn esquecer_sessao_do_exibir() {
+    match std::fs::remove_file(caminho_da_sessao_do_exibir()) {
+        Ok(()) => registro::linha("sessão salva do Exibir esquecida"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => registro::linha(format!("aviso: não consegui apagar a sessão salva do Exibir: {e}")),
+    }
+}
+
+// --- os nomes locais dos pares (`docs/v3-no-privado.md` §5.4) -----------------------------------
+
+fn caminho_dos_nomes() -> PathBuf {
+    pasta_de_dados().join(crate::conexao::ARQUIVO_DOS_NOMES)
+}
+
+/// Os nomes que as sessões autenticadas deram, por id. Ausente ou ilegível: nenhum.
+pub fn nomes_dos_pares() -> crate::conexao::NomesDosPares {
+    crate::conexao::NomesDosPares::ler(&std::fs::read_to_string(caminho_dos_nomes()).unwrap_or_default())
+}
+
+/// Lê, muda e grava os nomes (pelo mesmo cadeado dos pares, e por troca de arquivo).
+fn mudar_os_nomes(f: impl FnOnce(&mut crate::conexao::NomesDosPares)) {
+    let _vez = ESCRITA_DOS_PARES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut nomes = nomes_dos_pares();
+    let antes = nomes.clone();
+    f(&mut nomes);
+    if nomes == antes {
+        return;
+    }
+    let destino = caminho_dos_nomes();
+    let provisorio = destino.with_extension("txt.gravando");
+    if let Err(e) = std::fs::write(&provisorio, nomes.escrever()).and_then(|_| std::fs::rename(&provisorio, &destino)) {
+        registro::linha(format!("aviso: não consegui gravar os nomes dos pares: {e}"));
+    }
+}
+
+/// Guarda o nome de um par, **depois de autenticar** (o id e o nome vêm da sessão de pé).
+pub fn guardar_nome_do_par(device_id: &str, nome: &str) {
+    mudar_os_nomes(|n| n.guardar(device_id, nome));
+}
+
+pub fn esquecer_nome_do_par(device_id: &str) {
+    mudar_os_nomes(|n| n.esquecer(device_id));
 }

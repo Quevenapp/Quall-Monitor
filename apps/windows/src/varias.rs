@@ -41,6 +41,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{select, unbounded, Receiver, Sender};
 use quall_core::cancel::Cancelamento;
+use quall_core::confirmacao::ConfirmacaoPorCodigo;
 use quall_core::discovery::{anuncio, Advertiser};
 use quall_core::pairing::Pin;
 use quall_core::protocol::Capabilities;
@@ -171,7 +172,9 @@ impl Anunciante {
                         registro::linha(format!("mdns: desligado por --so-local (a espera na porta {porta} só em 127.0.0.1)"));
                         None
                     }
-                    Some(porta) => match Advertiser::start(&eu, porta) {
+                    // `cc` no anúncio (`docs/v3-no-privado.md` §3): esta espera aceita o código de 4
+                    // dígitos, e a janela tem o cartão dos três números (`EfeitosReais::abrir_espera`).
+                    Some(porta) => match Advertiser::start_com_codigo(&eu, porta, true) {
                         Ok(a) => {
                             let rotulo = a.discovery_label().to_string();
                             atual = Some(a);
@@ -190,9 +193,12 @@ impl Anunciante {
                 };
                 {
                     let mut e = emissor.estado();
-                    if e.rotulo_da_descoberta != rotulo {
+                    // O nome (`nm`) com que o anúncio subiu: o que os outros veem na lista (§8.7.1).
+                    let nome_anunciado = rotulo.as_ref().and_then(|_| quall_core::discovery::nome_anunciado()).unwrap_or_default();
+                    if e.rotulo_da_descoberta != rotulo || e.nome_da_descoberta != nome_anunciado {
                         e.anunciando_por_mdns = rotulo.is_some();
                         e.rotulo_da_descoberta = rotulo;
+                        e.nome_da_descoberta = nome_anunciado;
                         e.versao += 1;
                     }
                 }
@@ -230,6 +236,28 @@ struct EfeitosReais {
     nome: String,
     device_id: String,
     preferencia: Preferencia,
+    /// **Os confirmadores do código, pelo PIN** (`docs/v3-no-privado.md` §3): a espera que volta com o
+    /// mesmo PIN (o `--pin` da bancada, ou a reabertura depois de um candidato que caiu) continua com
+    /// o mesmo confirmador — as três trocas e o fim do código depois de uma escolha errada (P11) não
+    /// zeram. PIN novo, confirmador novo.
+    esperas_do_codigo: crate::conexao::EsperasDoCodigo<ConfirmacaoPorCodigo>,
+    /// A sessão cuja espera tem o confirmador na janela, e o id dele. Uma espera por vez: a do
+    /// primeiro aparelho, ou a de mais um com outros no ar.
+    codigo_da_espera: Option<(Id, u64)>,
+}
+
+impl EfeitosReais {
+    /// **A espera de `id` acabou** (conectou ou não): o cartão dela sai da janela antes que a tabela
+    /// abra a próxima espera — o toque num cartão velho nunca cai no confirmador novo.
+    fn fim_da_espera(&mut self, id: Id) {
+        if let Some((de, espera)) = self.codigo_da_espera {
+            if de == id {
+                self.codigo_da_espera = None;
+                self.emissor.soltar_confirmacao(espera);
+                self.emissor.olhar_o_codigo();
+            }
+        }
+    }
 }
 
 impl Efeitos for EfeitosReais {
@@ -270,6 +298,11 @@ impl Efeitos for EfeitosReais {
         }
         .map_err(|e| e.to_string())?;
         let pin_texto = pin.to_display();
+        // O confirmador desta espera, pelo PIN, e já na janela: o cartão aparece quando alguém tocar
+        // Conectar sem PIN e sem vínculo. Nenhuma troca pelo código gasta o PIN.
+        let da_espera = self.esperas_do_codigo.para_o_pin(&pin_texto, ConfirmacaoPorCodigo::nova);
+        let codigo = Some(da_espera.c.clone());
+        let id_da_espera = da_espera.id;
         let (tx_ordens, rx_ordens) = unbounded();
         let cancelamento = Cancelamento::novo();
         let parar = Arc::new(AtomicBool::new(false));
@@ -279,6 +312,7 @@ impl Efeitos for EfeitosReais {
             id,
             servidor,
             pin,
+            codigo,
             com_audio,
             toca_som: toca_som.clone(),
             argumentos: self.emissor.argumentos.clone(),
@@ -316,8 +350,17 @@ impl Efeitos for EfeitosReais {
                 toca_som,
             },
         );
+        if let Some((velha, espera)) = self.codigo_da_espera.replace((id, id_da_espera)) {
+            if velha != id {
+                registro::linha(format!("[#{id}] código: a espera de #{velha} ainda tinha o cartão — trocado"));
+            }
+            if espera != id_da_espera {
+                self.emissor.soltar_confirmacao(espera);
+            }
+        }
+        self.emissor.trocar_confirmacao(Some(da_espera));
         registro::linha(format!(
-            "[#{id}] espera: porta={porta_de_fato} com_som={com_audio}"
+            "[#{id}] espera: porta={porta_de_fato} com_som={com_audio} código=aceito"
         ));
         Ok((porta_de_fato, pin_texto))
     }
@@ -412,6 +455,8 @@ fn correr(emissor: Arc<Emissor>, pedidos: Receiver<Pedido>) {
         nome,
         device_id,
         preferencia,
+        esperas_do_codigo: Default::default(),
+        codigo_da_espera: None,
     };
     let mut tabela = Tabela::nova(identidade::indices_de_monitor());
     let mut resumos: HashMap<Id, String> = HashMap::new();
@@ -532,8 +577,12 @@ fn correr(emissor: Arc<Emissor>, pedidos: Receiver<Pedido>) {
                 if let Ok((id, d)) = m {
                     let agora = agora_ms(base);
                     match d {
-                        DaSessao::Conectou(par) => tabela.conectou(id, par, agora, &mut fx),
+                        DaSessao::Conectou(par) => {
+                            fx.fim_da_espera(id);
+                            tabela.conectou(id, par, agora, &mut fx)
+                        }
                         DaSessao::FalhouAoHospedar(falha, texto) => {
+                            fx.fim_da_espera(id);
                             if !texto.is_empty() {
                                 registro::linha(format!("[#{id}] a espera acabou: {texto}"));
                             }

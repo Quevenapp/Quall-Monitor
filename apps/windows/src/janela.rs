@@ -216,6 +216,12 @@ pub fn correr(emissor: Arc<Emissor>, receptor: Arc<Receptor>, cameras: Vec<crate
     // "Exibir", a lista estaria sempre vazia na hora exata em que alguém olha para ela — um
     // anúncio mDNS leva segundos para chegar.
     receptor.comecar_a_procurar();
+    // O QR do computador (`docs/conexao.md` §10): a thread sobe com o app, e o convite só existe com o
+    // Exibir à vista (`mostrar_o_qr`, a cada pulso).
+    receptor.comecar_o_qr();
+    // **O nome que os outros aparelhos veem** (`docs/v3-no-privado.md` §8.7): o guardado (ou o nome
+    // do computador) vai ao núcleo antes da primeira espera.
+    crate::identidade::aplicar_nome_na_rede();
     let com_cameras = emissor.argumentos.com_cameras();
     // Os números da exibição começam abertos numa corrida de bancada (§6.6).
     let detalhes = emissor.argumentos.modo_de_bancada();
@@ -568,6 +574,16 @@ impl Janela {
             if let Some(pin) = j.h(Controle::Pin) {
                 SendMessageW(pin, EM_SETLIMITTEXT, Some(WPARAM(6)), None);
             }
+            // **O nome que os outros aparelhos veem** (`docs/v3-no-privado.md` §8.7): o guardado, ou o
+            // nome do computador. O núcleo corta em 40 bytes; aqui, 40 caracteres. O retrato fica vazio
+            // (com a dica cinza): ele não lê a pasta de dados.
+            if let Some(nome) = j.h(Controle::NomeNaRede) {
+                SendMessageW(nome, EM_SETLIMITTEXT, Some(WPARAM(40)), None);
+                if j.app.is_some() {
+                    let texto = largo(&crate::identidade::nome_na_rede());
+                    let _ = SetWindowTextW(nome, PCWSTR(texto.as_ptr()));
+                }
+            }
             // A barra de rolagem escura na lista (Windows 10 1809 em diante), quando os aparelhos
             // passam de três.
             if let Some(lista) = j.h(Controle::Lista) {
@@ -600,13 +616,18 @@ impl Janela {
                 let dica = largo(t("ex.: 192.168.0.12:7877"));
                 SendMessageW(endereco, EM_SETCUEBANNER, Some(WPARAM(0)), Some(LPARAM(dica.as_ptr() as isize)));
             }
+            // Vazio, o campo mostra o nome do computador em cinza: é o que a sessão leva, e a rede não.
+            if let Some(nome) = self.h(Controle::NomeNaRede) {
+                let dica = largo(&crate::identidade::nome_do_computador());
+                SendMessageW(nome, EM_SETCUEBANNER, Some(WPARAM(0)), Some(LPARAM(dica.as_ptr() as isize)));
+            }
         }
         let servicos: Option<IAccPropServices> = unsafe { CoCreateInstance(&CLSID_AccPropServices, None, CLSCTX_INPROC_SERVER).ok() };
         let Some(s) = servicos else {
             registro::linha("janela: o IAccPropServices não veio; os campos ficam sem nome para o Narrador");
             return;
         };
-        for c in [Controle::Endereco, Controle::Pin, Controle::Lista] {
+        for c in [Controle::Endereco, Controle::Pin, Controle::Lista, Controle::NomeNaRede] {
             let Some(h) = self.h(c) else { continue };
             let nome = largo(&modelo::texto_acessivel(c, &self.modelo));
             unsafe {
@@ -638,7 +659,7 @@ impl Janela {
     /// O que depende do DPI nos controles nativos: a fonte dos campos e a altura da linha da lista.
     fn aplicar_dpi(&mut self) {
         unsafe {
-            for c in [Controle::Endereco, Controle::Pin, Controle::Lista] {
+            for c in [Controle::Endereco, Controle::Pin, Controle::Lista, Controle::NomeNaRede] {
                 if let Some(h) = self.h(c) {
                     SendMessageW(h, WM_SETFONT, Some(WPARAM(self.fonte_mono.0 as usize)), Some(LPARAM(1)));
                 }
@@ -903,6 +924,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 app.emissor.encerrar();
                 app.receptor.encerrar();
                 app.receptor.busca.parar();
+                app.receptor.parar_o_qr();
             }
             unsafe {
                 let _ = DestroyWindow(hwnd);
@@ -944,6 +966,17 @@ impl Janela {
         // **O nó da câmera de um aparelho recém-pareado nasce aqui**, e não na thread da sessão:
         // o objeto COM tem de ser criado por quem vai guardá-lo. Ver `baias::atender_pendentes`.
         app.receptor.baias.atender_pendentes(&mut self.cameras);
+
+        // **O cartão do código de 4 dígitos** (`docs/conexao.md` §4): o confirmador da espera (o
+        // emissor, também a do "mais um" com vários aparelhos) ou da conexão (o receptor) é lido
+        // aqui, e a versão só sobe quando o cartão muda.
+        app.emissor.olhar_o_codigo();
+        app.receptor.olhar_o_codigo();
+        // **O QR do computador** (`docs/conexao.md` §10) só existe com o painel Exibir à vista: a
+        // escuta do chamado não fica aberta para um QR que ninguém está vendo.
+        let exibir_a_vista = self.modelo.cena == Cena::Painel(Painel::Exibir)
+            && unsafe { IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool() };
+        app.receptor.mostrar_o_qr(exibir_a_vista);
 
         let (versao_e, sair) = {
             let e = app.emissor.estado();
@@ -1019,7 +1052,19 @@ impl Janela {
             return;
         }
         self.ultima_versao = versao;
+        let tinha_codigo = self.modelo.codigo.is_some();
         self.atualizar(hwnd);
+        // **O código apareceu com a janela escondida** (na bandeja, ou minimizada): ela volta à frente.
+        // Alguém tocou Conectar no outro aparelho e espera a pessoa daqui comparar o número; sem isto,
+        // o cartão ficaria numa janela que ninguém vê até o código expirar.
+        if !tinha_codigo && self.modelo.codigo.is_some() {
+            // Fora de um clique, o Windows pode só piscar o botão da barra em vez de trazer para a
+            // frente: o cartão aparece mesmo assim, e a pessoa vê o botão piscando.
+            if unsafe { !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() } {
+                registro::linha("código: a janela estava escondida; trazendo para a frente");
+            }
+            bandeja::restaurar(hwnd);
+        }
     }
 
     /// Monta o estado (do emissor e do receptor, ou o de exemplo já posto) e o aplica.
@@ -1082,15 +1127,23 @@ impl Janela {
         match (c, aviso) {
             // O traço violeta do campo com o foco: o estado é remontado pela fila, e não aqui — o
             // `EN_KILLFOCUS` chega também de dentro do `aplicar`, quando ele esconde o campo.
-            (Controle::Endereco | Controle::Pin, EN_SETFOCUS) => {
+            (Controle::Endereco | Controle::Pin | Controle::NomeNaRede, EN_SETFOCUS) => {
                 self.foco = Some(c);
                 self.pedir_atualizacao(hwnd);
             }
-            (Controle::Endereco | Controle::Pin, EN_KILLFOCUS) => {
+            (Controle::Endereco | Controle::Pin | Controle::NomeNaRede, EN_KILLFOCUS) => {
                 if self.foco == Some(c) {
                     self.foco = None;
                 }
                 self.pedir_atualizacao(hwnd);
+            }
+            // **O nome na rede** (§8.7): gravado e passado ao núcleo a cada mudança — vale para a próxima
+            // espera. O mesmo nome não regrava (o texto posto na abertura também chega aqui).
+            (Controle::NomeNaRede, EN_CHANGE) => {
+                if self.app.is_some() {
+                    let nome = self.h(c).map(texto_de).unwrap_or_default();
+                    crate::identidade::guardar_nome_na_rede(&nome);
+                }
             }
             (Controle::Lista, LBN_SELCHANGE) => {
                 let Some(h) = self.h(Controle::Lista) else { return };
@@ -1314,6 +1367,32 @@ impl Janela {
             Controle::Mudo => receptor.definir_mudo(ler(Controle::Mudo)),
             Controle::SomComCamera => receptor.definir_som_com_camera(ler(Controle::SomComCamera)),
             Controle::Volume(i) => receptor.definir_volume(VOLUMES[i.min(VOLUMES.len() - 1)].0),
+            // **O cartão do código** (`docs/v3-no-privado.md` §3.6): só o anfitrião tem botões — os três
+            // números e o "Nenhum destes". O toque vai com a tentativa e a espera do cartão que está
+            // desenhado (M2): se ela já caiu e outra começou, o emissor o ignora. No Quall Monitor o
+            // anfitrião é a espera sozinha ou a do "mais um" com vários aparelhos. O convidado desiste
+            // pelo Cancelar.
+            Controle::EscolherCodigo(_) | Controle::RecusarCodigo => {
+                let Some((espera, tentativa)) = self.modelo.codigo.as_ref().filter(|c| c.do_anfitriao()).map(|c| (c.espera, c.tentativa)) else { return };
+                if matches!(self.modelo.cena, Cena::Esperando | Cena::Varios) {
+                    match c {
+                        Controle::EscolherCodigo(i) => {
+                            emissor.escolher_codigo(espera, tentativa, i);
+                        }
+                        _ => {
+                            emissor.recusar_codigo(espera, tentativa);
+                        }
+                    }
+                }
+            }
+            // **A2**: o aparelho com vínculo não reconheceu este pareamento; esquecê-lo devolve o código.
+            Controle::EsquecerEsteAparelho => {
+                receptor.esquecer_este_aparelho();
+            }
+            // A varredura da /24 de novo (`docs/v3-no-privado.md` §8.9).
+            Controle::ProcurarDeNovo => {
+                receptor.procurar_de_novo();
+            }
             _ => {}
         }
     }
@@ -1398,17 +1477,31 @@ impl Janela {
                 .iter()
                 .map(|a| LinhaDeAparelho {
                     nome: a.nome.clone(),
-                    tipo: match (a.tem_tela, a.tem_camera) {
-                        (true, true) => t("Tela ou câmera"),
-                        (true, false) => t("Tela"),
-                        (false, true) => t("Câmera"),
-                        (false, false) => "—",
+                    tipo: match (a.lembrado || a.conhecido.is_some(), a.tem_tela, a.tem_camera) {
+                        // O par guardado, pelo nome local (P3, `docs/v3-no-privado.md` §5.4): o item
+                        // que a sonda reconheceu, ou a linha da sessão salva, que retoma com ele onde
+                        // estiver. A rede só diz "Quall 1a2b3c4d".
+                        (true, _, _) => t("Pareado"),
+                        (false, true, true) => t("Tela ou câmera"),
+                        (false, true, false) => t("Tela"),
+                        (false, false, true) => t("Câmera"),
+                        (false, false, false) => "—",
                     }
                     .to_string(),
                     endereco: a.endereco.to_string(),
                 })
+                // O nome anunciado leva o alias na frente do tipo (`docs/v3-no-privado.md` §8.7): não
+                // autentica nada, e o alias é o que a espera do outro aparelho mostra.
+                .zip(r.aparelhos.iter())
+                .map(|(mut linha, a)| {
+                    if let Some(alias) = &a.alias {
+                        linha.tipo = format!("{alias} · {}", linha.tipo);
+                    }
+                    linha
+                })
                 .collect(),
             escolhido: r.escolhido,
+            qr: r.qr.clone(),
             procurando: r.procurando,
             vazio,
             pede_pin: r.pede_pin,
@@ -1416,6 +1509,7 @@ impl Janela {
             aviso: (!r.conselho.is_empty())
                 .then(|| Aviso { tom: if r.pede_pin { estilo::Tom::Vermelho } else { estilo::Tom::Ambar }, texto: tr(&r.conselho) }),
             foco: self.foco,
+            esquecer_este: r.esquecer_este.is_some(),
         };
 
         // --- Ajustes ---
@@ -1446,16 +1540,24 @@ impl Janela {
         } else if e.camera_pelo_dono && !e.resumo.is_empty() {
             // O aviso da espera da câmera (o PIN que não conferiu e mudou, o receptor que saiu).
             (tr(&e.resumo), true)
+        } else if !e.aviso_do_codigo.is_empty() {
+            // Por que o último código não fechou (`docs/conexao.md` §4.4): a espera continua.
+            (tr(&e.aviso_do_codigo), true)
         } else {
             (String::new(), false)
         };
         let endereco = e.endereco.clone().unwrap_or_else(|| t("sem rede").to_string());
+        // O alias desta espera ("Quall 1a2b3c4d"), só o do anúncio da espera de agora: o de uma espera
+        // anterior nunca fica ao lado do PIN e do endereço da seguinte.
         let rotulo_da_espera = modelo::rotulo_da_espera(e.porta_da_espera, e.rotulo_da_descoberta.as_ref());
+        // O nome que os outros veem, com o alias para conferir (§8.7.1); sem nome anunciado, o alias.
+        let nome_da_espera = rotulo_da_espera.and_then(|alias| crate::conexao::nome_da_espera(&e.nome_da_descoberta, alias));
         let espera = TelaEspera {
             pin: e.pin.clone(),
             endereco: endereco.clone(),
             ha_pares: e.ha_pares_conhecidos,
-            nome: rotulo_da_espera.unwrap_or_default().to_string(),
+            nome: nome_da_espera.as_ref().map(|(n, _)| n.clone()).unwrap_or_else(|| rotulo_da_espera.unwrap_or_default().to_string()),
+            alias: nome_da_espera.and_then(|(_, a)| a),
             anunciando: rotulo_da_espera.is_some(),
             origem: origem.clone(),
             com_som: (!camera).then_some(e.com_som),
@@ -1514,7 +1616,8 @@ impl Janela {
         };
         let n = e.receptores.len();
         let varios_tela = TelaVarios {
-            nome_da_espera: rotulo_da_espera.unwrap_or_default().to_string(),
+            // Numa linha só: "Dell da sala (Quall 1a2b3c4d)", ou o alias sozinho.
+            nome_da_espera: rotulo_da_espera.map(|alias| crate::conexao::nome_da_espera_em_linha(&e.nome_da_descoberta, alias)).unwrap_or_default(),
             receptores: e.receptores.iter().map(|x| LinhaDeReceptor { nome: x.nome.clone(), monitor: x.monitor.clone(), resumo: x.resumo.clone() }).collect(),
             mais_um: e.esperando_mais_um.then(|| (e.pin.clone(), endereco.clone())),
             mais_um_texto: if n >= crate::sessoes::LIMITE_DE_SESSOES {
@@ -1579,7 +1682,14 @@ impl Janela {
             idioma: crate::idioma::atual(),
             #[cfg(feature = "tela-estendida-futura")]
             driver: modelo::TelaDoDriver { situacao: self.situacao_do_driver, andamento: crate::driver_da_tela_estendida::andamento() },
-
+            // O cartão do código: o da espera (o emissor; no Quall Monitor também a do "mais um" com
+            // vários aparelhos) ou o da conexão (o receptor). O `compor` só o desenha na cena dele.
+            codigo: match cena {
+                Cena::Esperando => e.codigo.clone(),
+                Cena::Varios if e.esperando_mais_um => e.codigo.clone(),
+                Cena::Conectando => r.codigo.clone(),
+                _ => None,
+            },
         }
     }
 

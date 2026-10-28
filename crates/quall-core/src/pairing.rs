@@ -30,6 +30,9 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 type HmacSha256 = Hmac<Sha256>;
 pub const PIN_DIGITS: usize = 6;
 pub const PAIR_SECRET_LEN: usize = 32;
+/// Tamanho da chave do pareamento pelo QR (`K_par`, `docs/conexao.md` §10). O pareamento pelo QR
+/// volta sobre o v3 na etapa 5 de `docs/v3-no-privado.md`; até lá só `qr.rs` usa a constante.
+pub const CHAVE_DO_QR_LEN: usize = 32;
 const NONCE_LEN: usize = 16;
 const RESUME_SLOTS: usize = 128;
 const MAX_HANDSHAKE_HEX: usize = 8192;
@@ -96,7 +99,8 @@ impl PairMode {
     fn ksf(self) -> ModeKsf {
         match self {
             Self::Pin => ModeKsf::Pin,
-            Self::Resume => ModeKsf::Resume,
+            // Sem segredo de baixa entropia a proteger: identidade, como a retomada.
+            Self::Resume | Self::Codigo | Self::Qr => ModeKsf::Resume,
         }
     }
 }
@@ -196,15 +200,32 @@ impl core::fmt::Debug for KnownPeer {
 pub enum PairMode {
     Pin,
     Resume,
+    /// **O código de 4 dígitos** (`docs/v3-no-privado.md` §3): OPAQUE com senha pública — um
+    /// acordo de chaves anônimo e cifrado — e a comparação numérica com compromisso dentro dele.
+    /// Só sai de um convidado que a casca ligou ao código, e só depois de nenhuma dica casar.
+    Codigo,
+    /// **O QR invertido** (`docs/v3-no-privado.md` §4): a senha é `K_par`, 256 bits tirados do
+    /// segredo de 128 do QR. Código de modo e rótulo de KSF próprios (revisão B2).
+    Qr,
 }
 impl PairMode {
     fn code(self) -> u8 {
         match self {
             Self::Pin => 0,
             Self::Resume => 1,
+            Self::Codigo => 2,
+            Self::Qr => 3,
         }
     }
 }
+
+/// A "senha" do modo [`PairMode::Codigo`]: pública e constante. Quem autentica é a pessoa,
+/// comparando o código; o OPAQUE só dá a cifra e a chave da perna.
+const SENHA_PUBLICA_DO_CODIGO: &[u8] = b"quall/v3/codigo/senha-publica";
+/// Dígitos do código de comparação.
+pub const CODE_DIGITS: usize = 4;
+/// Teto do JSON selado num quadro do código.
+const MAX_SELADO: usize = 1024;
 
 /// Mensagens públicas contêm material PAKE/aleatório. A identidade nas duas
 /// confirmações está dentro de AEAD, com counters que são transferidos ao Link.
@@ -242,6 +263,26 @@ pub enum PairFrame {
     Fail {
         motivo: String,
     },
+    /// Modo código, anfitrião → convidado: `SHA-256(rótulo ‖ cb ‖ n_h)`, selado.
+    CodigoCompromisso {
+        sela: String,
+    },
+    /// Modo código, convidado → anfitrião: `n_g`, selado.
+    CodigoNonce {
+        sela: String,
+    },
+    /// Modo código, anfitrião → convidado: `n_h`, selado. Os dois têm o código.
+    CodigoRevela {
+        sela: String,
+    },
+    /// Modo código, anfitrião → convidado: `{"ok": bool}` depois do toque no anfitrião.
+    CodigoDecisao {
+        sela: String,
+    },
+    /// Modo código: o `DeviceId` (e, do anfitrião, o nome) só depois da decisão (M2).
+    CodigoIdentidade {
+        sela: String,
+    },
 }
 impl core::fmt::Debug for PairFrame {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -254,6 +295,11 @@ impl core::fmt::Debug for PairFrame {
             Self::ConfirmAck { .. } => "ConfirmAck",
             Self::NeedsPin => "NeedsPin",
             Self::Fail { .. } => "Fail",
+            Self::CodigoCompromisso { .. } => "CodigoCompromisso",
+            Self::CodigoNonce { .. } => "CodigoNonce",
+            Self::CodigoRevela { .. } => "CodigoRevela",
+            Self::CodigoDecisao { .. } => "CodigoDecisao",
+            Self::CodigoIdentidade { .. } => "CodigoIdentidade",
         })
     }
 }
@@ -301,6 +347,8 @@ impl Context {
             b.extend_from_slice(match mode {
                 PairMode::Pin => b"ksf=argon2id-v19-m19456-t2-p1".as_slice(),
                 PairMode::Resume => b"ksf=identity-secret32-v3".as_slice(),
+                PairMode::Codigo => b"ksf=identity-public-codigo-v3".as_slice(),
+                PairMode::Qr => b"ksf=identity-qr-kpar32-v3".as_slice(),
             });
         }
         b
@@ -314,8 +362,112 @@ enum State {
     GuestAck(ClientLogin<Suite>),
     HostConfirm(ServerLogin<Suite>),
     GuestConfirmAck,
+    // O código (`docs/v3-no-privado.md` §3.3). Nenhum chega a `Done` antes das duas
+    // `CodigoIdentidade` (M6).
+    HostCodigoNonce,
+    HostCodigoDecisao,
+    HostCodigoIdentidade,
+    GuestCodigoCompromisso,
+    GuestCodigoRevela,
+    GuestCodigoDecisao,
+    GuestCodigoIdentidade,
     Done,
     Failed,
+}
+
+/// O que a troca pelo código guarda entre os quadros.
+#[derive(Zeroize, ZeroizeOnDrop)]
+struct TrocaDoCodigo {
+    /// O `session_key` do OPAQUE desta perna (o `export_key` é zerado, revisão B1).
+    k: Vec<u8>,
+    cb: [u8; 32],
+    n_g: [u8; NONCE_LEN],
+    n_h: [u8; NONCE_LEN],
+    compromisso: [u8; 32],
+    #[zeroize(skip)]
+    codigo: Option<String>,
+    #[zeroize(skip)]
+    opcoes: Vec<String>,
+    #[zeroize(skip)]
+    nome_do_par: Option<String>,
+    /// O convidado já mandou `n_g` (revisão A1: perna que cai depois disto e antes do código conta).
+    nonce_saiu: bool,
+}
+
+impl TrocaDoCodigo {
+    fn nova(k: &[u8], contexto: &[u8]) -> Result<Self> {
+        let salt = Sha256::digest(contexto);
+        let mut cb = [0u8; 32];
+        Hkdf::<Sha256>::new(Some(&salt), k)
+            .expand(b"quall/v3/codigo/binding", &mut cb)
+            .map_err(|_| invalid())?;
+        Ok(Self {
+            k: k.to_vec(),
+            cb,
+            n_g: [0; NONCE_LEN],
+            n_h: [0; NONCE_LEN],
+            compromisso: [0; 32],
+            codigo: None,
+            opcoes: Vec::new(),
+            nome_do_par: None,
+            nonce_saiu: false,
+        })
+    }
+    fn compromisso_de(&self, n_h: &[u8; NONCE_LEN]) -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(b"quall/v3/codigo/commit");
+        h.update(self.cb);
+        h.update(n_h);
+        h.finalize().into()
+    }
+    fn calcular_codigo(&mut self) -> Result<String> {
+        let mut salt = [0u8; 2 * NONCE_LEN];
+        salt[..NONCE_LEN].copy_from_slice(&self.n_g);
+        salt[NONCE_LEN..].copy_from_slice(&self.n_h);
+        let mut saida = [0u8; 4];
+        Hkdf::<Sha256>::new(Some(&salt), &self.cb)
+            .expand(b"quall/v3/codigo/sas", &mut saida)
+            .map_err(|_| invalid())?;
+        let codigo = format!("{:04}", u32::from_be_bytes(saida) % 10_000);
+        self.codigo = Some(codigo.clone());
+        Ok(codigo)
+    }
+}
+
+/// O nome que vai ao cartão: sem caracteres de controle (Cc) **nem de formatação** (Cf: a
+/// inversão de direção U+202E, os de largura zero U+200B…), que fariam o nome mostrado mentir
+/// sobre quem pede (revisão, baixo 5). No máximo 63 caracteres.
+pub(crate) fn nome_limpo(nome: &str) -> String {
+    nome.chars().filter(|c| !c.is_control() && !de_formatacao(*c)).take(63).collect()
+}
+
+/// Os caracteres de formatação (Cf) que um nome mostrado não leva. Também o do nome anunciado
+/// (`discovery::sanear_nome_anunciado`).
+pub(crate) fn de_formatacao(c: char) -> bool {
+    matches!(c as u32,
+        0x00AD | 0x0600..=0x0605 | 0x061C | 0x06DD | 0x070F | 0x0890 | 0x0891 | 0x08E2
+        | 0x180E | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x206F
+        | 0xFEFF | 0xFFF9..=0xFFFB | 0x110BD | 0x110CD | 0x13430..=0x1343F
+        | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A | 0xE0001 | 0xE0020..=0xE007F)
+}
+
+/// Dois números falsos, distintos entre si e do código, para a escolha entre três no anfitrião
+/// (`docs/v3-no-privado.md` §3.6), e os três em ordem sorteada.
+fn tres_opcoes(codigo: &str) -> Result<Vec<String>> {
+    let mut opcoes = vec![codigo.to_string()];
+    while opcoes.len() < 3 {
+        let n = u32::from_be_bytes(random::<4>()?) % 10_000;
+        let falso = format!("{n:04}");
+        if !opcoes.contains(&falso) {
+            opcoes.push(falso);
+        }
+    }
+    // Fisher-Yates com o sorteio do sistema.
+    for i in (1..opcoes.len()).rev() {
+        let j = (u32::from_be_bytes(random::<4>()?) as usize) % (i + 1);
+        opcoes.swap(i, j);
+    }
+    Ok(opcoes)
 }
 
 /// Máquina sem I/O. A aplicação deve consumir a tentativa após KE1 aceito,
@@ -336,6 +488,20 @@ pub struct Pairing {
     channel: Option<SecureChannel>,
     pair_secret: Zeroizing<[u8; PAIR_SECRET_LEN]>,
     attempted: bool,
+    /// A casca ligou o código: o anfitrião aceita `Hello {codigo}`; o convidado o manda quando não
+    /// tem PIN nem dica que case.
+    codigo_ligado: bool,
+    /// O nome de apresentação deste aparelho: no código, vai selado ao outro lado (o do convidado
+    /// antes da decisão, para o cartão; o do anfitrião só no fim, M2).
+    nome: String,
+    troca: Option<Box<TrocaDoCodigo>>,
+    /// **Convidado pelo QR**: o celular que chamou (o id que o chamado selado disse) e `K_par`.
+    qr: Option<KnownPeer>,
+    /// **Anfitrião**: os convites lidos neste processo (`qr::lidos`), entre os quais a dica do
+    /// `Hello {qr}` escolhe.
+    convites: Vec<KnownPeer>,
+    /// O convite que a dica escolheu (para a espera gastar a tentativa e, no fim, tirá-lo da caixa).
+    convite_usado: Option<DeviceId>,
 }
 impl Pairing {
     pub fn new(
@@ -361,6 +527,12 @@ impl Pairing {
             channel: None,
             pair_secret: Zeroizing::new([0; PAIR_SECRET_LEN]),
             attempted: false,
+            codigo_ligado: false,
+            nome: String::new(),
+            troca: None,
+            qr: None,
+            convites: Vec::new(),
+            convite_usado: None,
         })
     }
     pub fn new_with_store(
@@ -422,8 +594,159 @@ impl Pairing {
             Role::Guest => ctx.host_role,
         })
     }
+    /// Uma tentativa **de PIN** passou do KE1 e gastou a espera. A retomada e o código não gastam:
+    /// não há segredo de baixa entropia a proteger (`docs/v3-no-privado.md` §3.4, revisão B2).
     pub fn attempt_started(&self) -> bool {
         self.attempted
+    }
+
+    /// Liga o código de 4 dígitos (`docs/v3-no-privado.md` §3). Só antes de começar.
+    pub fn com_codigo(&mut self, ligado: bool, nome: &str) -> Result<()> {
+        if !matches!(self.state, State::Initial) {
+            return Err(invalid());
+        }
+        self.codigo_ligado = ligado;
+        self.nome = nome_limpo(nome);
+        Ok(())
+    }
+
+    /// O convidado já recebeu o `Challenge` (a procura da sessão salva só dá o prazo cheio a quem
+    /// chegou até aqui, revisão M-c).
+    pub fn desafio_recebido(&self) -> bool {
+        !matches!(self.state, State::Initial | State::GuestChallenge)
+    }
+
+    /// **Convidado**: pareia pelo QR com `celular`, a senha `chave` (`K_par`). Vem antes do PIN e da
+    /// retomada: ler o QR é dizer "pareie agora".
+    pub fn com_qr(&mut self, celular: DeviceId, chave: [u8; CHAVE_DO_QR_LEN]) -> Result<()> {
+        if !matches!(self.state, State::Initial) || self.role != Role::Guest {
+            return Err(invalid());
+        }
+        validate_id(&celular)?;
+        self.qr = Some(KnownPeer { id: celular, secret: chave });
+        Ok(())
+    }
+
+    /// **Anfitrião**: os convites lidos (o id do desktop e `K_par` de cada).
+    pub fn com_convites(&mut self, convites: Vec<(DeviceId, [u8; CHAVE_DO_QR_LEN])>) -> Result<()> {
+        if !matches!(self.state, State::Initial) || self.role != Role::Host {
+            return Err(invalid());
+        }
+        self.convites = convites.into_iter().map(|(id, secret)| KnownPeer { id, secret }).collect();
+        Ok(())
+    }
+
+    /// O convite que a dica do `Hello {qr}` escolheu.
+    pub fn convite_do_qr(&self) -> Option<&DeviceId> {
+        self.convite_usado.as_ref()
+    }
+
+    /// Esta troca está no modo código.
+    pub fn e_por_codigo(&self) -> bool {
+        self.mode == Some(PairMode::Codigo)
+    }
+
+    /// O código, quando os dois nonces já se conhecem.
+    pub fn codigo_na_tela(&self) -> Option<&str> {
+        self.troca.as_ref().and_then(|t| t.codigo.as_deref())
+    }
+
+    /// Os três números do anfitrião (o código e dois falsos), em ordem sorteada.
+    pub fn opcoes_na_tela(&self) -> &[String] {
+        self.troca.as_ref().map_or(&[], |t| t.opcoes.as_slice())
+    }
+
+    /// O nome do outro lado: o do convidado, no anfitrião, depois do `Confirm`; o do anfitrião, no
+    /// convidado, só depois das duas decisões (M2).
+    pub fn nome_do_par(&self) -> Option<&str> {
+        self.troca.as_ref().and_then(|t| t.nome_do_par.as_deref())
+    }
+
+    /// O anfitrião está com o código na tela, esperando a escolha da pessoa.
+    pub fn esperando_a_pessoa(&self) -> bool {
+        matches!(self.state, State::HostCodigoDecisao)
+    }
+
+    /// O convidado mandou `Hello {codigo}` e o anfitrião ainda não respondeu: se a conexão cair aqui,
+    /// é um anfitrião que não aceita o código (uma build das lojas, ou o código desligado ou gasto).
+    pub fn hello_do_codigo_sem_resposta(&self) -> bool {
+        self.mode == Some(PairMode::Codigo) && matches!(self.state, State::GuestAck(_))
+    }
+
+    /// O convidado já mandou o seu nonce do código (revisão A1).
+    pub fn nonce_do_codigo_saiu(&self) -> bool {
+        self.troca.as_ref().is_some_and(|t| t.nonce_saiu)
+    }
+
+    /// A decisão da pessoa no anfitrião. Com `false`, o quadro de recusa sai e a máquina falha.
+    pub fn decidir(&mut self, aceito: bool) -> Result<Step> {
+        if self.role != Role::Host || !matches!(self.state, State::HostCodigoDecisao) {
+            return Err(invalid());
+        }
+        let sela = self.selar(&serde_json::json!({ "ok": aceito }))?;
+        if aceito {
+            self.state = State::HostCodigoIdentidade;
+        } else {
+            self.state = State::Failed;
+            self.clear_sensitive();
+        }
+        Ok(Step {
+            reply: Some(PairFrame::CodigoDecisao { sela }),
+            done: None,
+        })
+    }
+
+    fn selar(&mut self, valor: &serde_json::Value) -> Result<String> {
+        let bytes = serde_json::to_vec(valor)?;
+        if bytes.len() > MAX_SELADO {
+            return Err(invalid());
+        }
+        Ok(hex_encode(&self.channel.as_mut().ok_or_else(invalid)?.seal(&bytes)?))
+    }
+
+    fn abrir(&mut self, sela: &str) -> Result<serde_json::Value> {
+        let bytes = self.channel.as_mut().ok_or_else(invalid)?.open(&decode(sela)?)?;
+        if bytes.len() > MAX_SELADO {
+            return Err(invalid());
+        }
+        serde_json::from_slice(&bytes).map_err(|_| invalid())
+    }
+
+    fn abrir_bytes<const N: usize>(&mut self, sela: &str) -> Result<[u8; N]> {
+        let bytes = self.channel.as_mut().ok_or_else(invalid)?.open(&decode(sela)?)?;
+        bytes.try_into().map_err(|_| invalid())
+    }
+
+    fn derivar_segredo_do_codigo(&mut self) -> Result<()> {
+        let contexto = self.context.as_ref().ok_or_else(invalid)?.bytes(Some(PairMode::Codigo));
+        let t = self.troca.as_ref().ok_or_else(invalid)?;
+        let mut h = Sha256::new();
+        h.update(&contexto);
+        h.update(t.n_g);
+        h.update(t.n_h);
+        let salt = h.finalize();
+        Hkdf::<Sha256>::new(Some(&salt), &t.k)
+            .expand(b"quall/v3/pair/code-secret", &mut *self.pair_secret)
+            .map_err(|_| invalid())
+    }
+
+    fn id_selado(&mut self, sela: &str) -> Result<(DeviceId, Option<String>)> {
+        let v = self.abrir(sela)?;
+        let id = v.get("id").and_then(|x| x.as_str()).ok_or_else(invalid)?;
+        let peer = DeviceId(id.to_string());
+        validate_id(&peer)?;
+        if peer == self.eu {
+            return Err(invalid());
+        }
+        // **O código substitui o vínculo que não retomou** (bancada de 13/10, `docs/v3-no-privado.md`
+        // §8.6; até então a B2 do código recusava aqui, nos dois lados). É a mesma peça do QR
+        // (`read_identity`, §8.4): um convidado com o vínculo bom teria achado a dica no `Challenge` e
+        // retomado, então a troca só chega ao código quando o vínculo que um lado guarda já não abre
+        // nada do outro. E só chega até aqui depois da escolha certa da pessoa no anfitrião — é o
+        // código que autentica o convidado; o segredo velho só é trocado com a sessão de pé, quando a
+        // casca grava por cima.
+        let nome = v.get("n").and_then(|x| x.as_str()).map(nome_limpo);
+        Ok((peer, nome))
     }
     pub fn is_done(&self) -> bool {
         matches!(self.state, State::Done)
@@ -446,6 +769,45 @@ impl Pairing {
             guest_role,
         })
     }
+    /// **Qual par guardado tem a dica neste `Challenge`** (`crate::reconhecer`), sem andar a
+    /// máquina: o convidado que só quer saber quem é o anfitrião não manda `Hello`. `None`: nenhum.
+    pub fn quem_casa_no_desafio(&self, frame: &PairFrame) -> Result<Option<DeviceId>> {
+        let PairFrame::Challenge { version, token, host_nonce, host_role, resume_hints } = frame
+        else {
+            return Err(invalid());
+        };
+        if self.role != Role::Guest || !matches!(self.state, State::GuestChallenge) {
+            return Err(invalid());
+        }
+        validate_version(*version)?;
+        validate_role(*host_role)?;
+        if resume_hints.len() != RESUME_SLOTS {
+            return Err(invalid());
+        }
+        let context = Context {
+            token: hex_decode(token).map_err(|_| invalid())?,
+            guest_nonce: self.nonce,
+            host_nonce: hex_decode(host_nonce).map_err(|_| invalid())?,
+            guest_role: self.local_role.ok_or_else(invalid)?,
+            host_role: *host_role,
+        };
+        let hints: Vec<[u8; 32]> = resume_hints
+            .iter()
+            .map(|h| hex_decode(h).map_err(|_| invalid()))
+            .collect::<Result<_>>()?;
+        let mut achado = None;
+        for known in &self.known {
+            let expected = resume_hint(&known.secret, &context)?;
+            let mut found = 0u8;
+            for candidate in &hints {
+                found |= expected.ct_eq(candidate).unwrap_u8();
+            }
+            if found == 1 && achado.is_none() {
+                achado = Some(known.id.clone());
+            }
+        }
+        Ok(achado)
+    }
     pub fn step(&mut self, frame: PairFrame) -> Result<Step> {
         let result = self.step_inner(frame);
         if result.is_err() {
@@ -457,6 +819,12 @@ impl Pairing {
     }
     fn clear_sensitive(&mut self) {
         self.pin = None;
+        self.qr = None;
+        self.convites.clear();
+        if let Some(t) = self.troca.as_mut() {
+            t.k.zeroize();
+            t.cb.zeroize();
+        }
         self.password = None;
         self.known.clear();
         self.selected = None;
@@ -539,7 +907,39 @@ impl Pairing {
                     .iter()
                     .map(|h| hex_decode(h).map_err(|_| invalid()))
                     .collect::<Result<_>>()?;
-                let (mode, hint, password) = if let Some(pin) = &self.pin {
+                // **O QR com um vínculo bom dos dois lados reconecta** (bancada de 13/10): se o
+                // anfitrião tem a dica do par que o QR chamou, é retomada — o QR só achou o
+                // aparelho, e o vínculo fica como está. Só o par do QR: outro conhecido que responda
+                // não é retomado aqui (M5).
+                let retomada_do_qr = match &self.qr {
+                    Some(convite) => {
+                        let mut achado = None;
+                        for known in self.known.iter().filter(|k| k.id == convite.id) {
+                            let expected = resume_hint(&known.secret, &context)?;
+                            let mut found = 0u8;
+                            for candidate in &hints {
+                                found |= expected.ct_eq(candidate).unwrap_u8();
+                            }
+                            if found == 1 && achado.is_none() {
+                                achado = Some((known.clone(), expected));
+                            }
+                        }
+                        achado
+                    }
+                    None => None,
+                };
+                let (mode, hint, password) = if let Some((known, hint)) = retomada_do_qr {
+                    self.qr = None;
+                    let password = Zeroizing::new(known.secret.to_vec());
+                    self.selected = Some(known);
+                    (PairMode::Resume, Some(hex_encode(&hint)), password)
+                } else if let Some(convite) = self.qr.take() {
+                    // O QR primeiro: ler é consentir, como digitar o PIN.
+                    let hint = crate::qr::dica_do_convite(&convite.secret, &context.bytes(None));
+                    let password = Zeroizing::new(convite.secret.to_vec());
+                    self.selected = Some(convite);
+                    (PairMode::Qr, Some(hex_encode(&hint)), password)
+                } else if let Some(pin) = &self.pin {
                     (PairMode::Pin, None, Zeroizing::new(pin.bytes().to_vec()))
                 } else {
                     let mut selected = None;
@@ -553,12 +953,24 @@ impl Pairing {
                             selected = Some((known.clone(), expected));
                         }
                     }
-                    let (known, hint) = selected.ok_or_else(|| {
-                        Error::NeedsPin("novo PIN necessário para este vínculo".into())
-                    })?;
-                    let password = Zeroizing::new(known.secret.to_vec());
-                    self.selected = Some(known);
-                    (PairMode::Resume, Some(hex_encode(&hint)), password)
+                    match selected {
+                        Some((known, hint)) => {
+                            let password = Zeroizing::new(known.secret.to_vec());
+                            self.selected = Some(known);
+                            (PairMode::Resume, Some(hex_encode(&hint)), password)
+                        }
+                        // Sem PIN e sem dica que case: o código, se a casca o ligou.
+                        None if self.codigo_ligado => (
+                            PairMode::Codigo,
+                            None,
+                            Zeroizing::new(SENHA_PUBLICA_DO_CODIGO.to_vec()),
+                        ),
+                        None => {
+                            return Err(Error::NeedsPin(
+                                "novo PIN necessário para este vínculo".into(),
+                            ))
+                        }
+                    }
                 };
                 let login =
                     ClientLogin::<Suite>::start(&mut OsRng, &password).map_err(|_| invalid())?;
@@ -613,11 +1025,40 @@ impl Pairing {
                         self.selected = Some(selected);
                         password
                     }
+                    PairMode::Qr => {
+                        let recebida: [u8; 32] = hex_decode(hint.as_deref().ok_or_else(invalid)?)
+                            .map_err(|_| invalid())?;
+                        let mut escolhido = None;
+                        for convite in &self.convites {
+                            let dica = crate::qr::dica_do_convite(&convite.secret, &context.bytes(None));
+                            if dica.ct_eq(&recebida).unwrap_u8() == 1 && escolhido.is_none() {
+                                escolhido = Some(convite.clone());
+                            }
+                        }
+                        let escolhido = escolhido
+                            .ok_or_else(|| Error::NeedsPin("nenhum QR lido aqui casa com este".into()))?;
+                        let password = Zeroizing::new(escolhido.secret.to_vec());
+                        self.convite_usado = Some(escolhido.id.clone());
+                        self.selected = Some(escolhido);
+                        password
+                    }
+                    PairMode::Codigo => {
+                        if hint.is_some() {
+                            return Err(invalid());
+                        }
+                        if !self.codigo_ligado {
+                            return Err(Error::NeedsPin("este aparelho não aceita o código".into()));
+                        }
+                        Zeroizing::new(SENHA_PUBLICA_DO_CODIGO.to_vec())
+                    }
                 };
                 let ke1 = CredentialRequest::<Suite>::deserialize(&decode(&ke1)?)
                     .map_err(|_| invalid())?;
                 let binding = context.bytes(Some(mode));
-                self.attempted = true;
+                // Só um KE1 de PIN gasta a espera (`docs/v3-no-privado.md` §3.4, B2).
+                if mode == PairMode::Pin {
+                    self.attempted = true;
+                }
                 let setup = ServerSetup::<Suite>::new(&mut OsRng);
                 // Registro somente local: seus dados nunca entram em PairFrame.
                 let registration = ClientRegistration::<Suite>::start(&mut OsRng, &password)
@@ -683,6 +1124,19 @@ impl Pairing {
                 result.export_key.zeroize();
                 let session_key = Zeroizing::new(result.session_key);
                 self.install_keys(&session_key, &binding, mode)?;
+                if mode == PairMode::Codigo {
+                    // Só o nome, para o cartão do anfitrião; o id vai depois da decisão (M2).
+                    let nome = self.nome.clone();
+                    let identity_ciphertext = self.selar(&serde_json::json!({ "n": nome }))?;
+                    self.state = State::GuestCodigoCompromisso;
+                    return Ok(Step {
+                        reply: Some(PairFrame::Confirm {
+                            ke3: hex_encode(&result.message.serialize()),
+                            identity_ciphertext,
+                        }),
+                        done: None,
+                    });
+                }
                 let identity_ciphertext = hex_encode(
                     &self
                         .channel
@@ -722,6 +1176,21 @@ impl Pairing {
                     .map_err(|_| authentication_error(mode))?;
                 let session_key = Zeroizing::new(result.session_key);
                 self.install_keys(&session_key, &binding, mode)?;
+                if mode == PairMode::Codigo {
+                    let v = self.abrir(&identity_ciphertext)?;
+                    let nome = nome_limpo(v.get("n").and_then(|x| x.as_str()).unwrap_or(""));
+                    let n_h: [u8; NONCE_LEN] = random()?;
+                    let troca = self.troca.as_mut().ok_or_else(invalid)?;
+                    troca.n_h = n_h;
+                    troca.nome_do_par = Some(nome);
+                    let c = troca.compromisso_de(&n_h);
+                    let sela = hex_encode(&self.channel.as_mut().ok_or_else(invalid)?.seal(&c)?);
+                    self.state = State::HostCodigoNonce;
+                    return Ok(Step {
+                        reply: Some(PairFrame::CodigoCompromisso { sela }),
+                        done: None,
+                    });
+                }
                 let peer = self.read_identity(&identity_ciphertext)?;
                 let identity_ciphertext = hex_encode(
                     &self
@@ -753,6 +1222,86 @@ impl Pairing {
                     done: Some(outcome),
                 })
             }
+            (Role::Guest, State::GuestCodigoCompromisso, PairFrame::CodigoCompromisso { sela }) => {
+                let c: [u8; 32] = self.abrir_bytes(&sela)?;
+                let n_g: [u8; NONCE_LEN] = random()?;
+                let troca = self.troca.as_mut().ok_or_else(invalid)?;
+                troca.compromisso = c;
+                troca.n_g = n_g;
+                troca.nonce_saiu = true;
+                let sela = hex_encode(&self.channel.as_mut().ok_or_else(invalid)?.seal(&n_g)?);
+                self.state = State::GuestCodigoRevela;
+                Ok(Step {
+                    reply: Some(PairFrame::CodigoNonce { sela }),
+                    done: None,
+                })
+            }
+            (Role::Host, State::HostCodigoNonce, PairFrame::CodigoNonce { sela }) => {
+                let n_g: [u8; NONCE_LEN] = self.abrir_bytes(&sela)?;
+                let troca = self.troca.as_mut().ok_or_else(invalid)?;
+                troca.n_g = n_g;
+                let n_h = troca.n_h;
+                let codigo = troca.calcular_codigo()?;
+                troca.opcoes = tres_opcoes(&codigo)?;
+                let sela = hex_encode(&self.channel.as_mut().ok_or_else(invalid)?.seal(&n_h)?);
+                self.state = State::HostCodigoDecisao;
+                Ok(Step {
+                    reply: Some(PairFrame::CodigoRevela { sela }),
+                    done: None,
+                })
+            }
+            (Role::Guest, State::GuestCodigoRevela, PairFrame::CodigoRevela { sela }) => {
+                let n_h: [u8; NONCE_LEN] = self.abrir_bytes(&sela)?;
+                let troca = self.troca.as_mut().ok_or_else(invalid)?;
+                // O compromisso tem de bater: é o que impede o relé de escolher `n_h` depois de
+                // ver `n_g` (`docs/v3-no-privado.md` §3.3).
+                if troca.compromisso_de(&n_h).ct_eq(&troca.compromisso).unwrap_u8() != 1 {
+                    return Err(Error::Pairing("o compromisso do código não conferiu".into()));
+                }
+                troca.n_h = n_h;
+                troca.calcular_codigo()?;
+                self.state = State::GuestCodigoDecisao;
+                Ok(Step {
+                    reply: None,
+                    done: None,
+                })
+            }
+            (Role::Guest, State::GuestCodigoDecisao, PairFrame::CodigoDecisao { sela }) => {
+                let v = self.abrir(&sela)?;
+                if v.get("ok").and_then(|x| x.as_bool()) != Some(true) {
+                    return Err(Error::Pairing("o outro aparelho recusou o código".into()));
+                }
+                let id = self.eu.0.clone();
+                let sela = self.selar(&serde_json::json!({ "id": id }))?;
+                self.state = State::GuestCodigoIdentidade;
+                Ok(Step {
+                    reply: Some(PairFrame::CodigoIdentidade { sela }),
+                    done: None,
+                })
+            }
+            (Role::Host, State::HostCodigoIdentidade, PairFrame::CodigoIdentidade { sela }) => {
+                let (peer, _) = self.id_selado(&sela)?;
+                let (id, nome) = (self.eu.0.clone(), self.nome.clone());
+                let sela = self.selar(&serde_json::json!({ "id": id, "n": nome }))?;
+                self.derivar_segredo_do_codigo()?;
+                let outcome = self.finish(peer, PairMode::Codigo);
+                Ok(Step {
+                    reply: Some(PairFrame::CodigoIdentidade { sela }),
+                    done: Some(outcome),
+                })
+            }
+            (Role::Guest, State::GuestCodigoIdentidade, PairFrame::CodigoIdentidade { sela }) => {
+                let (peer, nome) = self.id_selado(&sela)?;
+                if let Some(t) = self.troca.as_mut() {
+                    t.nome_do_par = nome;
+                }
+                self.derivar_segredo_do_codigo()?;
+                let outcome = self.finish(peer, PairMode::Codigo);
+                Ok(Step {
+                    reply: None,
+                    done: Some(outcome),
+                })
+            }
             _ => Err(invalid()),
         }
     }
@@ -762,7 +1311,10 @@ impl Pairing {
             session_key,
             context,
         )?);
-        if mode == PairMode::Resume {
+        if mode == PairMode::Codigo {
+            // O segredo do par só nasce depois das duas decisões (`derivar_segredo_do_codigo`).
+            self.troca = Some(Box::new(TrocaDoCodigo::nova(session_key, context)?));
+        } else if mode == PairMode::Resume {
             *self.pair_secret = self.selected.as_ref().ok_or_else(invalid)?.secret;
         } else {
             let salt = Sha256::digest(context);
@@ -789,13 +1341,18 @@ impl Pairing {
                 return Err(invalid());
             }
         }
+        // **O QR substitui um vínculo que não retomou** (bancada de 13/10; até então a B2 do QR
+        // recusava, como o código). Um convidado com o vínculo bom teria retomado (acima, no
+        // `Challenge`): se a troca chegou ao `Qr`, o vínculo que um dos lados guarda já não abre
+        // nada do outro — e o QR é consentimento nos dois (mostrar e ler, com 256 bits na tela),
+        // como o PIN, que sempre substituiu. A B2 continua valendo para o código de 4 dígitos.
         Ok(peer)
     }
     fn finish(&mut self, peer: DeviceId, mode: PairMode) -> PairOutcome {
         let outcome = PairOutcome {
             peer,
             secret: *self.pair_secret,
-            novo: mode == PairMode::Pin,
+            novo: mode != PairMode::Resume,
         };
         self.clear_sensitive();
         self.state = State::Done;
@@ -815,7 +1372,7 @@ fn invalid() -> Error {
 fn authentication_error(mode: PairMode) -> Error {
     match mode {
         PairMode::Pin => Error::WrongPin("PIN ou autenticação não conferiu".into()),
-        PairMode::Resume => invalid(),
+        PairMode::Resume | PairMode::Codigo | PairMode::Qr => invalid(),
     }
 }
 fn validate_version(version: u16) -> Result<()> {
@@ -979,6 +1536,26 @@ impl PairedPeers {
     /// O vínculo antigo permanece no arquivo, mas exige novo PIN explícito.
     pub fn requires_repair(&self, peer: &DeviceId) -> bool {
         self.pares.contains_key(&peer.0) && self.get(peer).is_none()
+    }
+
+    /// Os ids com vínculo v3 válido.
+    pub fn ids_seguros(&self) -> Vec<DeviceId> {
+        let mut ids: Vec<_> = self.pares.keys().map(|k| DeviceId(k.clone())).filter(|id| self.get(id).is_some()).collect();
+        ids.sort_by(|a, b| a.0.cmp(&b.0));
+        ids
+    }
+
+    /// **Só o vínculo v3 de `peer`** (revisão M5, `docs/v3-no-privado.md` §5.2): a procura da sessão
+    /// salva retoma com o alvo e com mais ninguém, mesmo que outro par conhecido responda. Vazia se
+    /// não há vínculo v3 válido com ele.
+    pub fn so_de(&self, peer: &DeviceId) -> PairedPeers {
+        let mut t = PairedPeers::new();
+        if self.get(peer).is_some() {
+            if let Some(e) = self.pares.get(&peer.0) {
+                t.pares.insert(peer.0.clone(), e.clone());
+            }
+        }
+        t
     }
 
     /// Há pelo menos um vínculo v3 válido que pode tentar retomada segura.
@@ -1660,5 +2237,193 @@ mod tests {
                 });
             }
         });
+    }
+}
+
+/// O código de 4 dígitos sobre o v3, na máquina (`docs/v3-no-privado.md` §3). A sequência com a
+/// sinalização e a escolha na tela está em `session::testes_do_codigo`.
+#[cfg(test)]
+mod testes_do_codigo {
+    use super::*;
+
+    fn par(codigo_g: bool, codigo_h: bool) -> (Pairing, Pairing) {
+        let mut g = Pairing::new(Role::Guest, DeviceId("convidado-id".into()), None, None).unwrap();
+        let mut h = Pairing::new(Role::Host, DeviceId("anfitriao-id".into()), None, None).unwrap();
+        g.bind_local_role(0).unwrap();
+        h.bind_local_role(0).unwrap();
+        g.com_codigo(codigo_g, "Galaxy A07").unwrap();
+        h.com_codigo(codigo_h, "MacBook").unwrap();
+        (g, h)
+    }
+
+    fn passar(de: &mut Pairing, quadro: PairFrame) -> Step {
+        de.step(quadro).expect("passo")
+    }
+
+    /// Até o código na tela dos dois: Probe … Revela. Devolve os quadros públicos.
+    fn ate_o_codigo(g: &mut Pairing, h: &mut Pairing) -> Vec<PairFrame> {
+        let mut quadros = Vec::new();
+        let probe = g.open().unwrap();
+        quadros.push(probe.clone());
+        let challenge = passar(h, probe).reply.unwrap();
+        quadros.push(challenge.clone());
+        let hello = passar(g, challenge).reply.unwrap();
+        assert!(matches!(hello, PairFrame::Hello { mode: PairMode::Codigo, hint: None, .. }));
+        quadros.push(hello.clone());
+        let ack = passar(h, hello).reply.unwrap();
+        quadros.push(ack.clone());
+        let confirm = passar(g, ack).reply.unwrap();
+        quadros.push(confirm.clone());
+        let compromisso = passar(h, confirm).reply.unwrap();
+        assert!(matches!(compromisso, PairFrame::CodigoCompromisso { .. }));
+        assert_eq!(h.nome_do_par(), Some("Galaxy A07"), "o cartão do anfitrião diz quem pede");
+        quadros.push(compromisso.clone());
+        let nonce = passar(g, compromisso).reply.unwrap();
+        assert!(g.nonce_do_codigo_saiu());
+        quadros.push(nonce.clone());
+        let revela = passar(h, nonce).reply.unwrap();
+        quadros.push(revela.clone());
+        let nada = passar(g, revela);
+        assert!(nada.reply.is_none() && nada.done.is_none());
+        quadros
+    }
+
+    #[test]
+    fn o_codigo_e_o_mesmo_nos_dois_e_esta_entre_as_tres_opcoes() {
+        let (mut g, mut h) = par(true, true);
+        let quadros = ate_o_codigo(&mut g, &mut h);
+        let codigo = g.codigo_na_tela().unwrap().to_string();
+        assert_eq!(codigo.len(), CODE_DIGITS);
+        assert_eq!(h.codigo_na_tela(), Some(codigo.as_str()));
+        let opcoes = h.opcoes_na_tela().to_vec();
+        assert_eq!(opcoes.len(), 3);
+        assert!(opcoes.contains(&codigo));
+        let mut distintas = opcoes.clone();
+        distintas.dedup();
+        distintas.sort();
+        distintas.dedup();
+        assert_eq!(distintas.len(), 3, "três números distintos");
+        assert!(g.opcoes_na_tela().is_empty(), "o convidado só mostra o código");
+        assert!(h.esperando_a_pessoa());
+        // **Sentinela**: nenhum quadro público leva id nem nome.
+        for q in &quadros {
+            let json = serde_json::to_string(q).unwrap();
+            for proibido in ["convidado-id", "anfitriao-id", "Galaxy", "MacBook"] {
+                assert!(!json.contains(proibido), "{proibido} em {json}");
+            }
+        }
+    }
+
+    /// **M6**: nada sai de `take_secure_channel` e ninguém chega a `Done` antes das duas
+    /// `CodigoIdentidade`. E **M2**: o nome do anfitrião só chega ao convidado no fim.
+    #[test]
+    fn so_depois_das_duas_identidades_e_o_nome_do_anfitriao_so_no_fim() {
+        let (mut g, mut h) = par(true, true);
+        ate_o_codigo(&mut g, &mut h);
+        assert!(g.take_secure_channel().is_err() && h.take_secure_channel().is_err());
+        assert_eq!(g.nome_do_par(), None, "M2: o nome do anfitrião não vem antes da decisão");
+        let decisao = h.decidir(true).unwrap().reply.unwrap();
+        assert!(h.take_secure_channel().is_err() && !h.is_done());
+        let id_g = passar(&mut g, decisao).reply.unwrap();
+        assert!(g.take_secure_channel().is_err() && !g.is_done());
+        let fim_h = passar(&mut h, id_g);
+        let rh = fim_h.done.unwrap();
+        let rg = passar(&mut g, fim_h.reply.unwrap()).done.unwrap();
+        assert_eq!(rg.secret, rh.secret);
+        assert!(rg.novo && rh.novo, "o código é um pareamento novo (B2)");
+        assert_eq!(rg.peer.0, "anfitriao-id");
+        assert_eq!(rh.peer.0, "convidado-id");
+        assert_eq!(g.nome_do_par(), Some("MacBook"));
+        let mut cg = g.take_secure_channel().unwrap();
+        let mut ch = h.take_secure_channel().unwrap();
+        assert_eq!(ch.open(&cg.seal(b"oi").unwrap()).unwrap(), b"oi");
+        // O segredo do código é um vínculo v3 como outro qualquer: a próxima vez é retomada.
+        let mut tabela = PairedPeers::new();
+        tabela.insert(&rg);
+        assert!(tabela.has_secure_peers());
+    }
+
+    #[test]
+    fn a_recusa_no_anfitriao_chega_ao_convidado() {
+        let (mut g, mut h) = par(true, true);
+        ate_o_codigo(&mut g, &mut h);
+        let recusa = h.decidir(false).unwrap().reply.unwrap();
+        assert!(h.take_secure_channel().is_err());
+        let r = g.step(recusa);
+        assert!(matches!(&r, Err(Error::Pairing(m)) if m.contains("recusou")), "{r:?}");
+    }
+
+    #[test]
+    fn anfitriao_sem_codigo_recusa_o_hello_antes_do_ke1() {
+        let (mut g, mut h) = par(true, false);
+        let challenge = passar(&mut h, g.open().unwrap()).reply.unwrap();
+        let hello = passar(&mut g, challenge).reply.unwrap();
+        assert!(matches!(h.step(hello), Err(Error::NeedsPin(_))));
+        assert!(!h.attempt_started(), "não gasta o PIN (M4)");
+    }
+
+    #[test]
+    fn convidado_sem_codigo_continua_pedindo_pin() {
+        let (mut g, mut h) = par(false, true);
+        let challenge = passar(&mut h, g.open().unwrap()).reply.unwrap();
+        assert!(matches!(g.step(challenge), Err(Error::NeedsPin(_))));
+    }
+
+    /// **O compromisso**: um anfitrião (ou um relé fazendo esse papel) que revela outro `n_h`
+    /// depois de ver `n_g` é pego pelo convidado.
+    #[test]
+    fn revelar_outro_nonce_que_o_comprometido_falha() {
+        let (mut g, mut h) = par(true, true);
+        let challenge = passar(&mut h, g.open().unwrap()).reply.unwrap();
+        let hello = passar(&mut g, challenge).reply.unwrap();
+        let ack = passar(&mut h, hello).reply.unwrap();
+        let confirm = passar(&mut g, ack).reply.unwrap();
+        let compromisso = passar(&mut h, confirm).reply.unwrap();
+        let nonce = passar(&mut g, compromisso).reply.unwrap();
+        h.troca.as_mut().unwrap().n_h = random().unwrap(); // escolhe outro n_h depois do compromisso
+        let revela = passar(&mut h, nonce).reply.unwrap();
+        let r = g.step(revela);
+        assert!(matches!(&r, Err(Error::Pairing(m)) if m.contains("compromisso")), "{r:?}");
+        assert!(g.codigo_na_tela().is_none(), "o código nem chega à tela");
+    }
+
+    /// **Relé no meio** (duas pernas independentes): cada perna tem a sua chave, e os códigos das
+    /// duas telas não coincidem — salvo 1 em 10⁴. Três rodadas: a chance de as três coincidirem é
+    /// 10⁻¹².
+    #[test]
+    fn um_rele_no_meio_ve_codigos_diferentes_nas_duas_telas() {
+        let mut algum_diferente = false;
+        for _ in 0..3 {
+            let (mut g, mut rele_h) = par(true, true);
+            let (mut rele_g, mut h) = par(true, true);
+            ate_o_codigo(&mut g, &mut rele_h);
+            ate_o_codigo(&mut rele_g, &mut h);
+            algum_diferente |= g.codigo_na_tela() != h.codigo_na_tela();
+        }
+        assert!(algum_diferente);
+    }
+
+    #[test]
+    fn decidir_fora_de_hora_e_do_convidado_e_invalido() {
+        let (mut g, mut h) = par(true, true);
+        assert!(h.decidir(true).is_err());
+        ate_o_codigo(&mut g, &mut h);
+        assert!(g.decidir(true).is_err());
+    }
+}
+
+#[cfg(test)]
+mod testes_do_nome_no_cartao {
+    use super::nome_limpo;
+
+    /// **Baixo 5**: o nome que vai ao cartão perde os de controle (Cc) e os de formatação (Cf) —
+    /// a inversão de direção e os de largura zero fariam o nome mostrado mentir sobre quem pede.
+    #[test]
+    fn o_nome_perde_controle_e_formatacao() {
+        assert_eq!(nome_limpo("Galaxy\u{202E}70A"), "Galaxy70A");
+        assert_eq!(nome_limpo("Mac\u{200B}Book\u{200D}\u{FEFF}"), "MacBook");
+        assert_eq!(nome_limpo("A07\n\t\u{7}"), "A07");
+        assert_eq!(nome_limpo("Câmera à esquerda"), "Câmera à esquerda");
+        assert_eq!(nome_limpo(&"x".repeat(100)).chars().count(), 63);
     }
 }

@@ -43,6 +43,9 @@ const ARQUIVOS: &[(&str, &str)] = &[
     ("cameras.rs", include_str!("../cameras.rs")),
     ("fontes.rs", include_str!("../fontes.rs")),
     ("instancia.rs", include_str!("../instancia.rs")),
+    // A conexão sem dor (o código de 4 dígitos, a sessão salva) e o QR do Exibir.
+    ("conexao.rs", include_str!("../conexao.rs")),
+    ("qr_na_tela.rs", include_str!("../qr_na_tela.rs")),
 ];
 
 #[test]

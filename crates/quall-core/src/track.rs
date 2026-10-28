@@ -1058,10 +1058,12 @@ mod webrtc {
         let mut saida = Vec::with_capacity(bytes.len());
         let mut i = 0;
         while i < bytes.len() {
+            // Por bytes, nunca por fatias de texto: o rótulo vem do outro aparelho, e `%é` cortava um
+            // caractere ao meio (pânico; revisão do QR, A1, varredura do núcleo).
             if bytes[i] == b'%' && i + 2 < bytes.len() {
-                let hex = &texto[i + 1..i + 3];
-                if let Ok(b) = u8::from_str_radix(hex, 16) {
-                    saida.push(b);
+                let digito = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+                if let (Some(alto), Some(baixo)) = (digito(bytes[i + 1]), digito(bytes[i + 2])) {
+                    saida.push((alto << 4) | baixo);
                     i += 3;
                     continue;
                 }
@@ -1876,6 +1878,13 @@ mod webrtc {
             self.relogio.deslocamento(self.indice_no_relogio)
         }
 
+        /// Deslocamento para gravação, independente da guarda da reprodução. Consulte a
+        /// guarda separadamente para diagnóstico; não chame na thread de áudio.
+        pub fn deslocamento_de_captura_cru(&self) -> Option<i64> {
+            self.informar_base();
+            self.relogio.deslocamento_cru(self.indice_no_relogio)
+        }
+
         /// O retrato do relógio comum desta track, para relatório. `None` antes do primeiro
         /// pacote.
         pub fn retrato_do_relogio(&self) -> Option<RetratoDoRelogio> {
@@ -2279,6 +2288,9 @@ mod webrtc {
             assert_eq!(decodificar_rotulo("Tela"), "Tela");
             // `%` solto no fim não pode virar erro nem comer bytes.
             assert_eq!(decodificar_rotulo("50%"), "50%");
+            // Um `%` seguido de caractere de mais de um byte não corta o caractere ao meio (pânico).
+            assert_eq!(decodificar_rotulo("a%éb"), "a%éb");
+            assert_eq!(decodificar_rotulo("%+f%41"), "%+fA", "sem sinal: `+f` não é hex");
         }
 
         #[test]

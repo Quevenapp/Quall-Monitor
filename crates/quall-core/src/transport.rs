@@ -154,6 +154,26 @@ pub(crate) struct FilaDeEntrada {
     politica: AtomicU8,
     /// Descartadas por fila cheia. É o `dropped_frames` de sempre.
     descartadas: Arc<AtomicU64>,
+    /// **A caixa da câmera** (`docs/controle-remoto-da-camera.md` §17.2): criada quando alguém pede
+    /// [`Mensageiro::da_camera`]. Com ela, toda mensagem da câmera que chega vai para lá, e não para
+    /// esta fila. Vazia numa sessão em que ninguém a pediu (toda sessão de vídeo).
+    caixa_da_camera: std::sync::OnceLock<Arc<FilaDeEntrada>>,
+}
+
+/// **É uma mensagem do controle remoto da câmera?** Até o teto da mensagem da câmera, com
+/// `"camera"` nos bytes e `"app":"camera"` no JSON. O roteiro de 128 KiB e o estado do teleprompter
+/// param na conferência do tamanho ou na busca de bytes; o JSON só é lido nas pequenas que falam
+/// em câmera. Roda na thread da libdatachannel: curto.
+fn e_da_camera(bytes: &[u8]) -> bool {
+    use crate::camera_remota::{APP, TETO_DA_MENSAGEM_DA_CAMERA};
+    const AGULHA: &[u8] = b"\"camera\"";
+    if bytes.len() > TETO_DA_MENSAGEM_DA_CAMERA || !bytes.windows(AGULHA.len()).any(|j| j == AGULHA) {
+        return false;
+    }
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()
+        .and_then(|v| v.get("app").and_then(serde_json::Value::as_str).map(|a| a == APP))
+        .unwrap_or(false)
 }
 
 struct EstadoDaFila {
@@ -187,11 +207,35 @@ impl FilaDeEntrada {
             chegou: Condvar::new(),
             politica: AtomicU8::new(politica as u8),
             descartadas,
+            caixa_da_camera: std::sync::OnceLock::new(),
         }
+    }
+
+    /// **A caixa da câmera** desta fila, criada na primeira vez (§17.2), e com ela a triagem ligada.
+    /// Com o cadeado da fila na mão enquanto nasce: um [`FilaDeEntrada::fechar`] ao mesmo tempo ou
+    /// vê a caixa e a fecha, ou veio antes e a caixa nasce fechada.
+    fn caixa_da_camera(&self) -> Arc<FilaDeEntrada> {
+        if let Some(c) = self.caixa_da_camera.get() {
+            return Arc::clone(c);
+        }
+        let guarda = self.estado.lock();
+        let fechada = guarda.as_ref().map(|e| e.fechada).unwrap_or(true);
+        let c = self.caixa_da_camera.get_or_init(|| {
+            let c = FilaDeEntrada::nova(self.politica(), Arc::clone(&self.descartadas));
+            if fechada {
+                c.fechar();
+            }
+            Arc::new(c)
+        });
+        drop(guarda);
+        Arc::clone(c)
     }
 
     fn mudar_politica(&self, politica: QuandoEnche) {
         self.politica.store(politica as u8, Ordering::Relaxed);
+        if let Some(c) = self.caixa_da_camera.get() {
+            c.mudar_politica(politica);
+        }
     }
 
     fn politica(&self) -> QuandoEnche {
@@ -204,6 +248,13 @@ impl FilaDeEntrada {
 
     /// Roda numa thread da libdatachannel, por mensagem. Não bloqueia além do cadeado.
     fn empurrar(&self, msg: Vec<u8>) {
+        // A triagem (§17.2): com a caixa da câmera pedida, a mensagem da câmera vai para lá.
+        if let Some(caixa) = self.caixa_da_camera.get() {
+            if e_da_camera(&msg) {
+                caixa.empurrar(msg);
+                return;
+            }
+        }
         let Ok(mut e) = self.estado.lock() else {
             self.descartadas.fetch_add(1, Ordering::Relaxed);
             return;
@@ -231,6 +282,10 @@ impl FilaDeEntrada {
             e.fechada = true;
         }
         self.chegou.notify_all();
+        // O fim é um só: a caixa da câmera fecha junto (§17.2).
+        if let Some(c) = self.caixa_da_camera.get() {
+            c.fechar();
+        }
     }
 
     /// Espera até haver o que ler (na vaga ou na fila), até o fim do prazo. Com o cadeado na mão,
@@ -1197,6 +1252,7 @@ impl Session {
             descartadas_fila_cheia: Arc::clone(&self.descartados),
             teto: Arc::clone(&self.teto_negociado),
             par: self.par.clone(),
+            da_camera: false,
         }
     }
 
@@ -1418,6 +1474,8 @@ pub struct Mensageiro {
     descartadas_fila_cheia: Arc<AtomicU64>,
     teto: Arc<std::sync::atomic::AtomicUsize>,
     par: Option<Arc<ParDaSessao>>,
+    /// Este é o mensageiro da câmera ([`Mensageiro::da_camera`]): `fila` é a caixa da câmera.
+    da_camera: bool,
 }
 
 /// O que conta como mensagem.
@@ -1447,6 +1505,37 @@ impl Mensageiro {
     /// réplica do teleprompter segue a regra de antes, sem pergunta e sem cópia.
     pub fn par(&self) -> Option<&ParDaSessao> {
         self.par.as_deref()
+    }
+
+    /// **O mensageiro da câmera desta sessão** (`docs/controle-remoto-da-camera.md` §17.2): manda
+    /// pelo mesmo canal, e lê de uma **caixa própria**, para onde vão as mensagens `"app":"camera"`
+    /// que chegam à sessão. É como a câmera passa pela sessão do teleprompter sem a bombeada do
+    /// teleprompter (o leitor da fila da sessão) vê-las.
+    ///
+    /// Na primeira vez, cria a caixa e **liga a triagem**: dali em diante, a câmera só chega por um
+    /// mensageiro da câmera. Pedido de novo (deste ou de outro mensageiro da sessão, inclusive de um
+    /// da câmera), é outro mensageiro da mesma caixa. Numa sessão de vídeo **não peça**: lá o leitor
+    /// da câmera é o mensageiro comum (§2). Depois do fim da sessão, a caixa nasce fechada.
+    pub fn da_camera(&self) -> Mensageiro {
+        if self.da_camera {
+            return self.clone();
+        }
+        let mut m = self.clone();
+        m.fila = self.fila.caixa_da_camera();
+        m.da_camera = true;
+        m
+    }
+
+    /// **A entrega deste canal é confiável?** Lida do canal, como `Session::entrega_do_canal`:
+    /// `Some(true)` com retransmissão (o teleprompter, `ReliableUnordered`), `Some(false)` sem ela (o
+    /// vídeo, `Realtime`), `None` enquanto o canal não existe deste lado ou depois do fim. Quem
+    /// reenvia por conta própria (o controlador da câmera) espaça o reenvio num canal confiável.
+    pub fn confiavel(&self) -> Option<bool> {
+        let _passe = self.portao.entrar()?;
+        let canal = self.canal.upgrade()?;
+        let guarda = canal.lock().ok()?;
+        let r = guarda.as_ref()?.reliability();
+        Some(!r.unreliable)
     }
 
     /// Manda uma mensagem.
@@ -3244,6 +3333,78 @@ mod tests {
         assert_eq!(b.entrega_do_canal(), Some(Delivery::Realtime));
         assert_eq!(b.fila.politica(), QuandoEnche::DescartaANova);
         assert_eq!(TransportConfig::default().delivery, Delivery::Realtime);
+    }
+
+    /// **A caixa da câmera** (`docs/controle-remoto-da-camera.md` §17.2), na fila, sem rede: sem a
+    /// caixa, tudo vai para a fila; com ela, só a mensagem pequena da câmera vai para a caixa — o
+    /// texto grande que fala em câmera, o estado do teleprompter e o lixo seguem na fila; o fim fecha
+    /// as duas, e a caixa pedida depois do fim nasce fechada.
+    #[test]
+    fn a_caixa_da_camera_tria_na_chegada_e_fecha_junto() {
+        let descartadas = Arc::new(AtomicU64::new(0));
+        let fila = FilaDeEntrada::nova(QuandoEnche::DescartaAVelha, Arc::clone(&descartadas));
+        let camera = br#"{"app":"camera","v":1,"tipo":"ola","cap":0}"#.to_vec();
+        fila.empurrar(camera.clone());
+        assert_eq!(fila.tirar(Duration::ZERO), Tirada::Item(camera.clone()), "sem a caixa, a câmera fica na fila");
+
+        let caixa = fila.caixa_da_camera();
+        assert!(Arc::ptr_eq(&caixa, &fila.caixa_da_camera()), "a caixa é uma só por fila");
+        assert_eq!(caixa.politica(), QuandoEnche::DescartaAVelha, "a caixa segue a regra da fila");
+        let do_teleprompter = br#"{"app":"teleprompter","v":1,"tipo":"estado","entende_camera":true}"#.to_vec();
+        let texto_grande = format!(r#"{{"app":"camera","x":"{}"}}"#, "y".repeat(5000)).into_bytes();
+        let fala_em_camera = br#"{"app":"teleprompter","tipo":"texto","texto":"\"camera\" no roteiro"}"#.to_vec();
+        for m in [camera.clone(), do_teleprompter.clone(), texto_grande.clone(), fala_em_camera.clone(), b"lixo \"camera\"".to_vec()] {
+            fila.empurrar(m);
+        }
+        assert_eq!(caixa.tirar(Duration::ZERO), Tirada::Item(camera));
+        assert_eq!(caixa.tirar(Duration::ZERO), Tirada::Nada, "só a mensagem da câmera vai para a caixa");
+        assert_eq!(fila.tirar(Duration::ZERO), Tirada::Item(do_teleprompter));
+        assert_eq!(fila.tirar(Duration::ZERO), Tirada::Item(texto_grande), "acima de 4 KiB não é da câmera");
+        assert_eq!(fila.tirar(Duration::ZERO), Tirada::Item(fala_em_camera));
+        assert_eq!(fila.tirar(Duration::ZERO), Tirada::Item(b"lixo \"camera\"".to_vec()));
+
+        fila.fechar();
+        assert_eq!(caixa.tirar(Duration::ZERO), Tirada::Fechada, "o fim é um só");
+        assert_eq!(fila.tirar(Duration::ZERO), Tirada::Fechada);
+
+        let tarde = FilaDeEntrada::nova(QuandoEnche::DescartaANova, Arc::new(AtomicU64::new(0)));
+        tarde.fechar();
+        assert_eq!(tarde.caixa_da_camera().tirar(Duration::ZERO), Tirada::Fechada, "pedida depois do fim, nasce fechada");
+    }
+
+    /// **O mensageiro da câmera numa sessão de teleprompter de verdade** (§17.2, §17.4): a mensagem da
+    /// câmera vai só para ele, a do teleprompter só para o comum; ele manda pelo mesmo canal; pedido
+    /// de novo (de um da câmera), é a mesma caixa; o canal é confiável dos dois lados; o fim chega a
+    /// ele como `Closed`.
+    #[test]
+    fn o_mensageiro_da_camera_divide_a_sessao_com_o_comum() {
+        let (a, b) = par_com_canal(Delivery::ReliableUnordered);
+        let (ma, mb) = (a.mensageiro(), b.mensageiro());
+        let (ca, cb) = (ma.da_camera(), mb.da_camera());
+        assert_eq!(ca.sessao(), ma.sessao(), "a mesma sessão");
+        assert_eq!((ca.confiavel(), cb.confiavel()), (Some(true), Some(true)), "o canal do teleprompter é confiável");
+        let camera = r#"{"app":"camera","v":1,"tipo":"ola","cap":0}"#;
+        let teleprompter = r#"{"app":"teleprompter","v":1,"tipo":"estado"}"#;
+        for _ in 0..5 {
+            ma.enviar(teleprompter).expect("o comum manda");
+            ca.enviar(camera).expect("o da câmera manda pelo mesmo canal");
+        }
+        let na_caixa = receber_ate(&cb.da_camera(), 5, Duration::from_secs(10));
+        let na_fila = receber_ate(&mb, 5, Duration::from_secs(10));
+        assert_eq!(na_caixa, vec![camera.to_string(); 5]);
+        assert_eq!(na_fila, vec![teleprompter.to_string(); 5]);
+        assert_eq!(mb.proxima(Duration::from_millis(100)).expect("lê"), None, "nada de câmera na fila comum");
+        drop(b);
+        assert!(matches!(cb.proxima(Duration::from_secs(1)), Err(Error::Closed)), "o fim chega à caixa");
+        assert_eq!(cb.confiavel(), None, "depois do fim, não se sabe");
+    }
+
+    /// Numa sessão de vídeo o canal é sem retransmissão: `confiavel` diz `false`.
+    #[test]
+    fn o_video_nao_e_confiavel() {
+        let (a, b) = par_com_canal(Delivery::Realtime);
+        assert_eq!(a.mensageiro().confiavel(), Some(false));
+        assert_eq!(b.mensageiro().confiavel(), Some(false));
     }
 
     /// Vazia, com NUL, ou acima do teto: recusada **antes** da biblioteca. Exatamente no teto:

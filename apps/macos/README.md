@@ -12,7 +12,7 @@ Na raiz do repositório, com Rust, CMake e o Xcode selecionado:
 apps/macos/Empacotar/empacotar.sh
 ```
 
-Gera `dist/macos/Quall Monitor.app`, `Quall-Monitor-0.1.1-macos-arm64.dmg` (ou `x64`), ZIP para validação e SHA-256. O DMG contém o app e um atalho para Aplicativos; arraste o app para instalar. O pipeline
+Gera `dist/macos/Quall Monitor.app`, `Quall-Monitor-0.2.0-macos-arm64.dmg` (ou `x64`, ou `universal` com `QUALL_MONITOR_ARQUITETURAS=universal`), ZIP para validação e SHA-256. O DMG contém o app e um atalho para Aplicativos; arraste o app para instalar. O pipeline
 compila o núcleo deste repositório, os dois executáveis Swift e assina localmente com ad-hoc.
 Não instala nem publica. O helper `quall-monitor-display` vive dentro do app.
 
@@ -38,12 +38,26 @@ Após o app receber o ticket, recrie o DMG com esse app e assine/notarize o inst
 
 ```sh
 QUALL_MONITOR_IDENTIDADE='Developer ID Application: ...' apps/macos/Empacotar/instalador.sh
-QUALL_MONITOR_PERFIL_NOTARIZACAO='nome-do-perfil-salvo' apps/macos/Empacotar/notarizar-dmg.sh dist/macos/Quall-Monitor-0.1.1-macos-arm64.dmg
+QUALL_MONITOR_PERFIL_NOTARIZACAO='nome-do-perfil-salvo' apps/macos/Empacotar/notarizar-dmg.sh dist/macos/Quall-Monitor-0.2.0-macos-arm64.dmg
 ```
 
 O segundo script monta o DMG somente para leitura, verifica o app com ticket e a identidade do titular,
 desmonta, envia o DMG e só anexa o ticket após `Accepted`. Use o nome `x64` para Intel.
 Developer ID Application basta para o DMG; não existe dependência de Developer ID Installer.
+
+PKG opcional e desinstalador, a partir do app já empacotado:
+
+```sh
+apps/macos/Empacotar/pacote-pkg.sh
+```
+
+Gera `Quall-Monitor-0.2.0-macos-<arq>.pkg`, que instala somente `Quall Monitor.app` em
+`/Applications` (não relocável, recibo `br.com.queven.quall.monitor.pkg`), e
+`Quall-Monitor-0.2.0-desinstalar.command`. O PKG só é assinado com
+`QUALL_MONITOR_IDENTIDADE_INSTALADOR='Developer ID Installer: ...'`. O desinstalador recusa rodar com o
+app aberto, confere o bundle `br.com.queven.quall.monitor` antes de apagar, esquece o recibo do PKG e
+preserva os dados; `--dados` apaga também pareamentos, sessões salvas, preferências e logs do Monitor,
+`--simular` só lista as ações. Nunca toca nos arquivos do Quall Studio.
 
 `QUALL_MONITOR_NUCLEO_PRONTO=sim` reaproveita somente `target/release/libquall.a` já construído
 neste repositório. `QUALL_MONITOR_JOBS`, `QUALL_MONITOR_VERSAO` e `QUALL_MONITOR_BUILD` são opções
@@ -57,7 +71,9 @@ de núcleo compatível; o empacotador sempre substitui esse valor pelo núcleo d
    da Tela quando o macOS pedir. Se bloqueadas, os botões abrem os respectivos painéis de Privacidade
    e Segurança. Na gravação, use `+` para adicionar o app caso a lista não o mostre.
 2. No outro computador, escolha **Exibir**, selecione o aparelho descoberto ou digite o endereço
-   completo `IP:porta`, e entre com o PIN de seis dígitos. Receptores Quall Studio compatíveis
+   completo `IP:porta`, e entre com o PIN de seis dígitos. Na 0.2.0, o caminho principal é tocar
+   no computador em **Por perto** e escolher, entre três opções, o código de 4 dígitos mostrado;
+   **Conectados antes** retoma sem código, e o Exibir mostra um QR para o Quall Studio do celular. Receptores Quall Studio compatíveis
    também podem receber a tela.
 3. Cada conexão cria um monitor virtual no formato informado pelo receptor; sem essa informação,
    usa 1920 × 1200. A espera seguinte mostra novo PIN e endereço, até **8 monitores simultâneos**.

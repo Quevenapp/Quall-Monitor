@@ -4,7 +4,15 @@ Casca desktop para criar até **oito monitores estendidos simultâneos**, um por
 
 O emissor mantém uma espera para o próximo aparelho enquanto há vaga. Ao atingir oito conexões, retira o anúncio; quando um aparelho sai, a espera e o anúncio voltam. Cada receptor recebe seu próprio monitor e reconecta com o mesmo índice, enquanto as demais sessões continuam. **Exibir** recebe uma tela por instância, como no Quall anterior.
 
-O Quall Monitor e o Quall Studio podem ficar abertos simultaneamente: executáveis, mutex de instância, janelas, dados, diário, identidade de rede e preferências são independentes. A porta de sinalização padrão é escolhida livremente. O protocolo v3 permanece compatível com o Quall Studio 1.0.0. Na descoberta aparece um rótulo efêmero `Quall <código>`, mostrado junto ao PIN/endereço da espera atual. O nome local termina em ` · Quall Monitor` e só chega ao outro aparelho pelo canal autenticado. Instalações Monitor 0.1.0 precisam parear novamente por PIN ao atualizar.
+O Quall Monitor e o Quall Studio podem ficar abertos simultaneamente: executáveis, mutex de instância, janelas, dados, diário, identidade de rede e preferências são independentes. A porta de sinalização padrão é escolhida livremente. O protocolo v3 permanece compatível com o Quall Studio. Na descoberta aparece um rótulo efêmero `Quall <código>` e, quando a pessoa escolhe, o nome que os outros aparelhos veem (campo no pé da barra; o padrão é o nome do computador seguido de ` · Quall Monitor`). Nenhum dos dois prova identidade: só o vínculo autenticado (`pares.json`) decide quem é quem.
+
+### Pareamento (0.2.0)
+
+- **Código de 4 dígitos.** Sem PIN e sem vínculo, o toque em Exibir (ou em Conectar no outro aparelho) abre uma troca pelo código: quem exibe mostra o número certo; quem estende vê três números e escolhe o que a outra tela mostra, ou "Nenhum destes". Um erro desliga o código daquela espera; três trocas por espera, no máximo. Vale na espera do primeiro aparelho e na espera de mais um, até oito.
+- **Por perto.** A lista "Na rede agora" usa a busca do núcleo (mDNS, broadcast UDP e sondagem da /24 pelos vizinhos do Windows), com "Procurar de novo". O aparelho que a sonda reconhece como par guardado aparece com o nome local; a última sessão do Exibir entra como "Pareado" enquanto o vínculo existir.
+- **Sessão salva por identidade.** `sessao-exibir.txt` e `nomes-dos-pares.txt` só são gravados depois da sessão autenticada. O toque num aparelho pareado reconecta só com o vínculo dele; se ele não reconhece mais este computador, o mesmo toque cai para o código. A falha fechada (A2) oferece "Esquecer este aparelho".
+- **QR no Exibir.** Com o painel Exibir à vista, o computador mostra um QR (`v=2`, 3 min, um chamado) que o celular lê para chamar; a escuta só existe enquanto o QR está na tela.
+- **PIN de 6 dígitos** continua como alternativa (aparelho que não aceita o código, código esgotado, interferência), e substitui o vínculo como sempre.
 
 O MSI cria regras de firewall próprias do executável Monitor, para TCP e UDP na rede privada e na sub-rede local. Elas permitem portas dinâmicas e permanecem separadas das regras do Studio. Para parear, os aparelhos precisam estar na mesma rede local, com o perfil de rede do Windows definido como Privado.
 
@@ -15,8 +23,8 @@ O Quall Monitor usa `%APPDATA%\Quall Monitor` e `%LOCALAPPDATA%\Quall Monitor\Lo
 ```powershell
 cargo run --manifest-path apps/windows/Cargo.toml --locked --bin quall-monitor
 cargo test --manifest-path apps/windows/Cargo.toml --lib --locked
-.\apps\windows\scripts\instalador\construir-msi.ps1 -Versao 0.1.1 -Destino "$PWD\dist\windows"
-.\apps\windows\scripts\instalador\construir-msi.ps1 -Versao 0.1.1 -Idioma en-US -SoEmpacotar -Destino "$PWD\dist\windows"
+.\apps\windows\scripts\instalador\construir-msi.ps1 -Versao 0.2.0 -Destino "$PWD\dist\windows"
+.\apps\windows\scripts\instalador\construir-msi.ps1 -Versao 0.2.0 -Idioma en-US -SoEmpacotar -Destino "$PWD\dist\windows"
 ```
 
 Use Rust MSVC x64, Visual Studio Build Tools com SDK Windows, CMake, NASM, Perl e libclang. O instalador usa WiX Toolset **5.0.2** e as extensões Util, Firewall e UI da mesma versão. O MSI padrão é em português; o segundo comando empacota a interface em inglês usando o mesmo executável bilíngue. A [documentação do instalador](scripts/instalador/README.md) descreve os artefatos e a instalação do driver. O ícone `quall.ico`, que mostra a marca Quall na tela de um monitor, é embutido no executável e usado nos atalhos e na lista de aplicativos do Windows.

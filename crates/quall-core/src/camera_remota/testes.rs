@@ -349,7 +349,7 @@ fn o_filmador_recusa_o_que_as_capacidades_nao_permitem() {
     // Campos demais.
     let mut f = filmador_com_camera(t);
     let _ = receptor_pronto(&mut f, SESSAO_A, t);
-    let muitos: Objeto = (0..17).map(|i| (format!("c{i}"), json!(true))).collect();
+    let muitos: Objeto = (0..=TETO_DE_CAMPOS).map(|i| (format!("c{i}"), json!(true))).collect();
     f.receber(SESSAO_A, Some(&par("rx")), &pedido_cru(&f, 1, json!({"ajuste": muitos})), t);
     assert_eq!(motivo_da_recusa(&mut f, t).0, "fora_da_faixa");
 }
@@ -1048,6 +1048,76 @@ fn ev_com_a_trava_ligada_e_incoerente() {
     assert!(a.pedir(r#"{"ev":1.0}"#, t).is_err());
 }
 
+/// As capacidades de uma webcam no Windows: o `ev` é o brilho do driver, independente da exposição
+/// (13/10, R9 §3.3).
+fn caps_windows(independente: bool) -> String {
+    let mut ev = json!({"min": -64, "max": 64, "passo": 1, "inteiro": true, "unidade": "brilho", "origem": 0});
+    if independente {
+        ev[DICA_DO_EV_INDEPENDENTE] = json!(true);
+    }
+    json!({
+        "plataforma": "windows",
+        "nomeDaCamera": "Integrated Webcam",
+        "controles": {
+            "exposicao": {"valores": ["auto", "manual"]},
+            "ev": ev,
+            "travaExposicao": {},
+            "iso": {"min": 0, "max": 100, "inteiro": true, "unidade": "ganho"},
+            "obturadorNs": {"min": 976563, "max": 62500000, "inteiro": true, "escala": "log2"}
+        },
+        "limites": {}
+    })
+    .to_string()
+}
+
+/// 13/10: o brilho do Windows vale com a exposição manual e com a trava, nas duas pontas; sem a
+/// dica (o filmador de antes), a regra de sempre.
+#[test]
+fn o_brilho_independente_vale_em_manual_e_com_a_trava() {
+    let t = Instant::now();
+    for independente in [true, false] {
+        let mut f = NucleoDoFilmador::novo();
+        f.permitir(true);
+        let manual = json!({"exposicao": "manual", "ev": 0, "travaExposicao": false, "iso": 10, "obturadorNs": 31250000});
+        f.definir_camera(Some((&caps_windows(independente), &manual.to_string()))).unwrap();
+        let mut a = receptor_pronto(&mut f, SESSAO_A, t);
+        // O receptor confere com as capacidades do filmador.
+        assert_eq!(a.pedir(r#"{"ev":12}"#, t).is_ok(), independente, "receptor, manual, independente={independente}");
+        // O filmador também, com o pedido cru (o receptor de antes não sabe da dica).
+        f.receber(SESSAO_A, Some(&par("A")), &pedido_cru(&f, 50, json!({"ajuste": {"ev": 20}})), t);
+        let aceito = f.proximo_pedido(t);
+        assert_eq!(aceito.is_some(), independente, "filmador, manual, independente={independente}");
+        if let Some(p) = aceito {
+            let p = v(&p);
+            assert_eq!(p["ajuste"]["ev"], json!(20));
+            let mut reg = f.ajuste().clone();
+            reg.insert("ev".into(), json!(20));
+            f.definir_ajuste(&Value::Object(reg).to_string(), p["n"].as_u64().unwrap(), t).unwrap();
+        }
+        // Em Auto com a trava ligada: o brilho continua livre só com a dica.
+        let travado = json!({"exposicao": "auto", "ev": 0, "travaExposicao": true});
+        f.definir_ajuste(&travado.to_string(), 0, t).unwrap();
+        f.receber(SESSAO_A, Some(&par("A")), &pedido_cru(&f, 60, json!({"ajuste": {"ev": -8}})), t);
+        assert_eq!(f.proximo_pedido(t).is_some(), independente, "filmador, trava, independente={independente}");
+    }
+}
+
+/// A dica só vale no `ev`, e só com `true`: o Android (sem a dica) segue com o EV só no Auto.
+#[test]
+fn a_dica_do_ev_e_estrita() {
+    let mut caps: Objeto = serde_json::from_str(&caps_windows(false)).unwrap();
+    assert!(!ev_independente(&caps));
+    caps["controles"]["ev"][DICA_DO_EV_INDEPENDENTE] = json!("sim");
+    assert!(!ev_independente(&caps), "só o booleano");
+    caps["controles"]["ev"][DICA_DO_EV_INDEPENDENTE] = json!(true);
+    assert!(ev_independente(&caps));
+    let manual: Objeto = serde_json::from_str(r#"{"exposicao":"manual"}"#).unwrap();
+    let iso_em_auto: Objeto = serde_json::from_str(r#"{"exposicao":"auto","iso":10}"#).unwrap();
+    // A dica não solta os outros campos.
+    assert!(conferir_coerencia(&caps, &manual, &serde_json::from_str(r#"{"ev":3}"#).unwrap()).is_ok());
+    assert!(conferir_coerencia(&caps, &Objeto::new(), &iso_em_auto).is_err());
+}
+
 /// M12: o nome do outro lado vai para a tela de todos sem caracteres de controle.
 #[test]
 fn o_nome_do_par_e_limpo_e_curto() {
@@ -1069,4 +1139,723 @@ fn no_receptor_restaurar_pendente_muda_a_coerencia() {
     assert!(a.pedir(r#"{"ev":1.0}"#, t).is_err(), "manual: EV apagado");
     a.restaurar(t).unwrap();
     a.pedir(r#"{"ev":1.0}"#, t).unwrap();
+}
+
+// ---------------------------------------------------------------------------------------------
+// "Travar fps" (R9 §3.1.1, 12/10)
+// ---------------------------------------------------------------------------------------------
+
+/// As capacidades do Android com o `travarFps` (sim/não).
+fn caps_android_com_trava_de_fps() -> String {
+    let mut c = v(&caps_android());
+    c["controles"]["travarFps"] = json!({});
+    c.to_string()
+}
+
+fn filmador_com_trava_de_fps() -> NucleoDoFilmador {
+    let mut f = NucleoDoFilmador::novo();
+    f.permitir(true);
+    f.definir_camera(Some((&caps_android_com_trava_de_fps(), &ajuste_padrao()))).unwrap();
+    f
+}
+
+/// O pedido do botão do aviso ("Travar em 30 fps") chega, é aplicado e volta no estado.
+#[test]
+fn travar_fps_vai_e_volta_pelo_controle_remoto() {
+    let t = Instant::now();
+    let mut f = filmador_com_trava_de_fps();
+    let mut a = receptor_pronto(&mut f, SESSAO_A, t);
+    a.pedir(r#"{"travarFps":true}"#, t).unwrap();
+    trocar(&mut f, SESSAO_A, &mut a, t);
+    let aplicados = aplicar_como_a_casca(&mut f, t);
+    assert_eq!(aplicados.len(), 1);
+    assert_eq!(aplicados[0]["ajuste"], json!({"travarFps": true}));
+    let t2 = t + BATIMENTO;
+    trocar(&mut f, SESSAO_A, &mut a, t2);
+    assert_eq!(a.aplicado().unwrap()["travarFps"], json!(true));
+    // E o "Clarear" desliga.
+    // (o `trocar` acima reenviou o primeiro pedido em t2: o próximo envio espera o intervalo)
+    let t2 = t2 + INTERVALO_DOS_PEDIDOS;
+    a.pedir(r#"{"travarFps":false}"#, t2).unwrap();
+    trocar(&mut f, SESSAO_A, &mut a, t2);
+    assert_eq!(aplicar_como_a_casca(&mut f, t2).len(), 1);
+    let t3 = t2 + BATIMENTO;
+    trocar(&mut f, SESSAO_A, &mut a, t3);
+    assert_eq!(a.aplicado().unwrap()["travarFps"], json!(false));
+}
+
+/// As cascas Apple põem dicas no descritor (`{"fps":30,"piso":15}`): continua sendo sim/não.
+#[test]
+fn travar_fps_com_dicas_no_descritor() {
+    let t = Instant::now();
+    let mut c = v(&caps_android());
+    c["controles"]["travarFps"] = json!({"fps": 30, "piso": 15});
+    let mut f = NucleoDoFilmador::novo();
+    f.permitir(true);
+    f.definir_camera(Some((&c.to_string(), &ajuste_padrao()))).unwrap();
+    let mut a = receptor_pronto(&mut f, SESSAO_A, t);
+    a.pedir(r#"{"travarFps":true}"#, t).unwrap();
+    assert!(a.pedir(r#"{"travarFps":30}"#, t).is_err());
+    trocar(&mut f, SESSAO_A, &mut a, t);
+    assert_eq!(aplicar_como_a_casca(&mut f, t).len(), 1);
+    assert_eq!(f.ajuste()["travarFps"], json!(true));
+}
+
+/// Booleano só: o número e o texto são `fora_da_faixa`.
+#[test]
+fn travar_fps_e_sim_ou_nao() {
+    let t = Instant::now();
+    let mut f = filmador_com_trava_de_fps();
+    let mut a = receptor_pronto(&mut f, SESSAO_A, t);
+    assert!(a.pedir(r#"{"travarFps":1}"#, t).is_err());
+    assert!(a.pedir(r#"{"travarFps":"sim"}"#, t).is_err());
+}
+
+/// Vale com a exposição manual também: não é `incoerente` (fica guardado e vale ao voltar ao Auto).
+#[test]
+fn travar_fps_vale_em_qualquer_exposicao() {
+    let t = Instant::now();
+    let mut f = filmador_com_trava_de_fps();
+    let mut reg = f.ajuste().clone();
+    reg.insert("exposicao".into(), json!("manual"));
+    reg.insert("iso".into(), json!(400));
+    reg.insert("obturadorNs".into(), json!(16_666_666));
+    f.definir_ajuste(&Value::Object(reg).to_string(), 0, t).unwrap();
+    let mut a = receptor_pronto(&mut f, SESSAO_A, t);
+    a.pedir(r#"{"travarFps":true}"#, t).unwrap();
+    a.pedir(r#"{"exposicao":"auto","travarFps":true}"#, t).unwrap();
+    a.pedir(r#"{"exposicao":"manual","travarFps":false}"#, t).unwrap();
+}
+
+/// Um filmador sem a chave nas capacidades (de antes de 12/10, ou sem a trava) faz o receptor
+/// recusar na hora, com `campo_desconhecido`.
+#[test]
+fn travar_fps_sem_a_capacidade_e_campo_desconhecido() {
+    let t = Instant::now();
+    let mut f = filmador_com_camera(t);
+    let mut a = receptor_pronto(&mut f, SESSAO_A, t);
+    assert!(a.pedir(r#"{"travarFps":true}"#, t).is_err());
+}
+
+/// O registro antigo, sem a chave, vale `false`: a casca que passa a gravar o `false` explícito
+/// não sobe a versão, e o pedido de `false` contra o ausente não disputa nada.
+#[test]
+fn travar_fps_ausente_vale_falso() {
+    let t = Instant::now();
+    let mut f = filmador_com_trava_de_fps();
+    let antes = f.versao();
+    let mut reg = f.ajuste().clone();
+    assert!(!reg.contains_key("travarFps"));
+    reg.insert("travarFps".into(), json!(false));
+    f.definir_ajuste(&Value::Object(reg.clone()).to_string(), 0, t).unwrap();
+    assert_eq!(f.versao(), antes, "false explícito = ausente");
+    reg.insert("travarFps".into(), Value::Null);
+    f.definir_ajuste(&Value::Object(reg.clone()).to_string(), 0, t).unwrap();
+    assert_eq!(f.versao(), antes, "null = ausente = false");
+    reg.insert("travarFps".into(), json!(true));
+    f.definir_ajuste(&Value::Object(reg).to_string(), 0, t).unwrap();
+    assert_eq!(f.versao(), antes + 1, "true muda");
+
+    // O pedido de false contra o ausente: recibo, sem pedido para a casca nem versão nova.
+    let mut f = filmador_com_trava_de_fps();
+    let mut a = receptor_pronto(&mut f, SESSAO_A, t);
+    let antes = f.versao();
+    a.pedir(r#"{"travarFps":false}"#, t).unwrap();
+    trocar(&mut f, SESSAO_A, &mut a, t);
+    assert!(f.proximo_pedido(t).is_none());
+    assert_eq!(f.versao(), antes);
+}
+
+/// O lido com a pouca luz (`"poucaLuz":{"fpsChegando":…,"piso":…}`) passa inteiro ao receptor, e o
+/// estado de um registro cheio com ele ainda cabe num pedaço SCTP.
+#[test]
+fn o_lido_leva_a_pouca_luz() {
+    let t = Instant::now();
+    let mut f = filmador_com_trava_de_fps();
+    let cheio = json!({"exposicao": "auto", "ev": -0.7, "travaExposicao": false, "travaIso": 400,
+        "travaObturadorNs": 16666666, "iso": 1600, "obturadorNs": 8333333, "antiCintilacao": "60",
+        "balanco": "kelvin", "kelvin": 5600, "travaBalanco": false,
+        "travaGanhos": [1.9921875, 1.0, 1.0, 2.34375], "foco": "manual", "focoPosicao": 0.37,
+        "travarFps": true});
+    f.definir_ajuste(&cheio.to_string(), 0, t).unwrap();
+    let lido = r#"{"iso":3200,"obturadorNs":33333333,"kelvin":5550,"abertura":1.7,"focoPosicao":0.37,"divergentes":["kelvin"],"poucaLuz":{"fpsChegando":30,"piso":15}}"#;
+    f.definir_lido(lido).unwrap();
+    let mut a = receptor_pronto(&mut f, SESSAO_A, t);
+    let e = v(&a.estado_json(t));
+    assert_eq!(e["lido"]["poucaLuz"], json!({"fpsChegando": 30, "piso": 15}));
+    f.receber(SESSAO_A, Some(&par("Um nome de aparelho bem comprido, com acento ção")), &mensagem("ola", Objeto::new()), t);
+    for (d, m) in f.devidas(SESSAO_A, t) {
+        assert!(m.len() <= ALVO_DA_MENSAGEM, "{d:?} tem {} bytes: {m}", m.len());
+    }
+    // A pouca luz que apaga volta como `null`.
+    f.definir_lido(r#"{"iso":800,"poucaLuz":null}"#).unwrap();
+    let t2 = t + BATIMENTO;
+    trocar(&mut f, SESSAO_A, &mut a, t2);
+    assert_eq!(v(&a.estado_json(t2))["lido"]["poucaLuz"], Value::Null);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Os ajustes de imagem (R9 §3.7, 13/10)
+// ---------------------------------------------------------------------------------------------
+
+/// As capacidades do Android com os quatro ajustes de imagem (o Quall processa) e a contraluz.
+fn caps_android_com_imagem() -> String {
+    let mut c = v(&caps_android_com_trava_de_fps());
+    for campo in AJUSTES_DE_IMAGEM {
+        c["controles"][campo] = json!({"min": -100, "max": 100, "passo": 1, "origem": "quall"});
+    }
+    c["controles"][CONTRALUZ] = json!({"origem": "camera"});
+    c.to_string()
+}
+
+fn filmador_com_imagem() -> NucleoDoFilmador {
+    let mut f = NucleoDoFilmador::novo();
+    f.permitir(true);
+    f.definir_camera(Some((&caps_android_com_imagem(), &ajuste_padrao()))).unwrap();
+    f
+}
+
+/// Os quatro e a contraluz vão e voltam, vencendo o último como os outros campos.
+#[test]
+fn os_ajustes_de_imagem_vao_e_voltam() {
+    let t = Instant::now();
+    let mut f = filmador_com_imagem();
+    let mut a = receptor_pronto(&mut f, SESSAO_A, t);
+    a.pedir(r#"{"gama":-20,"contraste":35,"saturacao":-100,"nitidez":100,"contraluz":true}"#, t).unwrap();
+    trocar(&mut f, SESSAO_A, &mut a, t);
+    let aplicados = aplicar_como_a_casca(&mut f, t);
+    assert_eq!(aplicados.len(), 1);
+    assert_eq!(
+        aplicados[0]["ajuste"],
+        json!({"gama": -20, "contraste": 35, "saturacao": -100, "nitidez": 100, "contraluz": true})
+    );
+    let t2 = t + BATIMENTO;
+    trocar(&mut f, SESSAO_A, &mut a, t2);
+    assert_eq!(a.aplicado().unwrap()["contraste"], json!(35));
+    // O inteiro sai sem `.0` (o Android lê Double e trunca).
+    assert_eq!(serde_json::to_string(&f.ajuste()["gama"]).unwrap(), "-20");
+
+    // Um pedido cru com a vista de antes da mudança perde o campo (vence o último).
+    let vista_velha = f.versao() - 1;
+    let velho = pedido_cru(&f, 9, json!({"vista": vista_velha, "ajuste": {"contraste": -50}}));
+    f.receber(SESSAO_B, Some(&par("B")), &velho, t2);
+    assert!(f.proximo_pedido(t2).is_none(), "quem não viu a mudança não vence");
+    // Quem viu, vence.
+    let novo = pedido_cru(&f, 10, json!({"vista": f.versao(), "ajuste": {"contraste": -50}}));
+    f.receber(SESSAO_B, Some(&par("B")), &novo, t2);
+    assert_eq!(aplicar_como_a_casca(&mut f, t2).len(), 1);
+    assert_eq!(f.ajuste()["contraste"], json!(-50));
+}
+
+/// Inteiros de -100 a 100, mesmo que o descritor não diga `"inteiro":true`.
+#[test]
+fn os_ajustes_de_imagem_sao_inteiros_na_faixa() {
+    let t = Instant::now();
+    let mut f = filmador_com_imagem();
+    let mut a = receptor_pronto(&mut f, SESSAO_A, t);
+    for ruim in [r#"{"gama":12.5}"#, r#"{"contraste":101}"#, r#"{"saturacao":-101}"#, r#"{"nitidez":"10"}"#, r#"{"nitidez":true}"#] {
+        assert!(a.pedir(ruim, t).is_err(), "{ruim} passou no receptor");
+    }
+    // E o filmador, com o pedido cru.
+    for (i, ruim) in [json!({"gama": 12.5}), json!({"contraste": 101}), json!({"contraluz": 1})].into_iter().enumerate() {
+        f.receber(SESSAO_A, Some(&par("rx")), &pedido_cru(&f, 100 + i as u64, json!({"ajuste": ruim})), t);
+        assert!(f.proximo_pedido(t).is_none(), "{ruim} passou no filmador");
+        assert_eq!(motivo_da_recusa(&mut f, t).0, motivo::FORA_DA_FAIXA);
+    }
+}
+
+/// Valem em qualquer exposição, com as travas, e logo depois de um `restaurar`.
+#[test]
+fn os_ajustes_de_imagem_nao_dependem_da_exposicao() {
+    let t = Instant::now();
+    let mut f = filmador_com_imagem();
+    let mut reg = f.ajuste().clone();
+    reg.insert("exposicao".into(), json!("manual"));
+    reg.insert("iso".into(), json!(400));
+    reg.insert("obturadorNs".into(), json!(16_666_666));
+    reg.insert("balanco".into(), json!("kelvin"));
+    reg.insert("kelvin".into(), json!(5600));
+    f.definir_ajuste(&Value::Object(reg).to_string(), 0, t).unwrap();
+    let mut a = receptor_pronto(&mut f, SESSAO_A, t);
+    a.pedir(r#"{"gama":10,"nitidez":-10,"contraluz":false}"#, t).unwrap();
+    a.restaurar(t).unwrap();
+    a.pedir(r#"{"saturacao":40}"#, t).unwrap();
+    let mut travado = f.ajuste().clone();
+    travado.insert("exposicao".into(), json!("auto"));
+    travado.insert("travaExposicao".into(), json!(true));
+    let caps: Objeto = serde_json::from_str(&caps_android_com_imagem()).unwrap();
+    let parcial: Objeto = serde_json::from_str(r#"{"contraste":5,"gama":-5}"#).unwrap();
+    assert!(conferir_coerencia(&caps, &travado, &parcial).is_ok());
+}
+
+/// O ausente vale 0: a casca que passa a gravar o 0 explícito não sobe a versão, e o pedido de 0
+/// contra o registro sem a chave só ganha recibo. A contraluz é a exceção: ausente é o padrão da
+/// câmera, e `false` é "desligada".
+#[test]
+fn imagem_ausente_vale_zero_e_contraluz_ausente_nao_e_falso() {
+    let t = Instant::now();
+    let mut f = filmador_com_imagem();
+    let antes = f.versao();
+    let mut reg = f.ajuste().clone();
+    for campo in AJUSTES_DE_IMAGEM {
+        assert!(!reg.contains_key(campo));
+        reg.insert(campo.into(), json!(0));
+    }
+    reg.insert("nitidez".into(), Value::Null);
+    reg.insert("gama".into(), json!(0.0));
+    f.definir_ajuste(&Value::Object(reg.clone()).to_string(), 0, t).unwrap();
+    assert_eq!(f.versao(), antes, "0, 0.0 e null = ausente");
+    reg.insert(CONTRALUZ.into(), json!(false));
+    f.definir_ajuste(&Value::Object(reg.clone()).to_string(), 0, t).unwrap();
+    assert_eq!(f.versao(), antes + 1, "contraluz false ≠ ausente");
+
+    let mut f = filmador_com_imagem();
+    let mut a = receptor_pronto(&mut f, SESSAO_A, t);
+    let antes = f.versao();
+    a.pedir(r#"{"gama":0,"saturacao":0}"#, t).unwrap();
+    trocar(&mut f, SESSAO_A, &mut a, t);
+    assert!(f.proximo_pedido(t).is_none());
+    assert_eq!(f.versao(), antes);
+}
+
+/// O filmador sem os campos novos (de antes de 13/10): o receptor recusa na hora.
+#[test]
+fn imagem_sem_a_capacidade_e_campo_desconhecido() {
+    let t = Instant::now();
+    let mut f = filmador_com_camera(t);
+    let mut a = receptor_pronto(&mut f, SESSAO_A, t);
+    for campo in AJUSTES_DE_IMAGEM {
+        assert!(a.pedir(&json!({campo: 10}).to_string(), t).is_err());
+    }
+    assert!(a.pedir(r#"{"contraluz":true}"#, t).is_err());
+}
+
+/// A forma dos descritores de imagem é conferida ao publicar as capacidades.
+#[test]
+fn os_descritores_de_imagem_tem_a_forma_do_contrato() {
+    let com = |campo: &str, d: Value| {
+        let mut c = v(&caps_android());
+        c["controles"][campo] = d;
+        NucleoDoFilmador::novo().definir_camera(Some((&c.to_string(), &ajuste_padrao()))).is_ok()
+    };
+    assert!(com("gama", json!({"min": -100, "max": 100, "passo": 1, "origem": "camera"})));
+    assert!(com("gama", json!({"min": -100, "max": 100})), "a origem é opcional");
+    assert!(com("nitidez", json!({"min": 0, "max": 100, "origem": "quall"})), "uma faixa menor, com o 0 dentro");
+    assert!(!com("gama", json!({"min": -200, "max": 200})), "a unidade do driver não vai no fio");
+    assert!(!com("contraste", json!({"min": 10, "max": 100})), "sem o neutro");
+    assert!(!com("saturacao", json!({"min": -100.5, "max": 100})));
+    assert!(!com("saturacao", json!({"min": -100, "max": 100, "origem": "driver"})));
+    assert!(!com("saturacao", json!({"min": -100, "max": 100, "origem": 0})));
+    assert!(!com("nitidez", json!({})), "sim/não não é ajuste de imagem");
+    assert!(!com("gama", json!({"valores": ["auto"]})));
+    assert!(com(CONTRALUZ, json!({})));
+    assert!(com(CONTRALUZ, json!({"min": 0, "max": 3, "origem": "camera"})));
+    assert!(!com(CONTRALUZ, json!({"min": -1, "max": 3})));
+    assert!(!com(CONTRALUZ, json!({"min": 0, "max": 2.5})));
+    assert!(!com(CONTRALUZ, json!({"valores": ["sim", "nao"]})));
+}
+
+/// A contraluz em níveis do driver: inteiro na faixa; sim/não não serve.
+#[test]
+fn contraluz_em_niveis() {
+    let t = Instant::now();
+    let mut c = v(&caps_android());
+    c["controles"][CONTRALUZ] = json!({"min": 0, "max": 3, "origem": "camera"});
+    let mut f = NucleoDoFilmador::novo();
+    f.permitir(true);
+    f.definir_camera(Some((&c.to_string(), &ajuste_padrao()))).unwrap();
+    let mut a = receptor_pronto(&mut f, SESSAO_A, t);
+    a.pedir(r#"{"contraluz":2}"#, t).unwrap();
+    assert!(a.pedir(r#"{"contraluz":1.5}"#, t).is_err());
+    assert!(a.pedir(r#"{"contraluz":4}"#, t).is_err());
+    assert!(a.pedir(r#"{"contraluz":true}"#, t).is_err());
+}
+
+/// O estado com o registro cheio (os 20 campos) ainda cabe num pedaço SCTP; as capacidades
+/// completas do Android, com a imagem e a contraluz, também.
+#[test]
+fn com_a_imagem_o_estado_ainda_cabe() {
+    let t = Instant::now();
+    let mut f = filmador_com_imagem();
+    let cheio = json!({"exposicao": "manual", "ev": -0.7, "travaExposicao": false, "travaIso": 400,
+        "travaObturadorNs": 16666666, "iso": 1600, "obturadorNs": 8333333, "antiCintilacao": "60",
+        "balanco": "kelvin", "kelvin": 5600, "travaBalanco": false,
+        "travaGanhos": [1.9921875, 1.0, 1.0, 2.34375], "foco": "manual", "focoPosicao": 0.37,
+        "travarFps": true, "gama": -100, "contraste": -100, "saturacao": -100, "nitidez": -100,
+        "contraluz": true});
+    f.definir_ajuste(&cheio.to_string(), 0, t).unwrap();
+    f.definir_lido(r#"{"iso":1600,"obturadorNs":8333333,"kelvin":5550,"abertura":1.7,"focoPosicao":0.37,"divergentes":["kelvin"]}"#).unwrap();
+    f.receber(SESSAO_A, Some(&par("Um nome de aparelho bem comprido, com acento ção")), &mensagem("ola", Objeto::new()), t);
+    let saida = f.devidas(SESSAO_A, t);
+    for (d, m) in &saida {
+        eprintln!("{d:?}: {} bytes", m.len());
+        // 13/10: as capacidades mediram 1.022 bytes e o estado 655.
+        assert!(m.len() <= ALVO_DA_MENSAGEM, "{d:?} tem {} bytes: {m}", m.len());
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// O zoom (R9 §3.8, 13/10)
+// ---------------------------------------------------------------------------------------------
+
+/// O descritor de zoom de um S24 Ultra (a câmera lógica traseira): 0,6× a 100×, quatro lentes.
+fn descritor_do_zoom_s24() -> Value {
+    json!({"min": 0.6, "max": 100, "passo": 0.1, "paradas": [0.6, 1, 3, 5, 10],
+           "opticas": [0.6, 1, 3, 5], "origem": "camera"})
+}
+
+fn filmador_com_zoom() -> NucleoDoFilmador {
+    let mut c = v(&caps_android_com_imagem());
+    c["controles"][ZOOM] = descritor_do_zoom_s24();
+    let mut f = NucleoDoFilmador::novo();
+    f.permitir(true);
+    f.definir_camera(Some((&c.to_string(), &ajuste_padrao()))).unwrap();
+    f
+}
+
+/// O zoom vai e volta, em qualquer exposição, e vence o último como os outros campos.
+#[test]
+fn o_zoom_vai_e_volta_em_qualquer_exposicao() {
+    let t = Instant::now();
+    let mut f = filmador_com_zoom();
+    let mut reg = f.ajuste().clone();
+    reg.insert("exposicao".into(), json!("manual"));
+    reg.insert("iso".into(), json!(400));
+    reg.insert("obturadorNs".into(), json!(16_666_666));
+    f.definir_ajuste(&Value::Object(reg).to_string(), 0, t).unwrap();
+    let mut a = receptor_pronto(&mut f, SESSAO_A, t);
+    a.pedir(r#"{"zoom":3}"#, t).unwrap();
+    trocar(&mut f, SESSAO_A, &mut a, t);
+    let aplicados = aplicar_como_a_casca(&mut f, t);
+    assert_eq!(aplicados.len(), 1);
+    assert_eq!(aplicados[0]["ajuste"], json!({"zoom": 3}));
+    assert_eq!(serde_json::to_string(&f.ajuste()["zoom"]).unwrap(), "3", "inteiro sem .0");
+    let t2 = t + BATIMENTO;
+    trocar(&mut f, SESSAO_A, &mut a, t2);
+    assert_eq!(a.aplicado().unwrap()["zoom"], json!(3));
+
+    // Fracionário vale (o zoom não é inteiro), dentro da faixa.
+    a.pedir(r#"{"zoom":0.6}"#, t2).unwrap();
+    a.pedir(r#"{"zoom":2.35}"#, t2).unwrap();
+    for ruim in [r#"{"zoom":0.5}"#, r#"{"zoom":100.5}"#, r#"{"zoom":"3"}"#, r#"{"zoom":true}"#, r#"{"zoom":null}"#] {
+        assert!(a.pedir(ruim, t2).is_err(), "{ruim} passou no receptor");
+    }
+    // O filmador também recusa o pedido cru fora da faixa.
+    f.receber(SESSAO_A, Some(&par("rx")), &pedido_cru(&f, 50, json!({"ajuste": {"zoom": 0.1}})), t2);
+    assert!(f.proximo_pedido(t2).is_none());
+    assert_eq!(motivo_da_recusa(&mut f, t2).0, motivo::FORA_DA_FAIXA);
+
+    // Vence o último: quem não viu a mudança perde.
+    let vista_velha = f.versao() - 1;
+    f.receber(SESSAO_B, Some(&par("B")), &pedido_cru(&f, 51, json!({"vista": vista_velha, "ajuste": {"zoom": 5}})), t2);
+    assert!(f.proximo_pedido(t2).is_none(), "quem não viu o 3× não vence");
+    f.receber(SESSAO_B, Some(&par("B")), &pedido_cru(&f, 52, json!({"vista": f.versao(), "ajuste": {"zoom": 5}})), t2);
+    assert_eq!(aplicar_como_a_casca(&mut f, t2).len(), 1);
+    assert_eq!(f.ajuste()["zoom"], json!(5));
+}
+
+/// O ausente vale 1: a casca que passa a gravar `"zoom":1` (ou `1.0`, ou `null`) não sobe a versão,
+/// e o pedido de 1× contra o registro sem a chave só ganha recibo.
+#[test]
+fn zoom_ausente_vale_um() {
+    let t = Instant::now();
+    let mut f = filmador_com_zoom();
+    let antes = f.versao();
+    for um in [json!(1), json!(1.0), Value::Null] {
+        let mut reg = f.ajuste().clone();
+        reg.insert(ZOOM.into(), um);
+        f.definir_ajuste(&Value::Object(reg).to_string(), 0, t).unwrap();
+        assert_eq!(f.versao(), antes, "1, 1.0 e null = ausente");
+    }
+    let mut a = receptor_pronto(&mut f, SESSAO_A, t);
+    let antes = f.versao();
+    a.pedir(r#"{"zoom":1.0}"#, t).unwrap();
+    trocar(&mut f, SESSAO_A, &mut a, t);
+    assert!(f.proximo_pedido(t).is_none());
+    assert_eq!(f.versao(), antes);
+}
+
+/// **O gesto contínuo não inunda o canal.** Uma pinça a 60 Hz por 1 s no receptor (60 `pedir`)
+/// sai em no máximo 15 pedidos por segundo, o filmador entrega à casca só o que juntou, e o último
+/// vale.
+#[test]
+fn a_pinca_continua_sai_a_15_por_segundo_e_o_ultimo_vale() {
+    let t0 = Instant::now();
+    let mut f = filmador_com_zoom();
+    let mut a = receptor_pronto(&mut f, SESSAO_A, t0);
+    let mut enviados = 0;
+    let mut na_casca = 0;
+    let mut ultimo = 0.0;
+    for i in 0..60u32 {
+        let agora = t0 + Duration::from_millis(u64::from(i) * 1000 / 60);
+        ultimo = 1.0 + f64::from(i) * 0.05;
+        a.pedir(&json!({"zoom": ultimo}).to_string(), agora).unwrap();
+        for texto in a.devidas(agora) {
+            enviados += usize::from(texto.contains("\"tipo\":\"pedido\""));
+            f.receber(SESSAO_A, Some(&par("rx")), &texto, agora);
+        }
+        na_casca += aplicar_como_a_casca(&mut f, agora).len();
+        for (_, texto) in f.devidas(SESSAO_A, agora) {
+            a.receber(&texto, agora);
+        }
+    }
+    // O fim do gesto: o último ainda pendente sai no envio seguinte.
+    for passo in 1..=4u32 {
+        let agora = t0 + Duration::from_secs(1) + INTERVALO_DOS_PEDIDOS * passo;
+        trocar(&mut f, SESSAO_A, &mut a, agora);
+        na_casca += aplicar_como_a_casca(&mut f, agora).len();
+    }
+    assert!(enviados <= 16, "{enviados} pedidos num segundo de pinça");
+    assert!(na_casca <= 17, "{na_casca} aplicações na casca");
+    let aplicado = f.ajuste()["zoom"].as_f64().unwrap();
+    assert!((aplicado - ultimo).abs() < 1e-9, "{aplicado} ≠ {ultimo}");
+    trocar(&mut f, SESSAO_A, &mut a, t0 + Duration::from_secs(3));
+    assert!((a.aplicado().unwrap()["zoom"].as_f64().unwrap() - ultimo).abs() < 1e-9);
+}
+
+/// A forma do descritor de zoom é conferida ao publicar as capacidades.
+#[test]
+fn o_descritor_do_zoom_tem_a_forma_do_contrato() {
+    let com = |d: Value| {
+        let mut c = v(&caps_android());
+        c["controles"][ZOOM] = d;
+        NucleoDoFilmador::novo().definir_camera(Some((&c.to_string(), &ajuste_padrao()))).is_ok()
+    };
+    assert!(com(descritor_do_zoom_s24()));
+    assert!(com(json!({"min": 1, "max": 4})), "as dicas são opcionais");
+    assert!(com(json!({"min": 1, "max": 4, "origem": "quall", "paradas": [1, 2, 4], "opticas": []})));
+    assert!(com(json!({"min": 2, "max": 2})), "uma câmera de zoom fixo, fora do 1×");
+    assert!(!com(json!({"min": 0, "max": 10})), "fator 0 não existe");
+    assert!(!com(json!({"min": -1, "max": 10})));
+    assert!(!com(json!({"min": 1, "max": 5000})));
+    assert!(!com(json!({"min": 1, "max": 10, "paradas": [0.5, 1]})), "parada abaixo do min");
+    assert!(!com(json!({"min": 1, "max": 10, "opticas": [1, 12]})), "óptica acima do max");
+    assert!(!com(json!({"min": 1, "max": 10, "paradas": "1,2"})));
+    assert!(!com(json!({"min": 1, "max": 10, "paradas": [1, "3"]})));
+    assert!(!com(json!({"min": 1, "max": 10, "paradas": vec![1; 13]})));
+    assert!(!com(json!({"min": 1, "max": 10, "passo": 0})));
+    assert!(!com(json!({"min": 1, "max": 10, "origem": "driver"})));
+    assert!(!com(json!({})), "sim/não não é zoom");
+    assert!(!com(json!({"valores": ["1", "2"]})));
+}
+
+/// Sem o zoom nas capacidades (o filmador de antes, ou a câmera sem zoom): o receptor recusa na hora.
+#[test]
+fn zoom_sem_a_capacidade_e_campo_desconhecido() {
+    let t = Instant::now();
+    let mut f = filmador_com_camera(t);
+    let mut a = receptor_pronto(&mut f, SESSAO_A, t);
+    assert!(a.pedir(r#"{"zoom":2}"#, t).is_err());
+}
+
+/// O registro cheio com o zoom ainda cabe num pedaço SCTP; as capacidades completas de um S24 (com a
+/// imagem, a contraluz e o zoom) passam do alvo só um pouco (o batimento repara, contrato §8).
+#[test]
+fn com_o_zoom_o_estado_ainda_cabe() {
+    let t = Instant::now();
+    let mut f = filmador_com_zoom();
+    let cheio = json!({"exposicao": "manual", "ev": -0.7, "travaExposicao": false, "travaIso": 400,
+        "travaObturadorNs": 16666666, "iso": 1600, "obturadorNs": 8333333, "antiCintilacao": "60",
+        "balanco": "kelvin", "kelvin": 5600, "travaBalanco": false,
+        "travaGanhos": [1.9921875, 1.0, 1.0, 2.34375], "foco": "manual", "focoPosicao": 0.37,
+        "travarFps": true, "gama": -100, "contraste": -100, "saturacao": -100, "nitidez": -100,
+        "contraluz": true, "zoom": 12.3});
+    f.definir_ajuste(&cheio.to_string(), 0, t).unwrap();
+    f.definir_lido(r#"{"iso":1600,"obturadorNs":8333333,"kelvin":5550,"abertura":1.7,"focoPosicao":0.37,"zoom":12.3,"divergentes":["kelvin"]}"#).unwrap();
+    f.receber(SESSAO_A, Some(&par("Um nome de aparelho bem comprido, com acento ção")), &mensagem("ola", Objeto::new()), t);
+    for (d, m) in f.devidas(SESSAO_A, t) {
+        eprintln!("{d:?}: {} bytes", m.len());
+        match d {
+            Devida::Estado => assert!(m.len() <= ALVO_DA_MENSAGEM, "o estado tem {} bytes: {m}", m.len()),
+            _ => assert!(m.len() <= ALVO_DA_MENSAGEM + 160, "{d:?} tem {} bytes: {m}", m.len()),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// §17: R9b pelo canal do teleprompter (13/10)
+// ---------------------------------------------------------------------------------------------
+
+/// §17.4: num canal confiável o pedido se reenvia a cada segundo, e não a cada 250 ms; o prazo de
+/// desistir continua o mesmo. Uma sessão nova esquece a entrega.
+#[test]
+fn no_canal_confiavel_o_pedido_se_reenvia_a_cada_segundo() {
+    let t = Instant::now();
+    let mut f = filmador_com_camera(t);
+    let mut r = receptor_pronto(&mut f, SESSAO_A, t);
+    assert_eq!(r.entrega_confiavel(), None);
+    r.definir_entrega_confiavel(true);
+    r.pedir(r#"{"ev":1.0}"#, t).unwrap();
+    assert_eq!(r.devidas(t).len(), 1, "o pedido sai na hora");
+    assert!(r.devidas(t + REENVIO_DO_PEDIDO).is_empty(), "confiável, não reenvia aos 250 ms");
+    assert_eq!(r.devidas(t + REENVIO_DO_PEDIDO_CONFIAVEL).len(), 1, "reenvia em 1 s");
+    let depois = t + PRAZO_DO_PEDIDO;
+    for (_, m) in f.devidas(SESSAO_A, depois) {
+        r.receber(&m, depois);
+    }
+    let _ = r.devidas(depois);
+    assert_eq!(v(&r.estado_json(depois))["recusa"]["motivo"], "sem_resposta", "o prazo não muda");
+    r.comecar_sessao(SESSAO_B, depois);
+    assert_eq!(r.entrega_confiavel(), None, "a entrega é da sessão");
+}
+
+/// **Uma sessão de teleprompter de verdade** (§17.7): o prompter hospeda com o papel `teleprompter`
+/// (o canal `ReliableUnordered`), o controle conecta com `controle_remoto`, as duas réplicas do
+/// teleprompter bombeiam os mensageiros comuns, e o filmador e o controlador bombeiam os da câmera
+/// (`Mensageiro::da_camera`). O controle só bombeia a câmera depois de ver `par_entende_camera`. O
+/// pedido volta aplicado com autor, o teleprompter segue convergindo, e nenhuma bombeada do
+/// teleprompter vê mensagem da câmera.
+#[test]
+fn pela_sessao_do_teleprompter_de_verdade() {
+    use crate::cancel::Cancelamento;
+    use crate::pairing::{PairedPeers, Pin};
+    use crate::protocol::{Announcement, Capabilities, DeviceId, Papel, PROTOCOL_VERSION};
+    use crate::session::{conectar, hospedar, SessionConfig};
+    use crate::signaling::SignalingServer;
+    use crate::teleprompter::Teleprompter;
+    use crate::transport::{Delivery, TransportConfig};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let anuncio = |id: &str, papel: Papel| Announcement {
+        protocol_version: PROTOCOL_VERSION,
+        device_id: DeviceId(id.into()),
+        display_name: format!("{id} nome"),
+        capabilities: Capabilities { screen_source: false, camera_source: false, sink: false },
+        screen: None,
+        papel: Some(papel),
+    };
+    let config = |a: Announcement, pin: &Pin| SessionConfig {
+        announcement: a,
+        pin: Some(pin.clone()),
+        known: PairedPeers::new(),
+        transport: TransportConfig::default(),
+        tracks: Vec::new(),
+        timeout: Duration::from_secs(30),
+        cancelamento: Cancelamento::novo(),
+        silencio_do_caminho: None,
+    };
+    let pin = Pin::parse("535353").expect("pin");
+    let servidor = SignalingServer::bind(0).expect("bind");
+    let porta = servidor.port().expect("porta");
+    let p = pin.clone();
+    let lado_p =
+        std::thread::spawn(move || hospedar(&servidor, config(anuncio("prompter-e2e", Papel::Teleprompter), &p)));
+    let destino = format!("127.0.0.1:{porta}").parse().expect("endereço");
+    let sessao_c = conectar(destino, config(anuncio("controle-e2e", Papel::ControleRemoto), &pin)).expect("controle");
+    let sessao_p = lado_p.join().expect("thread").expect("prompter");
+    assert_eq!(sessao_p.session.entrega_do_canal(), Some(Delivery::ReliableUnordered));
+
+    let tp_p = Arc::new(Teleprompter::nova("prompter-e2e", Papel::Teleprompter).unwrap());
+    let tp_c = Arc::new(Teleprompter::nova("controle-e2e", Papel::ControleRemoto).unwrap());
+    tp_p.ligar_camera(true).unwrap();
+    // No controle, ligar a câmera não muda nada.
+    tp_c.ligar_camera(true).unwrap();
+    let filmador = Arc::new(Filmador::novo());
+    filmador.permitir(true).unwrap();
+    filmador.definir_camera(Some((&caps_android(), &ajuste_padrao()))).unwrap();
+    let controle = Arc::new(Controlador::novo());
+    let parar = Arc::new(AtomicBool::new(false));
+    let mut threads = Vec::new();
+    // O prompter: o teleprompter e a câmera no mesmo laço da sessão, como as cascas.
+    {
+        let (tp, f, parar) = (Arc::clone(&tp_p), Arc::clone(&filmador), Arc::clone(&parar));
+        let m = sessao_p.session.mensageiro();
+        let mc = m.da_camera();
+        threads.push(std::thread::spawn(move || {
+            while !parar.load(Ordering::Relaxed) {
+                let a = tp.bombear(&m, Duration::from_millis(30)).unwrap();
+                let b = f.bombear(&mc, Duration::ZERO).unwrap();
+                if a.fechada || b.fechada {
+                    break;
+                }
+            }
+        }));
+    }
+    // O controle: a câmera só com `par_entende_camera`.
+    {
+        let (tp, c, parar) = (Arc::clone(&tp_c), Arc::clone(&controle), Arc::clone(&parar));
+        let m = sessao_c.session.mensageiro();
+        let mc = m.da_camera();
+        threads.push(std::thread::spawn(move || {
+            while !parar.load(Ordering::Relaxed) {
+                let a = tp.bombear(&m, Duration::from_millis(30)).unwrap();
+                if a.fechada {
+                    break;
+                }
+                if tp.estado().unwrap().par_entende_camera && c.bombear(&mc, Duration::ZERO).unwrap().fechada {
+                    break;
+                }
+            }
+        }));
+    }
+    {
+        let (f, parar) = (Arc::clone(&filmador), Arc::clone(&parar));
+        threads.push(std::thread::spawn(move || {
+            let mut reg: Objeto = serde_json::from_str(&ajuste_padrao()).unwrap();
+            while !parar.load(Ordering::Relaxed) {
+                while let Some(p) = f.proximo_pedido().unwrap() {
+                    let p = v(&p);
+                    for (k, x) in p["ajuste"].as_object().unwrap() {
+                        reg.insert(k.clone(), x.clone());
+                    }
+                    f.definir_ajuste(&Value::Object(reg.clone()).to_string(), p["n"].as_u64().unwrap()).unwrap();
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }));
+    }
+    let esperar = |cond: &dyn Fn(&Value) -> bool| {
+        let fim = Instant::now() + Duration::from_secs(10);
+        loop {
+            let e = v(&controle.estado_json().unwrap());
+            if cond(&e) || Instant::now() > fim {
+                return e;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let e = esperar(&|e| e["situacao"] == "pronto");
+    assert_eq!(e["situacao"], "pronto", "{e}");
+    assert!(tp_c.estado().unwrap().par_entende_camera, "o controle viu que o prompter tem a câmera");
+    assert!(!tp_p.estado().unwrap().par_entende_camera, "o controle nunca diz que tem a câmera");
+    tp_c.definir_velocidade(2.5).unwrap();
+    controle.pedir(r#"{"balanco":"kelvin","kelvin":5600}"#).unwrap();
+    let e = esperar(&|e| e["aplicado"]["kelvin"] == 5600 && e["pendente"] == json!({}));
+    assert_eq!(e["aplicado"]["kelvin"], 5600, "{e}");
+    assert_eq!(e["autor"], "controle-e2e nome");
+    let ef = v(&filmador.estado_json().unwrap());
+    assert_eq!(ef["controlado_por"]["nome"], "controle-e2e nome", "{ef}");
+    // O teleprompter segue: a velocidade chega ao prompter.
+    let fim = Instant::now() + Duration::from_secs(5);
+    while tp_p.estado().unwrap().velocidade != 2.5 && Instant::now() < fim {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(tp_p.estado().unwrap().velocidade, 2.5, "o teleprompter não convergiu");
+    // A mudança local do prompter também vale, e chega ao controle (vence o último).
+    let mut local: Objeto = serde_json::from_str(&ajuste_padrao()).unwrap();
+    local.insert("balanco".into(), json!("kelvin"));
+    local.insert("kelvin".into(), json!(4000));
+    filmador.definir_ajuste(&Value::Object(local).to_string(), 0).unwrap();
+    let e = esperar(&|e| e["aplicado"]["kelvin"] == 4000);
+    assert_eq!(e["aplicado"]["kelvin"], 4000, "{e}");
+    assert_eq!(e["autor"], Value::Null, "a mudança foi do próprio prompter");
+    // Nenhuma bombeada do teleprompter viu mensagem da câmera.
+    assert_eq!(tp_p.estado().unwrap().contadores.de_outro_app, 0, "a câmera vazou para o teleprompter do prompter");
+    assert_eq!(tp_c.estado().unwrap().contadores.de_outro_app, 0, "a câmera vazou para o teleprompter do controle");
+
+    // O prompter desliga a câmera: o controle vê `par_entende_camera` cair.
+    tp_p.ligar_camera(false).unwrap();
+    let fim = Instant::now() + Duration::from_secs(5);
+    while tp_c.estado().unwrap().par_entende_camera && Instant::now() < fim {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!tp_c.estado().unwrap().par_entende_camera);
+
+    parar.store(true, Ordering::Relaxed);
+    for t in threads {
+        let _ = t.join();
+    }
+    drop(sessao_c);
+    drop(sessao_p);
 }

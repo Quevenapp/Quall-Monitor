@@ -27,11 +27,12 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use quall_core::cancel::Cancelamento;
+use quall_core::confirmacao::ConfirmacaoPorCodigo;
 use quall_core::discovery::{anuncio, Advertiser};
 use quall_core::error::Error;
 use quall_core::pairing::{PairedPeers, Pin};
 use quall_core::protocol::Capabilities;
-use quall_core::session::{hospedar, SessionConfig};
+use quall_core::session::{hospedar_com_codigo, SessionConfig};
 use quall_core::signaling::SignalingServer;
 use quall_core::track::{TrackConfig, TrackKind};
 use quall_core::transport::TransportConfig;
@@ -116,6 +117,8 @@ pub struct Estado {
     pub anunciando_por_mdns: bool,
     /// Public ephemeral discovery label and the port it actually advertises (protocol v3).
     pub rotulo_da_descoberta: Option<(u16, String)>,
+    /// O nome (`nm`) com que o anúncio subiu, o que os outros veem na lista (§8.7.1); vazio sem nome.
+    pub nome_da_descoberta: String,
     pub resumo: String,
     /// Corrida de bancada pediu para o processo sair.
     pub sair: bool,
@@ -135,6 +138,14 @@ pub struct Estado {
     pub rotulo_gravar: String,
     /// "● GRAVANDO 1:23 · sobram 12,3 GB · Gravando SEM SOM — ligue o microfone", ou o recado.
     pub linha_da_gravacao: String,
+    /// **O cartão do código de 4 dígitos** (`docs/v3-no-privado.md` §3.6): alguém tocou Conectar, e os
+    /// três números estão na tela esperando a escolha (ou o "Nenhum destes"). Vale na espera do
+    /// primeiro aparelho e na espera aberta para mais um (até oito). Escrito por
+    /// [`Emissor::olhar_o_codigo`].
+    pub codigo: Option<crate::conexao::CartaoDoCodigo>,
+    /// Por que o último código não fechou (a chave em português, `conexao::aviso_do_anfitriao`),
+    /// enquanto outra tentativa não começa. A espera continua: só o cartão sai.
+    pub aviso_do_codigo: String,
 }
 
 /// Uma linha da lista de receptores.
@@ -204,6 +215,16 @@ pub struct Emissor {
     /// **Pouca luz** (§3.1): o automático da câmera comum baixou o fps para clarear. Escrito pela
     /// thread da câmera comum, do painel dos ajustes, como o "Controlado por".
     pouca_luz: Mutex<Option<crate::regras_dos_controles::PoucaLuz>>,
+    /// **O confirmador do código da espera aberta** (`docs/conexao.md` §4): o da sessão de uma tela
+    /// só (`correr_sessao`) ou o da espera do coordenador de várias sessões (`varias.rs`, uma espera
+    /// por vez: a do primeiro aparelho ou a de mais um). A janela o lê por [`Emissor::olhar_o_codigo`]
+    /// e decide por [`Emissor::escolher_codigo`] e [`Emissor::recusar_codigo`]. `None` fora da espera.
+    /// Leva a identidade (`DaEspera::id`): o toque só vale no confirmador que produziu o cartão.
+    confirmacao: Mutex<Option<crate::conexao::DaEspera<ConfirmacaoPorCodigo>>>,
+    /// **Os confirmadores das esperas de uma sessão só**, pelo PIN: o mesmo PIN (o `--pin` da bancada)
+    /// continua com o mesmo confirmador, e o P11 e o limite de três não zeram. O coordenador guarda
+    /// os dele.
+    esperas_do_codigo: Mutex<crate::conexao::EsperasDoCodigo<ConfirmacaoPorCodigo>>,
 }
 
 impl Emissor {
@@ -253,6 +274,7 @@ impl Emissor {
                 oferece_desparear: false,
                 anunciando_por_mdns: false,
                 rotulo_da_descoberta: None,
+                nome_da_descoberta: String::new(),
                 resumo: String::new(),
                 sair: false,
                 receptores: Vec::new(),
@@ -262,6 +284,8 @@ impl Emissor {
                 gravando: false,
                 rotulo_gravar: String::new(),
                 linha_da_gravacao: String::new(),
+                codigo: None,
+                aviso_do_codigo: String::new(),
             }),
             cancelamento: Mutex::new(None),
             parar: AtomicBool::new(false),
@@ -278,7 +302,92 @@ impl Emissor {
             ajustes_disponiveis: AtomicBool::new(false),
             controlada_por: Mutex::new(None),
             pouca_luz: Mutex::new(None),
+            confirmacao: Mutex::new(None),
+            esperas_do_codigo: Mutex::new(Default::default()),
         })
+    }
+
+    // MARK: - o código de 4 dígitos (`docs/conexao.md` §4)
+
+    /// Troca o confirmador da espera aberta. Do caminho de uma sessão só e do coordenador.
+    pub(crate) fn trocar_confirmacao(&self, c: Option<crate::conexao::DaEspera<ConfirmacaoPorCodigo>>) {
+        *self.confirmacao.lock().unwrap_or_else(|e| e.into_inner()) = c;
+    }
+
+    /// Solta o confirmador só se ele ainda for `id` (o coordenador: a espera que acabou pode já ter
+    /// sido trocada por outra).
+    pub(crate) fn soltar_confirmacao(&self, id: u64) {
+        let mut c = self.confirmacao.lock().unwrap_or_else(|e| e.into_inner());
+        if c.as_ref().is_some_and(|d| d.id == id) {
+            *c = None;
+        }
+    }
+
+    fn confirmacao(&self) -> Option<crate::conexao::DaEspera<ConfirmacaoPorCodigo>> {
+        self.confirmacao.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// **Lê o confirmador e publica o cartão** (e a frase da tentativa que não fechou). Chamado do
+    /// relógio da janela, a cada pulso: o confirmador é um `Arc` com um cadeado, ler custa nada, e a
+    /// versão só sobe quando o cartão ou a frase mudam. Vale na espera do primeiro aparelho e na
+    /// espera de mais um, com outros já no ar (o Monitor estende para até oito).
+    pub fn olhar_o_codigo(&self) {
+        let atual = self.confirmacao();
+        let leitura = atual.as_ref().map(|d| crate::conexao::ler(&d.c));
+        let cartao = leitura.as_ref().and_then(crate::conexao::cartao).zip(atual.as_ref()).map(|(c, d)| c.da_espera(d.id));
+        let aviso = leitura.as_ref().and_then(crate::conexao::aviso_do_anfitriao).unwrap_or_default();
+        let mut e = self.estado();
+        let esperando = e.fase == Fase::Esperando || (e.fase == Fase::Transmitindo && e.esperando_mais_um);
+        if !esperando {
+            if e.codigo.is_some() || !e.aviso_do_codigo.is_empty() {
+                e.codigo = None;
+                e.aviso_do_codigo.clear();
+                e.mudou();
+            }
+            return;
+        }
+        if e.codigo != cartao || e.aviso_do_codigo != aviso {
+            if let (Some(c), None) = (&cartao, &e.codigo) {
+                registro::linha(format!("código: na tela (tentativa {}), esperando a pessoa", c.tentativa));
+            }
+            if !aviso.is_empty() && aviso != e.aviso_do_codigo {
+                registro::linha(format!("código: a tentativa não fechou — {aviso}"));
+            }
+            e.codigo = cartao;
+            e.aviso_do_codigo = aviso.to_string();
+            e.mudou();
+        }
+    }
+
+    /// **A escolha de um dos três números**, no cartão da tentativa `tentativa` (a do cartão desenhado,
+    /// M2). O certo confirma; um falso recusa e desliga o código desta espera (P11) — o PIN continua.
+    /// O diário não diz qual número era o certo, só se a escolha valeu. `espera`: o confirmador que
+    /// produziu o cartão (`CartaoDoCodigo::espera`); outro, e o toque é ignorado.
+    pub fn escolher_codigo(&self, espera: u64, tentativa: u32, indice: usize) {
+        let Some(d) = self.confirmacao().filter(|d| d.id == espera) else {
+            registro::linha("código: escolha ignorada — o cartão era de outra espera");
+            return;
+        };
+        let c = d.c;
+        let valeu = c.escolher(tentativa, indice);
+        let errou = valeu && c.retrato().escolha_errada;
+        registro::linha(format!(
+            "código: escolha {} de 3 (tentativa {tentativa}){}",
+            indice + 1,
+            match (valeu, errou) {
+                (false, _) => " — ignorada: a tentativa já mudou",
+                (true, true) => " — errada: o código desta espera acabou, o PIN continua",
+                (true, false) => " — certa",
+            }
+        ));
+        self.olhar_o_codigo();
+    }
+
+    /// **"Nenhum destes"**, no cartão da tentativa `tentativa`: recusa.
+    pub fn recusar_codigo(&self, espera: u64, tentativa: u32) {
+        let valeu = self.confirmacao().filter(|d| d.id == espera).is_some_and(|d| d.c.recusar(tentativa));
+        registro::linha(format!("código: nenhum destes (tentativa {tentativa}){}", if valeu { "" } else { " — ignorado: a tentativa já mudou" }));
+        self.olhar_o_codigo();
     }
 
     /// **O botão do microfone da câmera comum** (`docs/audio.md` §8.2; `teleprompter-com-camera.md`
@@ -800,11 +909,19 @@ impl Emissor {
         // sessão subir, este computador só apareceria na lista dos outros **depois** de já ter
         // recebido a conexão. Falhar aqui é esperado em rede com multicast bloqueado e não é erro
         // de produto — o endereço continua na tela e continua funcionando.
-        let anunciante = if so_local { None } else { Advertiser::start(&eu_anuncio, porta).ok() };
+        // **O código de 4 dígitos** (`docs/v3-no-privado.md` §3): um confirmador por PIN (as três
+        // trocas e o fim do código depois de uma escolha errada, P11, contam nele, e não zeram numa
+        // espera que volta com o mesmo PIN), e o anúncio diz `cc` — a janela tem o cartão dos três
+        // números. Nenhuma troca pelo código gasta o PIN.
+        let da_espera = self.esperas_do_codigo.lock().unwrap_or_else(|e| e.into_inner()).para_o_pin(&pin_texto, ConfirmacaoPorCodigo::nova);
+        let confirmacao = da_espera.c.clone();
+        self.trocar_confirmacao(Some(da_espera));
+        let anunciante = if so_local { None } else { Advertiser::start_com_codigo(&eu_anuncio, porta, true).ok() };
         {
             let mut e = self.estado();
             e.anunciando_por_mdns = anunciante.is_some();
             e.rotulo_da_descoberta = anunciante.as_ref().map(|a| (porta, a.discovery_label().to_string()));
+            e.nome_da_descoberta = anunciante.as_ref().and_then(|_| quall_core::discovery::nome_anunciado()).unwrap_or_default();
             e.mudou();
         }
         registro::linha(format!(
@@ -885,7 +1002,7 @@ impl Emissor {
         // cobrada por tentativa: numa rede em que o pareamento fecha mas o ICE nunca fecha, um
         // laço acumularia uma `Track` vazada por volta. A dívida 4 tem de ser paga antes de
         // qualquer casca tirar o teto de tentativas.
-        let resultado = hospedar(
+        let resultado = hospedar_com_codigo(
             &servidor,
             SessionConfig {
                 announcement: eu_anuncio,
@@ -904,7 +1021,11 @@ impl Emissor {
                 silencio_do_caminho: None,
                 cancelamento,
             },
+            Some(confirmacao),
         );
+        // A espera acabou, com par ou sem: o cartão do código sai.
+        self.trocar_confirmacao(None);
+        self.olhar_o_codigo();
 
         // Conectado ou não, paramos de anunciar. Continuar anunciando durante a transmissão
         // convidaria um terceiro aparelho para uma porta que já não aceita ninguém.
@@ -915,6 +1036,7 @@ impl Emissor {
             let mut e = self.estado();
             e.anunciando_por_mdns = false;
             e.rotulo_da_descoberta = None;
+            e.nome_da_descoberta.clear();
             e.mudou();
         }
 
@@ -932,6 +1054,8 @@ impl Emissor {
         let mut novos = PairedPeers::new();
         novos.insert(&pronto.outcome);
         identidade::guardar_pares(&novos);
+        // O nome local do par (§5.4), da sessão autenticada: a lista do Exibir o mostra no item dele.
+        identidade::guardar_nome_do_par(&pronto.peer.device_id.0, &pronto.peer.display_name);
 
         let nome_do_par = pronto.peer.display_name.clone();
         // `descartados` só é diferente de zero quando alguém conectou e sumiu no meio — o
@@ -1344,7 +1468,10 @@ impl Emissor {
         e.endereco = None;
         e.anunciando_por_mdns = false;
         e.rotulo_da_descoberta = None;
+        e.nome_da_descoberta.clear();
         e.porta_da_espera = None;
+        e.codigo = None;
+        e.aviso_do_codigo.clear();
         e.resumo.clear();
         e.ha_pares_conhecidos = identidade::ha_pares_conhecidos();
         self.aplicar_lista(&mut e, geracao, nova);

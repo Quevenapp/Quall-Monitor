@@ -96,6 +96,12 @@ public final class NucleoReceptor {
 
     public init() {}
 
+    /// Called on the UI thread before starting a new connection worker, after the previous
+    /// worker has ended. Reset here so a Stop between this call and conectar is still honored.
+    public func prepararConexao() {
+        travaDaParada.lock(); _parar = false; travaDaParada.unlock()
+    }
+
     // --- utilidade ---------------------------------------------------------------------------
 
     public static func ultimoErro() -> String {
@@ -130,6 +136,10 @@ public final class NucleoReceptor {
         // O "ocupado" do teleprompter (`docs/contrato-teleprompter.md` §2): um receptor de vídeo não
         // o recebe, mas sem o nome o registro mostraria `código 16`.
         case QUALL_STATUS_BUSY: return "BUSY"
+        // As recusas do vínculo do v3 (`docs/v3-no-privado.md` §8.3).
+        case QUALL_STATUS_INTERFERENCE: return "INTERFERENCE"
+        case QUALL_STATUS_PAIR_NOT_RECOGNIZED: return "PAIR_NOT_RECOGNIZED"
+        case QUALL_STATUS_ALREADY_PAIRED: return "ALREADY_PAIRED"
         default: return "código \(s.rawValue)"
         }
     }
@@ -160,18 +170,20 @@ public final class NucleoReceptor {
                          nome: String,
                          paresConhecidos: String?,
                          prazoMs: UInt32,
-                         tela: (largura: UInt32, altura: UInt32) = (0, 0)) -> Bool {
+                         tela: (largura: UInt32, altura: UInt32) = (0, 0),
+                         confirmacao: ConfirmacaoDeCodigo? = nil,
+                         alvo: String? = nil) -> Bool {
         let idC = guardar(deviceId)
         let nomeC = guardar(nome)
         let enderecoC = guardar(endereco)
         let pinC: UnsafeMutablePointer<CChar>? = pin.map { guardar($0) }
         let paresC: UnsafeMutablePointer<CChar>? = paresConhecidos.map { guardar($0) }
+        let alvoC: UnsafeMutablePointer<CChar>? = alvo.flatMap { $0.isEmpty ? nil : guardar($0) }
 
         let novoCancelador = quall_canceller_new()
         travaDoCancelador.lock()
         cancelador = novoCancelador
         travaDoCancelador.unlock()
-        // Stop may arrive before the session thread installs its canceller.
         if parou { quall_session_cancel(novoCancelador) }
 
         var opcoes = QuallSessionOptions(
@@ -199,8 +211,17 @@ public final class NucleoReceptor {
 
         // Fora de qualquer trava: a chamada bloqueia por dezenas de segundos e nada mais pode
         // ficar pendurado nela — inclusive o `parar()` da interface, que é quem a destrava.
-        let nova = withUnsafePointer(to: &opcoes) {
-            quall_connect_with_screen(enderecoC, $0, novoCancelador, tela.largura, tela.altura)
+        // Com o confirmador, o caminho do código de 4 dígitos (`docs/conexao.md` §4) entra quando não
+        // há PIN nem pareamento guardado; sem ele, é o `connect` de sempre.
+        let nova = withUnsafePointer(to: &opcoes) { o -> OpaquePointer? in
+            // **Com alvo** (o `device_id` autenticado de uma sessão salva), a revisão A2
+            // (`docs/v3-no-privado.md` §3.5): com vínculo e sem a dica dele no desafio, falha fechado
+            // em vez de cair no código.
+            if confirmacao != nil || alvoC != nil {
+                return quall_connect_with_code_to(enderecoC, o, novoCancelador, nil, confirmacao?.ponteiro,
+                                                  tela.largura, tela.altura, alvoC.map { UnsafePointer($0) })
+            }
+            return quall_connect_with_screen(enderecoC, o, novoCancelador, tela.largura, tela.altura)
         }
 
         travaDoCancelador.lock()
@@ -223,6 +244,79 @@ public final class NucleoReceptor {
         return true
     }
 
+    /// **A sessão salva, sem id no anúncio** (`quall_connect_known`, `docs/v3-no-privado.md` §5.2):
+    /// acha o aparelho `deviceId` no endereço antigo e nos anfitriões da busca e retoma com ele **na
+    /// mesma conexão**, só com o vínculo dele. Nunca usa código nem PIN. **Bloqueia**; chame de uma
+    /// thread de trabalho. O endereço em que conectou sai depois em `enderecoDaSessao`, e só ali — com
+    /// a retomada feita — ele pode ser gravado.
+    public func conectarConhecido(deviceId alvo: String,
+                                  enderecoAntigo: String?,
+                                  meuId: String,
+                                  nome: String,
+                                  paresConhecidos: String?,
+                                  prazoMs: UInt32,
+                                  tela: (largura: UInt32, altura: UInt32) = (0, 0)) -> Bool {
+        let alvoC = guardar(alvo)
+        let antigoC: UnsafeMutablePointer<CChar>? = enderecoAntigo.flatMap { $0.isEmpty ? nil : guardar($0) }
+        let idC = guardar(meuId)
+        let nomeC = guardar(nome)
+        let paresC: UnsafeMutablePointer<CChar>? = paresConhecidos.map { guardar($0) }
+
+        let novoCancelador = quall_canceller_new()
+        travaDoCancelador.lock()
+        cancelador = novoCancelador
+        travaDoCancelador.unlock()
+        if parou { quall_session_cancel(novoCancelador) }
+
+        var opcoes = QuallSessionOptions(
+            me: QuallDeviceDesc(device_id: idC, display_name: nomeC,
+                                screen_source: false, camera_source: false, sink: true),
+            pin: nil,
+            known_peers_json: paresC.map { UnsafePointer($0) },
+            signaling_port: 0, timeout_ms: prazoMs, tracks: nil, track_count: 0, bind_address: nil)
+        let nova = withUnsafePointer(to: &opcoes) { o in
+            quall_connect_known_with_screen(alvoC, antigoC.map { UnsafePointer($0) }, o, novoCancelador, nil,
+                                            tela.largura, tela.altura)
+        }
+
+        travaDoCancelador.lock()
+        cancelador = nil
+        travaDoCancelador.unlock()
+
+        guard let nova else {
+            ultimoStatus = quall_last_status()
+            ultimoMotivo = NucleoReceptor.ultimoErro()
+            quall_canceller_free(novoCancelador)
+            return false
+        }
+        quall_canceller_free(novoCancelador)
+        travaDoUso.lock()
+        sessao = nova
+        travaDoUso.unlock()
+        return true
+    }
+
+    /// Onde a sessão de pé conectou (`quall_session_endpoint_json`): o endereço a gravar na sessão
+    /// salva, e por onde a sessão salva o achou. `nil` sem sessão.
+    public var enderecoDaSessao: EnderecoDaSessao? {
+        travaDoUso.lock()
+        let s = sessao
+        travaDoUso.unlock()
+        guard let s else { return nil }
+        return EnderecoDaSessao.doJSON(NucleoDeRede.lerTexto { buf, cap in quall_session_endpoint_json(s, buf, cap) })
+    }
+
+    /// **A sessão que subiu pelo QR** (`docs/conexao.md` §10): a espera pelo convite corre fora deste
+    /// núcleo (com o cancelador dela, enquanto o formulário segue usável), e a sessão entra aqui só
+    /// depois, para o resto da corrida ser a de sempre. `false` se já havia sessão (quem chamou a
+    /// fecha soltando `s`).
+    public func adotar(_ s: SessaoDoConvite) -> Bool {
+        travaDoUso.lock(); defer { travaDoUso.unlock() }
+        guard sessao == nil, let p = s.tomar() else { return false }
+        sessao = p
+        return true
+    }
+
     /// Levanta a bandeira e, se houver espera em curso, aciona o cancelador. Chamável de qualquer
     /// thread — e **não** toca em handle de sessão, de track nem na caixa.
     public func parar() {
@@ -231,6 +325,16 @@ public final class NucleoReceptor {
         if let c = cancelador { quall_session_cancel(c) }
         travaDoCancelador.unlock()
     }
+
+    /// Abaixa a bandeira para a **próxima** conexão. O `Receptor` guarda um núcleo só pela vida do
+    /// app, e a bandeira nunca voltava: depois do primeiro Parar, toda conexão seguinte subia,
+    /// retomava o pareamento e caía em "cancelado" na espera da track (achado do Bruno, 12/10).
+    /// Chamado na main **antes** de largar a thread da corrida, para não engolir um Parar dado
+    /// durante a conexão.
+    public func rearmar() {
+        travaDaParada.lock(); _parar = false; travaDaParada.unlock()
+    }
+
 
     // --- track -------------------------------------------------------------------------------
 
@@ -369,6 +473,16 @@ public final class NucleoReceptor {
         return quall_track_capture_offset_us(t, &us) == 1 ? us : nil
     }
 
+    /// Source clock for the file; never called from the render/network callback.
+    public func deslocamentoCruDeCaptura(doSom: Bool) -> Int64? {
+        travaDoUso.lock()
+        let t = doSom ? trackDeAudio : track
+        travaDoUso.unlock()
+        guard let t else { return nil }
+        var us: Int64 = 0, guarda: Int32 = 0
+        return quall_track_capture_offset_raw_us(t, &us, &guarda) == 1 ? us : nil
+    }
+
     /// O rótulo da track, pelo padrão `(buf, cap)` — **pergunta o tamanho antes**.
     ///
     /// Era um buffer fixo de 256 bytes com a mesma leitura errada que `lerTexto` tinha: um
@@ -479,7 +593,12 @@ public final class NucleoReceptor {
 
     // --- o que o núcleo sabe ------------------------------------------------------------------
 
-    public var nomeDoPar: String {
+    public var nomeDoPar: String { campoDoPar("display_name") }
+
+    /// O `device_id` do outro lado: é o que a sessão salva guarda (`docs/conexao.md` §3).
+    public var idDoPar: String { campoDoPar("device_id") }
+
+    private func campoDoPar(_ chave: String) -> String {
         travaDoUso.lock()
         let s = sessao
         travaDoUso.unlock()
@@ -487,9 +606,9 @@ public final class NucleoReceptor {
         let json = NucleoDeRede.lerTexto { buf, cap in quall_session_peer_json(s, buf, cap) }
         guard let dados = json.data(using: .utf8),
               let objeto = try? JSONSerialization.jsonObject(with: dados) as? [String: Any],
-              let nome = objeto["display_name"] as? String
+              let valor = objeto[chave] as? String
         else { return "" }
-        return nome
+        return valor
     }
 
     public func pareamentoNovo() -> Bool {
@@ -500,16 +619,16 @@ public final class NucleoReceptor {
         return quall_session_pairing_is_new(s)
     }
 
-    public func paresConhecidos(somandoA base: String?) -> String {
+    /// **Só o par desta sessão, e só se o pareamento é novo** (`quall_session_known_peers_json(s, NULL)`),
+    /// para `Identidade.guardarPares` fundir com o disco **lido na hora de gravar**. Somar à tabela lida
+    /// quando a espera abriu ressuscitava um par que a pessoa esqueceu nesse meio tempo (revisão da
+    /// integração, M2). Retomada: nada a gravar — o vínculo já está no disco, ou foi esquecido de
+    /// propósito. Vazio quando não há o que gravar.
+    public func parNovoParaGuardar() -> String {
         travaDoUso.lock()
         let s = sessao
         travaDoUso.unlock()
-        guard let s else { return "" }
-        if let base, !base.isEmpty {
-            return base.withCString { antigos in
-                NucleoDeRede.lerTexto { buf, cap in quall_session_known_peers_json(s, antigos, buf, cap) }
-            }
-        }
+        guard let s, quall_session_pairing_is_new(s) else { return "" }
         return NucleoDeRede.lerTexto { buf, cap in quall_session_known_peers_json(s, nil, buf, cap) }
     }
 

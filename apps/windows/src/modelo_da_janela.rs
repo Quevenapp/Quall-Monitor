@@ -128,6 +128,22 @@ pub enum Controle {
     /// **O seletor de idioma "PT | EN"** (a tradução, 02/10): um segmento por idioma (0 PT, 1 EN),
     /// num grupo de opções, no canto de cima à direita dos quatro painéis.
     Idioma(usize),
+    /// **Um dos três números do código de 4 dígitos** (`docs/v3-no-privado.md` §3.6), no cartão da
+    /// espera (o anfitrião, também a do "mais um" com vários aparelhos): 0, 1 e 2, da esquerda para a
+    /// direita. Tocar no que o outro aparelho mostra confirma; num falso, recusa e desliga o código
+    /// da espera (P11). O toque vai com a tentativa do cartão desenhado (M2).
+    EscolherCodigo(usize),
+    /// **"Nenhum destes"**: o quarto botão do cartão do anfitrião, separado dos três. Recusa.
+    RecusarCodigo,
+    /// **"Esquecer este aparelho"** no Exibir (A2, `docs/v3-no-privado.md` §3.5): o aparelho com
+    /// vínculo não reconheceu este pareamento, e o código só volta para ele depois de esquecê-lo.
+    EsquecerEsteAparelho,
+    /// **"Nome que os outros aparelhos veem"** (`docs/v3-no-privado.md` §8.7): o `EDIT` no pé da barra,
+    /// no lugar do "Nome deste computador" que só se lia. Vazio: os outros veem o alias.
+    NomeNaRede,
+    /// **"Procurar de novo"** no Exibir (`docs/v3-no-privado.md` §8.9), ao lado do "procurando": a
+    /// varredura da /24 recomeça (`descoberta::Busca::procurar_de_novo`).
+    ProcurarDeNovo,
 }
 
 /// Que controle nativo cada um é.
@@ -192,6 +208,12 @@ impl Controle {
             Controle::Letreiro => 143,
             Controle::DriverDaTelaEstendida => 144,
             Controle::Volume(i) => 150 + i,
+            // Os mesmos números do Quall Studio (160 em diante, livres aqui).
+            Controle::RecusarCodigo => 161,
+            Controle::EscolherCodigo(i) => 164 + i.min(2),
+            Controle::EsquecerEsteAparelho => 167,
+            Controle::NomeNaRede => 168,
+            Controle::ProcurarDeNovo => 169,
             Controle::Ladrilho(i) => 200 + i,
         }
     }
@@ -225,6 +247,11 @@ impl Controle {
             143 => Controle::Letreiro,
             144 => Controle::DriverDaTelaEstendida,
             150..=153 => Controle::Volume(id - 150),
+            161 => Controle::RecusarCodigo,
+            164..=166 => Controle::EscolherCodigo(id - 164),
+            167 => Controle::EsquecerEsteAparelho,
+            168 => Controle::NomeNaRede,
+            169 => Controle::ProcurarDeNovo,
             i if (200..200 + MAX_LADRILHOS).contains(&i) => Controle::Ladrilho(i - 200),
             _ => return None,
         })
@@ -235,7 +262,7 @@ impl Controle {
             Controle::Item(_) | Controle::Ladrilho(_) | Controle::Volume(_) | Controle::Idioma(_) => Especie::Opcao,
             Controle::Som | Controle::Microfone | Controle::Mudo | Controle::SomComCamera | Controle::Detalhes => Especie::Alternar,
             Controle::Lista => Especie::Lista,
-            Controle::Endereco | Controle::Pin => Especie::Campo,
+            Controle::Endereco | Controle::Pin | Controle::NomeNaRede => Especie::Campo,
             Controle::Letreiro => Especie::Letreiro,
             _ => Especie::Botao,
         }
@@ -248,7 +275,7 @@ impl Controle {
         let mut v: Vec<Controle> = [Painel::Espelhar, Painel::Exibir, Painel::Ajustes].iter().map(|p| Controle::Item(*p)).collect();
         #[cfg(feature = "tela-estendida-futura")]
         v.push(Controle::TelaEstendidaSemDriver);
-        v.extend([Controle::Som, Controle::Espelhar, Controle::Lista, Controle::Endereco, Controle::Pin, Controle::Exibir]);
+        v.extend([Controle::Som, Controle::Espelhar, Controle::ProcurarDeNovo, Controle::Lista, Controle::Endereco, Controle::Pin, Controle::Exibir, Controle::EsquecerEsteAparelho]);
 
         // O chip antes do Esquecer e do microfone: é a ordem de cima para baixo da espera da câmera
         // (a janela põe o microfone depois do Diário quando a sessão é de câmera).
@@ -258,6 +285,10 @@ impl Controle {
         v.extend((0..4).map(Controle::Volume));
         v.extend([Controle::Detalhes, Controle::Cancelar]);
         v.extend([Controle::Idioma(0), Controle::Idioma(1)]);
+        // O nome na rede, no pé da barra, antes do item Ajustes (§8.7).
+        v.push(Controle::NomeNaRede);
+        // O cartão do código: os três números, da esquerda para a direita, e o "Nenhum destes" embaixo.
+        v.extend([Controle::EscolherCodigo(0), Controle::EscolherCodigo(1), Controle::EscolherCodigo(2), Controle::RecusarCodigo]);
         v
     }
 
@@ -349,6 +380,12 @@ pub struct TelaExibir {
     pub aviso: Option<Aviso>,
     /// Qual campo tem o foco (a borda de baixo violeta).
     pub foco: Option<Controle>,
+    /// **O QR do computador** (`docs/conexao.md` §10), numa coluna à direita da lista. `None`: sem a
+    /// coluna (a bancada com `--so-local`, e o retrato de antes).
+    pub qr: Option<crate::qr_na_tela::QrNaTela>,
+    /// **"Esquecer este aparelho"** no pé (A2): a última conexão falhou fechado com um aparelho de que
+    /// este computador guarda vínculo.
+    pub esquecer_este: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -366,7 +403,10 @@ pub struct TelaEspera {
     pub pin: String,
     pub endereco: String,
     pub ha_pares: bool,
+    /// O nome que os outros veem na lista (o anunciado), ou o alias sem nome (14/10, §8.7.1).
     pub nome: String,
+    /// O alias para conferir ao lado do nome, como na linha da lista; `None` sem nome anunciado.
+    pub alias: Option<String>,
     pub anunciando: bool,
     pub origem: String,
     /// Com o som do computador (a intenção). `None`: câmera (o som é o do microfone).
@@ -428,6 +468,7 @@ pub struct LinhaDeReceptor {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TelaVarios {
+    /// O nome da espera do "mais um" numa linha só: "Dell da sala (Quall 1a2b3c4d)", ou o alias.
     pub nome_da_espera: String,
     pub receptores: Vec<LinhaDeReceptor>,
     /// PIN e endereço da espera aberta para mais um.
@@ -506,6 +547,10 @@ pub struct EstadoDaTela {
     /// acontecendo com ele (o ladrilho apagado, o aviso do Espelhar e o cartão dos Ajustes).
     #[cfg(feature = "tela-estendida-futura")]
     pub driver: TelaDoDriver,
+    /// **O cartão do código de 4 dígitos** (`docs/conexao.md` §4): o do emissor na espera
+    /// ([`Cena::Esperando`], e a do "mais um" em [`Cena::Varios`]; quem pede é o outro) ou o do
+    /// receptor na conexão ([`Cena::Conectando`]). Só é desenhado nessas cenas.
+    pub codigo: Option<crate::conexao::CartaoDoCodigo>,
 }
 
 /// O driver da tela estendida, na tela (`regras_do_driver`).
@@ -575,6 +620,10 @@ pub fn instrucao_da_espera(e: &TelaEspera) -> Vec<Trecho> {
     if e.anunciando {
         v.push(Trecho::simples(t(" e escolha ")));
         v.push(Trecho::forte(e.nome.clone()));
+        // O alias pequeno para conferir (14/10): o nome anunciado não autentica, o alias é o da lista.
+        if let Some(a) = &e.alias {
+            v.push(Trecho { tamanho: Some(12.0), ..Trecho::simples(format!(" ({a})")) });
+        }
         v.push(Trecho::simples(t(" na lista, ou digite o endereço abaixo.")));
     } else {
         v.push(Trecho::simples(t(" e digite o endereço abaixo.")));
@@ -776,8 +825,13 @@ fn barra(q: &mut Quadro, e: &EstadoDaTela) {
     if let Some(s) = &e.sessao {
         q.mais(texto(lugar::NOTA_DA_SESSAO, s.nota.clone(), F_LEGENDA, TEXTO3).quebra().item());
     }
-    q.mais(texto(lugar::NOME_ROTULO, t("Nome deste computador"), F_LEGENDA_11, TEXTO3).meio().item());
-    q.mais(texto(lugar::NOME, e.nome_do_aparelho.clone(), F_CORPO_FORTE, TEXTO).meio().item());
+    // **O nome que os outros aparelhos veem** (`docs/v3-no-privado.md` §8.7): o "Nome deste computador"
+    // de antes, agora editável. O `EDIT` guarda e passa ao núcleo a cada mudança (`janela.rs`); a dica
+    // cinza de dentro dele é o nome do computador ([`EstadoDaTela::nome_do_aparelho`]).
+    q.mais(texto(lugar::NOME_ROTULO, t("Nome que os outros aparelhos veem"), F_LEGENDA_11, TEXTO3).quebra().item());
+    q.varios(campo(lugar::CAMPO_DO_NOME, e.exibir.foco == Some(Controle::NomeNaRede)));
+    q.controle(Controle::NomeNaRede, lugar::edit_no_campo(lugar::CAMPO_DO_NOME));
+    q.mais(texto(lugar::NOTA_DO_NOME, t("Aparece para quem está na mesma rede Wi-Fi."), F_LEGENDA_11, TEXTO3).quebra().item());
     q.controle(Controle::Item(Painel::Ajustes), lugar::ITEM_AJUSTES);
 }
 
@@ -845,10 +899,21 @@ fn rede(q: &mut Quadro, r: Ret, ip: Option<&str>) {
 
 fn painel_exibir(q: &mut Quadro, e: &EstadoDaTela) {
     let s = &e.exibir;
-    cabecalho(q, t("Assistir outro aparelho"), t("Escolha quem está espelhando. Na primeira vez, digite o PIN que aparece lá."));
-    q.mais(rotulo(lugar::ROTULO_DA_LISTA, t("Na rede agora")));
+    cabecalho(q, t("Assistir outro aparelho"), t("Escolha quem está espelhando. Na primeira vez, os dois aparelhos mostram um código para conferir, ou digite o PIN que aparece lá."));
+    // Com o QR, a lista estreita e ele fica na coluna à direita — ao lado, não no lugar (§10).
+    let (r_rotulo, r_procurando, r_lista, r_vazia) = if s.qr.is_some() {
+        (lugar::ROTULO_DA_LISTA_COM_QR, lugar::PROCURANDO_COM_QR, lugar::LISTA_COM_QR, lugar::LISTA_VAZIA_COM_QR)
+    } else {
+        (lugar::ROTULO_DA_LISTA, lugar::PROCURANDO, lugar::LISTA, lugar::LISTA_VAZIA)
+    };
+    q.mais(rotulo(r_rotulo, t("Na rede agora")));
+    // "Procurar de novo" (`docs/v3-no-privado.md` §8.9): a /24 só sai sozinha com a lista vazia, uma vez.
+    q.controle(Controle::ProcurarDeNovo, if s.qr.is_some() { lugar::PROCURAR_DE_NOVO_COM_QR } else { lugar::PROCURAR_DE_NOVO });
+    if let Some(qr) = &s.qr {
+        coluna_do_qr(q, qr);
+    }
     if s.procurando {
-        let r = lugar::PROCURANDO;
+        let r = r_procurando;
         // A bolinha violeta e "procurando" (§6.6), encostados à direita.
         let lt = 80.0;
         q.mais(Item::Circulo { cx: r.direita() - lt - 9.0, cy: r.y + r.a / 2.0, raio: 5.0, cor: TRACO_ESCOLHIDO.vezes(0.3) });
@@ -856,11 +921,11 @@ fn painel_exibir(q: &mut Quadro, e: &EstadoDaTela) {
         q.mais(texto(Ret::new(r.direita() - lt, r.y, lt, r.a), t("procurando"), F_LEGENDA, TEXTO2).direita().meio().item());
     }
     if s.aparelhos.is_empty() {
-        let r = lugar::LISTA_VAZIA;
+        let r = r_vazia;
         q.mais(cartao(r));
-        q.mais(texto(r.dentro(16.0, 0.0), s.vazio.clone(), F_LEGENDA_13, TEXTO2).meio().item());
+        q.mais(texto(r.dentro(16.0, 0.0), s.vazio.clone(), F_LEGENDA_13, TEXTO2).meio().quebra().item());
     } else {
-        q.controle(Controle::Lista, lugar::LISTA);
+        q.controle(Controle::Lista, r_lista);
     }
     q.mais(rotulo(lugar::ROTULO_DO_ENDERECO, t("Ou digite o endereço")));
     let r_pin = lugar::ROTULO_DO_PIN;
@@ -869,12 +934,37 @@ fn painel_exibir(q: &mut Quadro, e: &EstadoDaTela) {
     q.varios(campo(lugar::CAMPO_DO_PIN, s.foco == Some(Controle::Pin) || s.pede_pin));
     q.controle(Controle::Endereco, lugar::edit_no_campo(lugar::CAMPO_DO_ENDERECO));
     q.controle(Controle::Pin, lugar::edit_no_campo(lugar::CAMPO_DO_PIN));
-    q.mais(texto(lugar::LEGENDA_DO_PIN, t("Deixe o PIN vazio se os dois já parearam."), F_LEGENDA, if s.pede_pin { ACENTO_CLARO } else { TEXTO3 }).meio().item());
+    q.mais(texto(lugar::LEGENDA_DO_PIN, t("Sem PIN, entra o pareamento guardado ou o código de 4 dígitos."), F_LEGENDA, if s.pede_pin { ACENTO_CLARO } else { TEXTO3 }).meio().item());
     if let Some(a) = &s.aviso {
         let altura = altura_do_aviso(&a.texto, lugar::L).min(lugar::PE_Y - 12.0 - lugar::AVISO_DO_EXIBIR_Y);
         q.varios(aviso(Ret::new(lugar::X, lugar::AVISO_DO_EXIBIR_Y, lugar::L, altura), a.tom, &a.texto));
     }
+    if s.esquecer_este {
+        q.controle(Controle::EsquecerEsteAparelho, lugar::ESQUECER_ESTE_APARELHO);
+    }
     q.controle(Controle::Exibir, lugar::BOTAO_PRINCIPAL);
+}
+
+/// **A coluna do QR** (`docs/conexao.md` §10): o rótulo, o QR (ou a frase no lugar dele) e a fase.
+fn coluna_do_qr(q: &mut Quadro, qr: &crate::qr_na_tela::QrNaTela) {
+    use crate::qr_na_tela::{desenho, frase, no_lugar_do_qr, FaseDoQr};
+    q.mais(rotulo(lugar::ROTULO_DO_QR, t("Ler no celular")));
+    match (&qr.matriz, qr.mostra_o_qr()) {
+        (Some(m), true) => q.varios(desenho(lugar::QR, m)),
+        _ => {
+            q.mais(cartao(lugar::QR));
+            let no_lugar = no_lugar_do_qr(&qr.fase);
+            if !no_lugar.is_empty() {
+                q.mais(texto(lugar::QR.dentro(14.0, 14.0), no_lugar, F_LEGENDA_13, TEXTO2).centro().meio().quebra().item());
+            }
+        }
+    }
+    let cor = match qr.fase {
+        FaseDoQr::Chamado { .. } => CONECTADO_TEXTO,
+        FaseDoQr::SemRede | FaseDoQr::Falhou => AGUARDANDO_TEXTO,
+        _ => TEXTO3,
+    };
+    q.mais(texto(lugar::FASE_DO_QR, frase(&qr.fase), F_LEGENDA, cor).centro().meio().item());
 }
 
 /// Os três cartões do teleprompter: ícone, título e explicação (§7.3). Em português, como chaves da
@@ -986,9 +1076,13 @@ fn cena_esperando(q: &mut Quadro, e: &EstadoDaTela) {
     let s = &e.espera;
     q.mais(Item::Pilula { ancora: Ancora::Centro(lugar::CX), y: lugar::PILULA_Y, luz: Luz::Aguardando, texto: t("Aguardando").into() });
     q.mais(texto(lugar::TITULO_DA_SESSAO, t("Pronto para estender"), F_TITULO_GRANDE, TEXTO).centro().meio().item());
-    q.mais(rico(lugar::INSTRUCAO, instrucao_da_espera(s), F_CORPO, TEXTO2).centro().quebra().item());
     let chip_l = largura_do_chip(&s.endereco);
-    if !s.ha_pares {
+    if let Some(c) = e.codigo.as_ref().filter(|c| c.do_anfitriao()) {
+        // **Alguém tocou Conectar** (`docs/v3-no-privado.md` §3.6): o cartão dos três números toma o
+        // lugar da instrução, do PIN e do chip até a pessoa decidir. O PIN continua valendo por baixo.
+        cartao_do_codigo(q, c, true);
+    } else if !s.ha_pares {
+        q.mais(rico(lugar::INSTRUCAO, instrucao_da_espera(s), F_CORPO, TEXTO2).centro().quebra().item());
         q.mais(texto(lugar::ROTULO_DO_PIN_DA_ESPERA, caixa_alta(t("Na primeira vez, o PIN")), F_ROTULO, TEXTO3).centro().meio().item());
         q.controle(Controle::Letreiro, lugar::letreiro());
         let (rotulo_r, chip_r) = lugar::chip(chip_l, true, lugar::CHIP_Y);
@@ -997,6 +1091,7 @@ fn cena_esperando(q: &mut Quadro, e: &EstadoDaTela) {
         }
         q.controle(Controle::Chip, chip_r);
     } else {
+        q.mais(rico(lugar::INSTRUCAO, instrucao_da_espera(s), F_CORPO, TEXTO2).centro().quebra().item());
         q.mais(texto(lugar::FRASE_DOS_PAREADOS, t("Aparelhos pareados entram direto."), F_CORPO_15, TEXTO).centro().meio().item());
         let (_, chip_r) = lugar::chip(chip_l, false, lugar::CHIP_Y_COM_PARES);
         q.controle(Controle::Chip, chip_r);
@@ -1096,6 +1191,18 @@ fn cena_varios(q: &mut Quadro, e: &EstadoDaTela) {
     let n = s.receptores.len();
     let titulo_ = if n == 1 { t("Estendendo para 1 aparelho").to_string() } else { tf("Estendendo para {} aparelhos", &[&n]) };
     q.mais(texto(lugar::TITULO_DOS_VARIOS, titulo_, F_TITULO, TEXTO).meio().item());
+    if let Some(c) = e.codigo.as_ref().filter(|c| c.do_anfitriao()) {
+        // **Mais um aparelho tocou Conectar** (`docs/v3-no-privado.md` §3.6): a espera do "mais um" é
+        // uma espera como a da cena Esperando, e o cartão dos três números toma o lugar das linhas
+        // dos receptores e do PIN do "mais um" até a pessoa decidir. Os que já estão seguem no ar, o
+        // rodapé continua, e o Parar também. O PIN continua valendo por baixo.
+        cartao_do_codigo(q, c, true);
+        if !s.rodape.is_empty() {
+            q.mais(texto(lugar::RODAPE_DOS_VARIOS, s.rodape.clone(), F_LEGENDA_13, if s.rodape_aviso { AGUARDANDO_TEXTO } else { TEXTO2 }).meio().item());
+        }
+        q.controle(Controle::Cancelar, lugar::PARAR);
+        return;
+    }
     let linhas = lugar::linhas_dos_varios(n.min(MAX_RECEPTORES));
     for (r, x) in linhas.iter().zip(&s.receptores) {
         q.mais(cartao(*r));
@@ -1144,6 +1251,12 @@ fn cena_varios(q: &mut Quadro, e: &EstadoDaTela) {
 fn cena_conectando(q: &mut Quadro, e: &EstadoDaTela) {
     q.mais(Item::Pilula { ancora: Ancora::Centro(lugar::CX), y: lugar::PILULA_Y, luz: Luz::Aguardando, texto: t("Conectando").into() });
     q.mais(texto(lugar::TITULO_DA_SESSAO, t("Conectando"), F_TITULO_GRANDE, TEXTO).centro().meio().item());
+    if let Some(c) = e.codigo.as_ref().filter(|c| !c.do_anfitriao()) {
+        // O outro lado aceitou o código: o cartão toma o lugar do destino e do parágrafo.
+        cartao_do_codigo(q, c, false);
+        q.controle(Controle::Cancelar, lugar::CANCELAR);
+        return;
+    }
     q.mais(texto(lugar::DESTINO, e.conectando.clone(), F_CORPO_15, TEXTO).centro().meio().item());
     q.mais(
         texto(
@@ -1157,6 +1270,41 @@ fn cena_conectando(q: &mut Quadro, e: &EstadoDaTela) {
         .item(),
     );
     q.controle(Controle::Cancelar, lugar::CANCELAR);
+}
+
+/// **O cartão do código de 4 dígitos** (`docs/v3-no-privado.md` §3.6). `anfitriao`: este computador
+/// espera (o outro tocou Conectar) — quem pede, "Qual número o outro aparelho mostra?", os três
+/// números (botões iguais em cor e tamanho, nada só por cor) e o "Nenhum destes" separado; escolhido
+/// o certo, os botões saem e a frase diz que está conectando. O convidado: a quem se conecta, os
+/// quatro dígitos e a instrução de achá-los na outra tela (o Cancelar da cena desiste). Sem prazo
+/// visual: os 60 s do núcleo bastam, e a contagem não apressa ninguém.
+fn cartao_do_codigo(q: &mut Quadro, c: &crate::conexao::CartaoDoCodigo, anfitriao: bool) {
+    q.mais(cartao(lugar::CARTAO_DO_CODIGO));
+    let quem = match (anfitriao, c.par.is_empty()) {
+        (true, false) => tf("{} quer conectar", &[&c.par]),
+        (true, true) => t("Um aparelho quer conectar").to_string(),
+        (false, false) => tf("Conectando a {}", &[&c.par]),
+        (false, true) => t("Conectando").to_string(),
+    };
+    q.mais(texto(lugar::CODIGO_QUEM, quem, F_CORPO_FORTE, TEXTO).centro().meio().item());
+    if !anfitriao {
+        q.varios(codigo(lugar::CX, lugar::CODIGO_Y, &c.codigo));
+        q.mais(texto(lugar::CODIGO_PERGUNTA, t("Escolha este número no outro aparelho."), F_CORPO, TEXTO).centro().meio().item());
+        // O toque que tentou reconectar e caiu para o código (§8.6) diz por que o código apareceu.
+        let conselho = if c.pareamento_anterior { t(crate::conexao::FRASE_PAREAMENTO_ANTERIOR) } else { t("Ele mostra três números; só este é o certo.") };
+        q.mais(texto(lugar::CODIGO_CONSELHO, conselho, F_LEGENDA_13, TEXTO2).centro().meio().item());
+        return;
+    }
+    if c.confirmado_aqui {
+        q.mais(texto(lugar::ESCOLHA_PERGUNTA, t("Número certo. Conectando…"), F_CORPO, CONECTADO_TEXTO).centro().meio().item());
+        return;
+    }
+    q.mais(texto(lugar::ESCOLHA_PERGUNTA, t("Qual número o outro aparelho mostra?"), F_CORPO, TEXTO).centro().meio().item());
+    for (i, r) in lugar::opcoes_do_codigo().into_iter().enumerate().take(c.opcoes.len()) {
+        q.controle(Controle::EscolherCodigo(i), r);
+    }
+    q.controle(Controle::RecusarCodigo, lugar::NENHUM_DESTES);
+    q.mais(texto(lugar::ESCOLHA_CONSELHO, t("Errar o número desliga o código nesta espera; o PIN continua valendo."), F_LEGENDA_13, TEXTO2).centro().meio().item());
 }
 
 fn cena_exibindo(q: &mut Quadro, e: &EstadoDaTela) {
@@ -1379,7 +1527,23 @@ pub fn aparencia(c: Controle, e: &EstadoDaTela, l: f32, a: f32, s: EstadoDoContr
             }
             v
         }
-        Controle::Lista | Controle::Endereco | Controle::Pin => vec![],
+        // Os três números: a mesma caixa, a mesma borda e o mesmo dígito mono dos quatro do convidado
+        // (`estilo::codigo`), em dois grupos ("04 27"). Nenhum se destaca.
+        Controle::EscolherCodigo(i) => {
+            fundo = SUPERFICIE;
+            let numero = e.codigo.as_ref().and_then(|c| c.opcoes.get(i)).map(|n| crate::conexao::em_grupos(n)).unwrap_or_default();
+            vec![
+                caixa_com_borda(Ret::new(0.0, 0.0, l, a), 12.0, SUPERFICIE_ALTA, ACENTO, 1.0),
+                texto(Ret::new(0.0, 0.0, l, a), numero, F_PIN, TEXTO).centro().meio().item(),
+            ]
+        }
+        Controle::RecusarCodigo => {
+            fundo = SUPERFICIE;
+            botao(l, a, TipoDeBotao::Secundario, t("Nenhum destes"), None, F_BOTAO)
+        }
+        Controle::EsquecerEsteAparelho => botao(l, a, TipoDeBotao::Secundario, t("Esquecer este aparelho"), None, F_BOTAO),
+        Controle::ProcurarDeNovo => botao(l, a, TipoDeBotao::Secundario, t("Procurar de novo"), Some(Icone::Atualizar), F_BOTAO_PEQUENO),
+        Controle::Lista | Controle::Endereco | Controle::Pin | Controle::NomeNaRede => vec![],
     };
     if s.quente && !s.desligado && c.especie() != Especie::Letreiro {
         itens.push(caixa(Ret::new(0.0, 0.0, l, a), raio, Cor::rgba(0xFFFFFF, 10)));
@@ -1455,7 +1619,7 @@ pub fn texto_acessivel(c: Controle, e: &EstadoDaTela) -> String {
         Controle::Exibir => t("Exibir").into(),
         Controle::Lista => t("Na rede agora").into(),
         Controle::Endereco => t("Endereço do outro aparelho").into(),
-        Controle::Pin => t("PIN do outro aparelho; vazio se os dois já parearam").into(),
+        Controle::Pin => t("PIN do outro aparelho; vazio para o pareamento guardado ou o código de 4 dígitos").into(),
         Controle::Papel(i) => t(PAPEIS[i.min(2)].1).to_string(),
         Controle::Esquecer if e.ajustes.confirmando && e.cena == Cena::Painel(Painel::Ajustes) => {
             t("Esquecer de verdade: os aparelhos vão pedir o PIN outra vez").into()
@@ -1484,6 +1648,16 @@ pub fn texto_acessivel(c: Controle, e: &EstadoDaTela) -> String {
         Controle::Volume(i) => tf("Volume {}", &[&VOLUMES[i.min(3)].1]),
         Controle::Detalhes => t("Detalhes").into(),
         Controle::AjustesDaCamera => t(crate::regras_dos_controles::ROTULO_DO_ICONE).into(),
+        Controle::NomeNaRede => t("Nome que os outros aparelhos veem").into(),
+        // O Narrador lê cada número dígito a dígito, e a posição ("0 4 2 7, primeiro de três"): o
+        // cartão é pintado, e o botão é o que tem foco.
+        Controle::EscolherCodigo(i) => {
+            let numero = e.codigo.as_ref().and_then(|c| c.opcoes.get(i)).map(|n| crate::conexao::para_ler(n)).unwrap_or_else(|| "—".into());
+            tf(crate::conexao::MOLDE_DA_OPCAO, &[&numero, &t(crate::conexao::posicao(i))])
+        }
+        Controle::RecusarCodigo => t("Nenhum destes").into(),
+        Controle::EsquecerEsteAparelho => t("Esquecer este aparelho").into(),
+        Controle::ProcurarDeNovo => t("Procurar de novo").into(),
     }
 }
 
@@ -1528,8 +1702,9 @@ fn base_de_exemplo() -> EstadoDaTela {
         exibir: TelaExibir {
             aparelhos: vec![
                 // i18n: fora (o nome do aparelho é dado de exemplo)
-                LinhaDeAparelho { nome: "iPhone do Bruno".into(), tipo: t("Tela ou câmera").into(), endereco: "192.168.15.4:7877".into() },
-                LinhaDeAparelho { nome: "Galaxy A07".into(), tipo: t("Tela ou câmera").into(), endereco: "192.168.15.11:7877".into() },
+                // No v3 a rede só diz o alias ("Quall 1a2b3c4d", P3); o nome guardado é o do pareado.
+                LinhaDeAparelho { nome: "Quall 1a2b3c4d".into(), tipo: t("Tela ou câmera").into(), endereco: "192.168.15.4:7877".into() },
+                LinhaDeAparelho { nome: "Galaxy A07".into(), tipo: t("Pareado").into(), endereco: "192.168.15.11:7877".into() },
             ],
             escolhido: Some(0),
             procurando: true,
@@ -1537,6 +1712,12 @@ fn base_de_exemplo() -> EstadoDaTela {
             pede_pin: false,
             aviso: None,
             foco: None,
+            qr: Some(crate::qr_na_tela::QrNaTela {
+                // i18n: fora (o texto de um convite de exemplo; o segredo é de mentira)
+                matriz: crate::qr_na_tela::matriz("quall://chamar?v=2&a=192.168.15.2&p=7874&i=win-3F2504E0-4F89-11D3-9A0C-0305E82C3301&n=DELL-G3&s=00112233445566778899aabbccddeeff").map(std::sync::Arc::new),
+                fase: crate::qr_na_tela::FaseDoQr::Esperando { segundos: 161 },
+            }),
+            esquecer_este: false,
         },
         ajustes: TelaAjustes { tem_pares: true, confirmando: false, pasta_do_diario: "%LOCALAPPDATA%\\Quall\\Logs".into(), versao: "0.1.0".into() },
         espera: TelaEspera {
@@ -1544,6 +1725,7 @@ fn base_de_exemplo() -> EstadoDaTela {
             endereco: "192.168.15.2:7877".into(),
             ha_pares: false,
             nome: "DELL-G3".into(),
+            alias: None,
             anunciando: true,
             origem: "Monitor 1".into(), // i18n: fora (dado de exemplo)
             com_som: Some(true),
@@ -1658,7 +1840,28 @@ pub fn exemplos() -> Vec<(&'static str, EstadoDaTela)> {
     e.exibir.escolhido = None;
     e.exibir.pede_pin = true;
     e.exibir.aviso = Some(Aviso { tom: Tom::Vermelho, texto: t("O PIN não conferiu. Digite os seis dígitos que aparecem no outro aparelho.").into() });
-    v.push(("05-exibir-vazio-pede-pin", e));
+    v.push(("05-exibir-vazio-pede-pin", e.clone()));
+    // A2 (`docs/v3-no-privado.md` §3.5): a sessão salva não reconheceu este pareamento — falha fechado,
+    // com "Esquecer este aparelho" no pé e o PIN em destaque. A frase mais longa, com o nome.
+    let mut e = EstadoDaTela { cena: Cena::Painel(Painel::Exibir), painel: Painel::Exibir, ..b.clone() };
+    e.exibir.pede_pin = true;
+    e.exibir.esquecer_este = true;
+    e.exibir.aviso = Some(Aviso { tom: Tom::Vermelho, texto: tf(crate::conexao::MOLDE_NAO_ACHEI, &[&"Galaxy A07"]) });
+    v.push(("05e-exibir-nao-reconheceu", e));
+    // O QR depois do chamado (sai o QR, fica a frase) e sem rede (§10).
+    let mut e = EstadoDaTela { cena: Cena::Painel(Painel::Exibir), painel: Painel::Exibir, ..b.clone() };
+    if let Some(qr) = e.exibir.qr.as_mut() {
+        qr.fase = crate::qr_na_tela::FaseDoQr::Chamado { nome: "Galaxy A07".into() }; // i18n: fora (exemplo)
+    }
+    v.push(("05b-exibir-qr-chamado", e.clone()));
+    if let Some(qr) = e.exibir.qr.as_mut() {
+        qr.fase = crate::qr_na_tela::FaseDoQr::SemRede;
+    }
+    e.exibir.aparelhos.clear();
+    e.exibir.escolhido = None;
+    v.push(("05c-exibir-qr-sem-rede", e.clone()));
+    e.exibir.qr = None;
+    v.push(("05d-exibir-sem-qr", e));
 
     v.push(("06-teleprompter", EstadoDaTela { cena: Cena::Painel(Painel::Teleprompter), painel: Painel::Teleprompter, ..b.clone() }));
     v.push(("07-ajustes", EstadoDaTela { cena: Cena::Painel(Painel::Ajustes), painel: Painel::Ajustes, ..b.clone() }));
@@ -1696,6 +1899,28 @@ pub fn exemplos() -> Vec<(&'static str, EstadoDaTela)> {
     e.espera.aviso_ambar = true;
     e.camera = Some(ControlesDaCamera { esquecer: true, ..camera_de_exemplo(false) });
     v.push(("10-esperando-camera", e));
+    // O cartão do código de 4 dígitos (`docs/v3-no-privado.md` §3.6): alguém tocou Conectar, e este
+    // computador escolhe entre três números; o convidado (15b) mostra o certo.
+    // i18n: fora (o nome do aparelho é dado de exemplo)
+    let par = "Galaxy A07".to_string();
+    let opcoes: Vec<String> = ["8812", "0427", "5530"].iter().map(|s| s.to_string()).collect();
+    let pedido = crate::conexao::CartaoDoCodigo { codigo: String::new(), opcoes, par: par.clone(), tentativa: 1, confirmado_aqui: false, espera: 1, pareamento_anterior: false };
+    let do_convidado = crate::conexao::CartaoDoCodigo { codigo: "0427".into(), opcoes: Vec::new(), par, tentativa: 1, confirmado_aqui: false, espera: 2, pareamento_anterior: false };
+    v.push(("08b-esperando-codigo", EstadoDaTela { codigo: Some(pedido.clone()), ..espera.clone() }));
+    let mut e = espera.clone();
+    e.espera.ha_pares = true;
+    e.codigo = Some(crate::conexao::CartaoDoCodigo { confirmado_aqui: true, par: String::new(), ..pedido.clone() });
+    v.push(("08c-esperando-codigo-confirmado", e));
+    // P11: a escolha errada desligou o código desta espera; o PIN continua, e a frase diz isso.
+    let mut e = espera.clone();
+    e.espera.aviso = t(crate::conexao::FRASE_ESCOLHA_ERRADA).into();
+    e.espera.aviso_ambar = true;
+    v.push(("08d-esperando-escolha-errada", e));
+    // O nome que os outros veem, com o alias para conferir (§8.7.1).
+    let mut e = espera.clone();
+    e.espera.nome = "Dell da sala".into(); // i18n: fora (dado de exemplo)
+    e.espera.alias = Some("Quall 1234abcd".into()); // i18n: fora (o alias de exemplo)
+    v.push(("08e-esperando-nome-e-alias", e));
 
     let no_ar = EstadoDaTela { cena: Cena::NoAr, painel: Painel::Espelhar, sessao: sessao_de_exemplo(Painel::Espelhar, Luz::NoAr, t("Espelhando")), ..b.clone() };
     v.push(("11-no-ar", no_ar.clone()));
@@ -1723,6 +1948,9 @@ pub fn exemplos() -> Vec<(&'static str, EstadoDaTela)> {
         rodape_aviso: false,
     };
     v.push(("13-varios", e.clone()));
+    // Mais um aparelho tocou Conectar na espera do "mais um": o cartão dos três números no lugar
+    // das linhas e do PIN; o Parar continua.
+    v.push(("13b-varios-codigo", EstadoDaTela { codigo: Some(pedido.clone()), ..e.clone() }));
     e.varios.receptores = (0..8)
         .map(|i| LinhaDeReceptor { nome: format!("Aparelho {}", i + 1), monitor: "1920 × 1080".into(), resumo: "900 quadros · 1 IDR".into() }) // i18n: fora (dados de exemplo)
         .collect();
@@ -1730,10 +1958,10 @@ pub fn exemplos() -> Vec<(&'static str, EstadoDaTela)> {
     e.varios.mais_um_texto = tf("Limite de {} aparelhos: para entrar mais um, outro precisa sair.", &[&8]);
     v.push(("14-varios-no-limite", e));
 
-    v.push((
-        "15-conectando",
-        EstadoDaTela { cena: Cena::Conectando, painel: Painel::Exibir, sessao: sessao_de_exemplo(Painel::Exibir, Luz::Aguardando, t("Conectando")), ..b.clone() },
-    ));
+    let conectando =
+        EstadoDaTela { cena: Cena::Conectando, painel: Painel::Exibir, sessao: sessao_de_exemplo(Painel::Exibir, Luz::Aguardando, t("Conectando")), ..b.clone() };
+    v.push(("15-conectando", conectando.clone()));
+    v.push(("15b-conectando-codigo", EstadoDaTela { codigo: Some(do_convidado), ..conectando }));
     let exibindo = EstadoDaTela { cena: Cena::Exibindo, painel: Painel::Exibir, sessao: sessao_de_exemplo(Painel::Exibir, Luz::Conectado, t("Exibindo")), ..b.clone() };
     v.push(("16-exibindo", exibindo.clone()));
     let mut e = exibindo;
@@ -1829,7 +2057,8 @@ mod testes {
             let q = compor(&e);
             for (c, r) in &q.controles {
                 assert!(janela.contem(r), "{nome}: {c:?} fora da janela: {r:?}");
-                if !matches!(c, Controle::Item(_)) {
+                // Na barra: os itens e o nome na rede (§8.7).
+                if !matches!(c, Controle::Item(_) | Controle::NomeNaRede) {
                     assert!(lugar::PAINEL.contem(r), "{nome}: {c:?} fora do painel: {r:?}");
                 }
             }
@@ -1996,7 +2225,198 @@ mod testes {
         let q = compor(&achar("07-ajustes"));
         assert!(q.lugar(Controle::SomComCamera).is_none(), "§11.5: saiu dos Ajustes");
         let q = compor(&achar("13-varios"));
-        assert_eq!(q.controles.iter().filter(|(c, _)| !matches!(c, Controle::Item(_))).count(), 1, "§11.5: sem Desconectar");
+        assert_eq!(
+            q.controles.iter().filter(|(c, _)| !matches!(c, Controle::Item(_) | Controle::NomeNaRede)).count(),
+            1,
+            "§11.5: sem Desconectar"
+        );
+    }
+
+    /// **O nome que os outros aparelhos veem** (`docs/v3-no-privado.md` §8.7): o campo no pé da barra,
+    /// em toda cena, acima do item Ajustes; o rótulo e a nota traduzidos e dentro da barra.
+    #[test]
+    fn o_nome_na_rede_fica_no_pe_da_barra_em_toda_cena() {
+        let barra = Ret::new(0.0, 0.0, LARGURA_DA_BARRA, ALTURA_MINIMA);
+        for (nome, e) in exemplos() {
+            let q = compor(&e);
+            let r = q.lugar(Controle::NomeNaRede).unwrap_or_else(|| panic!("{nome}: sem o campo do nome"));
+            assert!(barra.contem(&r), "{nome}: o campo fora da barra: {r:?}");
+            assert!(!r.cruza(&lugar::ITEM_AJUSTES) && !r.cruza(&lugar::NOTA_DA_SESSAO), "{nome}");
+            // Os dois itens da barra do Quall Monitor (Estender e Exibir) ficam acima do campo.
+            for item in &lugar::ITENS[..2] {
+                assert!(!r.cruza(item), "{nome}");
+            }
+        }
+        assert!(lugar::NOTA_DO_NOME.y + lugar::NOTA_DO_NOME.a <= lugar::ITEM_AJUSTES.y);
+        let e = exemplos().into_iter().next().unwrap().1;
+        assert_eq!(texto_acessivel(Controle::NomeNaRede, &e), "Nome que os outros aparelhos veem");
+        // O nome que só se lia saiu: o campo o substitui.
+        assert!(!compor(&e).textos().iter().any(|t| t == "Nome deste computador"));
+        crate::idioma::com_idioma(crate::idioma::Idioma::En, || {
+            assert_eq!(texto_acessivel(Controle::NomeNaRede, &e), "Name other devices see");
+            assert_eq!(t("Aparece para quem está na mesma rede Wi-Fi."), "Shown to anyone on the same Wi-Fi network.");
+        });
+    }
+
+    /// **O cartão do código** (`docs/v3-no-privado.md` §3.6): na espera, o anfitrião vê três números
+    /// e o "Nenhum destes", no lugar do PIN e do chip; escolhido o certo, os botões saem. Com vários
+    /// aparelhos, a espera do "mais um" mostra o mesmo cartão no lugar das linhas, com o Parar. Na
+    /// conexão, o convidado vê o código certo, sem botões no cartão (o Cancelar da cena desiste).
+    /// Fora dessas cenas, nada.
+    #[test]
+    fn o_cartao_do_codigo() {
+        let achar = |n: &str| exemplos().into_iter().find(|(x, _)| *x == n).unwrap().1;
+        let escolhas = [Controle::EscolherCodigo(0), Controle::EscolherCodigo(1), Controle::EscolherCodigo(2)];
+        let q = compor(&achar("08b-esperando-codigo"));
+        assert!(escolhas.iter().all(|c| q.lugar(*c).is_some()) && q.lugar(Controle::RecusarCodigo).is_some(), "três números e o Nenhum destes");
+        assert!(q.lugar(Controle::Letreiro).is_none() && q.lugar(Controle::Chip).is_none(), "o cartão toma o lugar do PIN e do chip");
+        assert!(q.lugar(Controle::Cancelar).is_some(), "o Cancelar continua");
+        let textos = q.textos();
+        assert!(textos.iter().any(|t| t == "Galaxy A07 quer conectar"), "{textos:?}");
+        assert!(textos.iter().any(|t| t == "Qual número o outro aparelho mostra?"));
+        assert!(textos.iter().any(|t| t.contains("o PIN continua valendo")), "o PIN continua (P11)");
+        // Os três do mesmo tamanho, na mesma linha, da esquerda para a direita; o Nenhum destes
+        // separado, embaixo; e nenhum número pintado fora dos botões (o anfitrião não tem o código).
+        let r: Vec<Ret> = escolhas.iter().map(|c| q.lugar(*c).unwrap()).collect();
+        assert!(r.iter().all(|x| x.l == r[0].l && x.a == r[0].a && x.y == r[0].y));
+        assert!(r[0].direita() < r[1].x && r[1].direita() < r[2].x);
+        let nenhum = q.lugar(Controle::RecusarCodigo).unwrap();
+        assert!(nenhum.y >= r[0].baixo() + 8.0, "o quarto botão, separado");
+        assert!(r.iter().chain([&nenhum]).all(|x| lugar::CARTAO_DO_CODIGO.contem(x)));
+        assert!(!q.itens.iter().any(|i| matches!(i, Item::Texto(t) if t.fonte == F_PIN)), "nenhum número fora dos botões");
+        let e = achar("08b-esperando-codigo");
+        let numeros: Vec<String> = escolhas
+            .iter()
+            .map(|c| {
+                let r = q.lugar(*c).unwrap();
+                aparencia(*c, &e, r.l, r.a, EstadoDoControle::default())
+                    .itens
+                    .iter()
+                    .filter_map(|i| if let Item::Texto(t) = i { (t.fonte == F_PIN).then(|| t.texto_corrido()) } else { None })
+                    .collect()
+            })
+            .collect();
+        assert_eq!(numeros, ["88 12", "04 27", "55 30"], "a ordem do núcleo, em grupos");
+        // O Narrador: dígito a dígito e a posição, na ordem estável; o Nenhum destes pelo nome.
+        assert_eq!(texto_acessivel(Controle::EscolherCodigo(0), &e), "8 8 1 2, primeiro de três");
+        assert_eq!(texto_acessivel(Controle::EscolherCodigo(1), &e), "0 4 2 7, segundo de três");
+        assert_eq!(texto_acessivel(Controle::EscolherCodigo(2), &e), "5 5 3 0, terceiro de três");
+        assert_eq!(texto_acessivel(Controle::RecusarCodigo, &e), "Nenhum destes");
+        crate::idioma::com_idioma(crate::idioma::Idioma::En, || {
+            assert_eq!(texto_acessivel(Controle::EscolherCodigo(1), &e), "0 4 2 7, second of three");
+            assert_eq!(texto_acessivel(Controle::RecusarCodigo, &e), "None of these");
+        });
+        // Os ids: um por número, e de volta.
+        for c in escolhas.iter().chain([&Controle::RecusarCodigo, &Controle::EsquecerEsteAparelho, &Controle::NomeNaRede, &Controle::ProcurarDeNovo]) {
+            assert_eq!(Controle::de_id(c.id()), Some(*c), "{c:?}");
+        }
+
+        let q = compor(&achar("08c-esperando-codigo-confirmado"));
+        assert!(escolhas.iter().all(|c| q.lugar(*c).is_none()) && q.lugar(Controle::RecusarCodigo).is_none(), "escolhido o certo, sem botões");
+        assert!(q.textos().iter().any(|t| t == "Um aparelho quer conectar"), "sem nome do par");
+        assert!(q.textos().iter().any(|t| t == "Número certo. Conectando…"));
+
+        // A espera do "mais um" (o Quall Monitor com vários aparelhos): o mesmo cartão, no lugar das
+        // linhas dos receptores e do PIN do "mais um"; o Parar continua.
+        let q = compor(&achar("13b-varios-codigo"));
+        assert!(escolhas.iter().all(|c| q.lugar(*c).is_some()) && q.lugar(Controle::RecusarCodigo).is_some(), "com vários, o cartão também");
+        assert!(q.lugar(Controle::Cancelar).is_some(), "o Parar continua");
+        let textos = q.textos();
+        assert!(textos.iter().any(|t| t == "Galaxy A07 quer conectar"), "{textos:?}");
+        assert!(!textos.iter().any(|t| t.contains("iPad do Bruno")), "as linhas saem com o cartão: {textos:?}");
+        assert!(!textos.iter().any(|t| t.contains("591 204")), "o PIN do mais um sai com o cartão: {textos:?}");
+        assert!(compor(&achar("13-varios")).lugar(Controle::EscolherCodigo(0)).is_none());
+
+        // O convidado: os quatro dígitos e a instrução; nenhum botão no cartão.
+        let q = compor(&achar("15b-conectando-codigo"));
+        assert!(escolhas.iter().all(|c| q.lugar(*c).is_none()) && q.lugar(Controle::RecusarCodigo).is_none());
+        assert!(q.lugar(Controle::Cancelar).is_some());
+        assert!(q.textos().iter().any(|t| t == "Conectando a Galaxy A07"));
+        assert!(q.textos().iter().any(|t| t == "Escolha este número no outro aparelho."));
+        assert!(!q.textos().iter().any(|t| t.contains("192.168.15.4")), "o destino sai com o cartão");
+        let digitos: String = q
+            .itens
+            .iter()
+            .filter_map(|i| if let Item::Texto(t) = i { (t.fonte == F_PIN).then(|| t.texto_corrido()) } else { None })
+            .collect();
+        assert_eq!(digitos, "0427", "as quatro casas, na ordem");
+        // O cartão de um lado não aparece na cena do outro.
+        let e = EstadoDaTela { codigo: achar("15b-conectando-codigo").codigo, ..achar("08b-esperando-codigo") };
+        assert!(compor(&e).lugar(Controle::EscolherCodigo(0)).is_none(), "o cartão do convidado na espera");
+        let e = EstadoDaTela { codigo: achar("15b-conectando-codigo").codigo, ..achar("13b-varios-codigo") };
+        assert!(compor(&e).lugar(Controle::EscolherCodigo(0)).is_none(), "o cartão do convidado com vários");
+        let e = EstadoDaTela { codigo: achar("08b-esperando-codigo").codigo, ..achar("15b-conectando-codigo") };
+        assert!(compor(&e).lugar(Controle::EscolherCodigo(0)).is_none(), "o do anfitrião na conexão");
+
+        // Um código no estado não aparece nas outras cenas.
+        for n in ["04-exibir", "11-no-ar", "16-exibindo"] {
+            let e = EstadoDaTela { codigo: achar("08b-esperando-codigo").codigo, ..achar(n) };
+            assert!(compor(&e).lugar(Controle::EscolherCodigo(0)).is_none(), "{n}");
+        }
+    }
+
+    /// Os rótulos dos botões novos cabem neles, nos dois idiomas (a largura estimada, folgada).
+    #[test]
+    fn os_rotulos_do_codigo_cabem_nos_botoes() {
+        let achar = |n: &str| exemplos().into_iter().find(|(x, _)| *x == n).unwrap().1;
+        for idioma in [crate::idioma::Idioma::Pt, crate::idioma::Idioma::En] {
+            crate::idioma::com_idioma(idioma, || {
+                for (cena, c) in [("08b-esperando-codigo", Controle::RecusarCodigo), ("05e-exibir-nao-reconheceu", Controle::EsquecerEsteAparelho)] {
+                    let r = compor(&achar(cena)).lugar(c).expect("o botão");
+                    let rotulo = texto_acessivel(c, &achar(cena));
+                    assert!(largura_estimada(&rotulo, F_BOTAO) + 16.0 <= r.l, "{idioma:?}: {rotulo:?} não cabe em {}", r.l);
+                }
+                let r = lugar::opcoes_do_codigo()[0];
+                assert!(largura_estimada("04 27", F_PIN) + 12.0 <= r.l && F_PIN.tamanho + 12.0 <= r.a);
+            });
+        }
+    }
+
+    /// **A2 no Exibir** (`docs/v3-no-privado.md` §3.5): a frase de falhar fechado, o PIN em destaque e
+    /// "Esquecer este aparelho" no pé, à esquerda do Exibir; fora disso, o botão não aparece.
+    #[test]
+    fn o_esquecer_este_aparelho_no_exibir() {
+        let achar = |n: &str| exemplos().into_iter().find(|(x, _)| *x == n).unwrap().1;
+        let q = compor(&achar("05e-exibir-nao-reconheceu"));
+        let esquecer = q.lugar(Controle::EsquecerEsteAparelho).expect("o Esquecer este aparelho");
+        let exibir = q.lugar(Controle::Exibir).unwrap();
+        assert!(esquecer.direita() < exibir.x && esquecer.y == exibir.y, "no pé, à esquerda do Exibir");
+        assert!(q.textos().iter().any(|t| t.starts_with("Não achei Galaxy A07 nesta rede")), "{:?}", q.textos());
+        assert!(compor(&achar("04-exibir")).lugar(Controle::EsquecerEsteAparelho).is_none());
+        assert!(compor(&achar("05-exibir-vazio-pede-pin")).lugar(Controle::EsquecerEsteAparelho).is_none());
+        // P3: a lista mostra o alias da rede e o nome local do pareado.
+        let e = achar("04-exibir");
+        assert_eq!(e.exibir.aparelhos[0].nome, "Quall 1a2b3c4d");
+        assert_eq!((e.exibir.aparelhos[1].nome.as_str(), e.exibir.aparelhos[1].tipo.as_str()), ("Galaxy A07", "Pareado"));
+        // O caminho novo é o principal: o cabeçalho e a legenda do PIN falam do código, e o PIN é a volta.
+        let textos = q.textos();
+        assert!(textos.iter().any(|t| t.contains("mostram um código para conferir")), "{textos:?}");
+        assert!(textos.iter().any(|t| t == "Sem PIN, entra o pareamento guardado ou o código de 4 dígitos."), "{textos:?}");
+        // "Procurar de novo" (§8.9) no Exibir, e só nele.
+        assert!(q.lugar(Controle::ProcurarDeNovo).is_some());
+        assert!(compor(&achar("05d-exibir-sem-qr")).lugar(Controle::ProcurarDeNovo).is_some(), "sem o QR também");
+        assert!(compor(&achar("08-esperando")).lugar(Controle::ProcurarDeNovo).is_none());
+        assert!(compor(&achar("01-espelhar")).lugar(Controle::ProcurarDeNovo).is_none());
+    }
+
+    /// **O QR do computador** (`docs/conexao.md` §10): ao lado da lista e dos campos, nunca no lugar.
+    #[test]
+    fn o_qr_fica_ao_lado_da_lista() {
+        let achar = |n: &str| exemplos().into_iter().find(|(x, _)| *x == n).unwrap().1;
+        let q = compor(&achar("04-exibir"));
+        let lista = q.lugar(Controle::Lista).expect("a lista continua");
+        assert!(lista.direita() <= lugar::QR.x, "a lista termina antes do QR");
+        assert!(q.lugar(Controle::Endereco).is_some() && q.lugar(Controle::Pin).is_some(), "os campos continuam");
+        assert!(lugar::FASE_DO_QR.baixo() <= lugar::CAMPOS_Y, "a coluna acaba antes dos campos");
+        let pretos = q.itens.iter().filter(|i| matches!(i, Item::Caixa { fundo, .. } if *fundo == Cor::rgb(0))).count();
+        assert!(pretos > 100, "o QR desenhado: {pretos} trechos");
+        assert!(q.textos().iter().any(|t| t == "Vale por 2:41"));
+        let q = compor(&achar("05b-exibir-qr-chamado"));
+        assert!(!q.itens.iter().any(|i| matches!(i, Item::Caixa { fundo, .. } if *fundo == Cor::rgb(0))), "chamado, o QR sai");
+        assert!(q.textos().iter().any(|t| t == "Galaxy A07 chamou…"));
+        let q = compor(&achar("05d-exibir-sem-qr"));
+        assert_eq!(q.lugar(Controle::Lista), None, "lista vazia");
+        assert!(!q.textos().iter().any(|t| t == "LER NO CELULAR"));
     }
 
     #[cfg(not(feature = "tela-estendida-futura"))]
@@ -2138,6 +2558,15 @@ mod testes {
             t,
             "No outro aparelho, abra o Quall em Exibir e escolha DELL-G3 na lista, ou digite o endereço abaixo. Vai Monitor 1, com o som deste computador."
         );
+        // O nome que os outros veem, com o alias para conferir (14/10, §8.7.1).
+        e.nome = "Dell da sala".into();
+        e.alias = Some("Quall 1234abcd".into());
+        let t: String = instrucao_da_espera(&e).iter().map(|x| x.texto.as_str()).collect();
+        assert_eq!(
+            t,
+            "No outro aparelho, abra o Quall em Exibir e escolha Dell da sala (Quall 1234abcd) na lista, ou digite o endereço abaixo. Vai Monitor 1, com o som deste computador."
+        );
+        e.alias = None;
         e.anunciando = false;
         e.com_som = None;
         e.origem = "Integrated Webcam".into();

@@ -50,8 +50,12 @@ final class SessaoEmissora: Sessao {
     var aoAnunciar: ((String) -> Void)?
     var aoEstado: ((MensagemDoMonitor) -> Void)?
     var aoTerminar: ((MensagemDoMonitor, Bool) -> Void)?
+    /// O cartão do código de 4 dígitos desta espera (`docs/conexao.md` §4): `nil` fecha o cartão.
+    var aoCodigo: ((EstadoDoCodigo?) -> Void)?
     private let lock = NSLock()
     private var stopping = false
+    /// Uma espera, um confirmador: o PIN continua valendo junto (protocolo v3, `quall_host_with_code`).
+    private let confirmacao = ConfirmacaoDeCodigo()
     private var captureFailure = MensagemDoMonitor()
     private var indiceDoMonitor: Int?
     private let monitorPreparado = DispatchSemaphore(value: 0)
@@ -98,19 +102,30 @@ final class SessaoEmissora: Sessao {
         let peers = Identidade.pares()
         guard !parado else { return }
         if anunciante.comecar(deviceId: Identidade.deviceId, nome: Identidade.nome, porta: porta,
-                              emiteTela: true, emiteCamera: false) {
-            let label = anunciante.rotulo
+                              emiteTela: true, emiteCamera: false, aceitaCodigo: confirmacao != nil) {
+            // O nome que os outros veem (`nm`) e, embaixo, o alias efêmero que a lista v3 mostra.
+            let label = [anunciante.nomeAnunciadoNoAr, anunciante.nomePublico]
+                .compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")
             DispatchQueue.main.async { [self] in aoAnunciar?(label) }
         }
-        guard nucleo.hospedar(pin: pin, porta: porta, deviceId: Identidade.deviceId,
+        let vigia = VigiaDoCodigo(confirmacao) { [weak self] estado in
+            DispatchQueue.main.async { self?.aoCodigo?(estado) }
+        }
+        let hospedou = nucleo.hospedar(pin: pin, porta: porta, deviceId: Identidade.deviceId,
                              nome: Identidade.nome,
                              tracksPedidas: [.init(tipo: QUALL_TRACK_KIND_SCREEN, rotulo: T("Quall Monitor · tela estendida"))],
                              paresConhecidos: peers.isEmpty ? nil : peers, prazoMs: 300_000,
-                             cancelador: cancelador) else {
+                             cancelador: cancelador, confirmacao: confirmacao)
+        vigia.parar()
+        DispatchQueue.main.async { [self] in aoCodigo?(nil) }
+        guard hospedou else {
             if !parado {
                 switch nucleo.ultimoStatusDeFalha {
                 case QUALL_STATUS_WRONG_PIN, QUALL_STATUS_PAIRING:
                     motivo = MensagemDoMonitor("O pareamento não terminou. Inicie novamente para gerar outro PIN.")
+                case QUALL_STATUS_ALREADY_PAIRED, QUALL_STATUS_INTERFERENCE, QUALL_STATUS_PAIR_NOT_RECOGNIZED:
+                    motivo = MensagemDoMonitor(RecusaDoVinculo.de(status: NucleoReceptor.nome(nucleo.ultimoStatusDeFalha))?.frase
+                        ?? "O pareamento não terminou. Inicie novamente para gerar outro PIN.")
                 default:
                     motivo = MensagemDoMonitor("Não foi possível conectar. Confira a rede e tente iniciar novamente.")
                 }
@@ -119,7 +134,8 @@ final class SessaoEmissora: Sessao {
             return
         }
         anunciante.parar()
-        Identidade.guardarPares(nucleo.paresParaGuardar(somandoA: peers.isEmpty ? nil : peers))
+        // Só o par novo; a fusão relê o disco na hora de gravar e não ressuscita um par esquecido.
+        Identidade.guardarPares(nucleo.parNovoParaGuardar())
         guard !parado else { return }
         let peer = Self.par(nucleo.parJson())
         // Announcement stop completed above. The next waiting slot may now advertise the same
@@ -178,6 +194,9 @@ final class SessaoEmissora: Sessao {
             Thread.sleep(forTimeInterval: 0.02)
         }
     }
+    /// O toque no cartão leva a tentativa: um toque atrasado não vale para o código seguinte.
+    func escolherCodigo(tentativa: UInt32, indice: Int) { confirmacao?.escolher(tentativa: tentativa, indice: indice) }
+    func recusarCodigo(tentativa: UInt32) { confirmacao?.recusar(tentativa: tentativa) }
     private static func par(_ json: String) -> ParDoMonitor {
         let d = json.data(using: .utf8).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
         let screen = d["screen"] as? [String: Any]
@@ -188,22 +207,60 @@ final class SessaoEmissora: Sessao {
     }
 }
 
+/// Lê o confirmador numa thread própria enquanto o núcleo espera, e entrega só as mudanças.
+final class VigiaDoCodigo: @unchecked Sendable {
+    private let lock = NSLock()
+    private var parou = false
+    init(_ confirmacao: ConfirmacaoDeCodigo?, aoMudar: @escaping (EstadoDoCodigo?) -> Void) {
+        guard let confirmacao else { return }
+        let worker = Thread { [self] in
+            var anterior: EstadoDoCodigo?
+            while !lock.withLock({ parou }) {
+                let atual = confirmacao.estado.flatMap { $0.fase == .esperando ? nil : $0 }
+                if atual != anterior { anterior = atual; aoMudar(atual) }
+                Thread.sleep(forTimeInterval: 0.15)
+            }
+        }
+        worker.name = "quall.monitor.codigo"
+        worker.start()
+    }
+    func parar() { lock.withLock { parou = true } }
+    deinit { parar() }
+}
+
+/// Como o receptor chega ao emissor (`docs/conexao.md` §3, §4 e §10).
+enum ModoDeConexao {
+    /// Endereço digitado ou tocado na lista. Sem PIN e sem vínculo, segue pelo código de 4 dígitos;
+    /// `alvo` é o `device_id` autenticado de uma sessão salva naquele endereço (falha fechado, A2).
+    case endereco(String, pin: String, alvo: String?)
+    /// Sessão salva: acha o IP novo pelo id e retoma pelo segredo, sem PIN e sem código.
+    case conhecido(deviceId: String, enderecoAntigo: String)
+    /// O QR mostrado por este Mac foi lido e o emissor já autenticou pelo segredo do convite.
+    case convite(SessaoDoConvite)
+}
+
 final class SessaoReceptora: Sessao {
-    let endereco: String
-    let pin: String
+    let modo: ModoDeConexao
     let tela: (largura: UInt32, altura: UInt32)
     let exibidor: Exibidor
     var aoEstado: ((MensagemDoMonitor) -> Void)?
     var aoTerminar: ((MensagemDoMonitor) -> Void)?
+    var aoCodigo: ((EstadoDoCodigo?) -> Void)?
+    /// Depois de autenticar: a sessão salva só é gravada aqui (revisão de 12/10, M3).
+    var aoAutenticar: ((SessaoSalva) -> Void)?
     private let nucleo = NucleoReceptor()
+    private let confirmacao: ConfirmacaoDeCodigo?
     private let lock = NSLock()
     private var waitingIdr = true
     private var lastFrame: UInt64 = Medidas.agoraUs()
     private var hidden: UInt64 = 0
 
-    init(endereco: String, pin: String, tela: (UInt32, UInt32), exibidor: Exibidor) {
-        self.endereco = endereco; self.pin = pin; self.tela = tela; self.exibidor = exibidor
+    init(modo: ModoDeConexao, tela: (UInt32, UInt32), exibidor: Exibidor) {
+        self.modo = modo; self.tela = tela; self.exibidor = exibidor
+        if case .endereco(_, let pin, _) = modo, pin.isEmpty { confirmacao = ConfirmacaoDeCodigo() } else { confirmacao = nil }
     }
+    func aceitarCodigo(tentativa: UInt32) { confirmacao?.aceitar(tentativa: tentativa) }
+    func recusarCodigo(tentativa: UInt32) { confirmacao?.recusar(tentativa: tentativa) }
     func parar() { nucleo.parar() }
     func comecar() {
         let worker = Thread { [self] in correr() }
@@ -232,20 +289,55 @@ final class SessaoReceptora: Sessao {
             }
         }
         let peers = Identidade.pares()
-        guard nucleo.conectar(endereco: endereco, pin: pin.isEmpty ? nil : pin,
-                             deviceId: Identidade.deviceId, nome: Identidade.nome,
-                             paresConhecidos: peers.isEmpty ? nil : peers, prazoMs: 30_000, tela: tela) else {
+        let conhecidos = peers.isEmpty ? nil : peers
+        let vigia = VigiaDoCodigo(confirmacao) { [weak self] estado in
+            DispatchQueue.main.async { self?.aoCodigo?(estado) }
+        }
+        let conectou: Bool
+        var enderecoUsado = ""
+        switch modo {
+        case .endereco(let endereco, let pin, let alvo):
+            enderecoUsado = endereco
+            // O prazo cobre a pessoa conferindo o código nas duas telas (60 s no núcleo).
+            conectou = nucleo.conectar(endereco: endereco, pin: pin.isEmpty ? nil : pin,
+                                       deviceId: Identidade.deviceId, nome: Identidade.nome,
+                                       paresConhecidos: conhecidos, prazoMs: confirmacao == nil ? 30_000 : 90_000,
+                                       tela: tela, confirmacao: confirmacao, alvo: alvo)
+        case .conhecido(let id, let antigo):
+            enderecoUsado = antigo
+            conectou = nucleo.conectarConhecido(deviceId: id, enderecoAntigo: antigo, meuId: Identidade.deviceId,
+                                                nome: Identidade.nome, paresConhecidos: conhecidos,
+                                                prazoMs: 30_000, tela: tela)
+        case .convite(let sessao):
+            conectou = nucleo.adotar(sessao)
+        }
+        vigia.parar()
+        let ultimoCodigo = confirmacao?.estado
+        DispatchQueue.main.async { [self] in aoCodigo?(nil) }
+        guard conectou else {
             if !nucleo.parou {
-                switch nucleo.ultimoStatus {
-                case QUALL_STATUS_NEEDS_PIN: reason = MensagemDoMonitor("Digite o PIN de seis dígitos mostrado no outro aparelho.")
-                case QUALL_STATUS_WRONG_PIN: reason = MensagemDoMonitor("PIN incorreto. Confira o PIN no outro aparelho.")
-                default: reason = MensagemDoMonitor("Não consegui conectar. Confira endereço, porta e rede local.")
+                let status = NucleoReceptor.nome(nucleo.ultimoStatus)
+                var eraSessaoSalva = false
+                if case .conhecido = modo { eraSessaoSalva = true }
+                if let frase = FraseDoToque.de(status: status, estado: ultimoCodigo) {
+                    reason = MensagemDoMonitor(frase)
+                } else {
+                    switch nucleo.ultimoStatus {
+                    case QUALL_STATUS_NEEDS_PIN: reason = MensagemDoMonitor("Digite o PIN de seis dígitos mostrado no outro aparelho.")
+                    case QUALL_STATUS_WRONG_PIN: reason = MensagemDoMonitor("PIN incorreto. Confira o PIN no outro aparelho.")
+                    case QUALL_STATUS_TIMEOUT where eraSessaoSalva:
+                        reason = MensagemDoMonitor("O aparelho salvo não respondeu. Confira se ele está em Estender tela na mesma rede.")
+                    default: reason = MensagemDoMonitor("Não consegui conectar. Confira endereço, porta e rede local.")
+                    }
                 }
-                Registro.linha("receptor: conexão falhou status=\(nucleo.ultimoStatus.rawValue)")
+                Registro.linha("receptor: conexão falhou status=\(status)")
             }
             return
         }
-        Identidade.guardarPares(nucleo.paresConhecidos(somandoA: peers.isEmpty ? nil : peers))
+        Identidade.guardarPares(nucleo.parNovoParaGuardar())
+        let salva = SessaoSalva(deviceId: nucleo.idDoPar, nome: nucleo.nomeDoPar,
+                                endereco: nucleo.enderecoDaSessao?.endpoint ?? enderecoUsado)
+        if !salva.endereco.isEmpty { DispatchQueue.main.async { [self] in aoAutenticar?(salva) } }
         guard let track = nucleo.esperarTrackDeVideo(prazoMs: 10_000), track.tipo == QUALL_TRACK_KIND_SCREEN else {
             if !nucleo.parou { reason = MensagemDoMonitor("O aparelho não ofereceu uma tela. Use Estender tela ou Espelhar uma tela no Quall Studio.") }
             return

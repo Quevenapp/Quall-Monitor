@@ -260,6 +260,10 @@ pub mod mudou {
     /// (`"pedido_de_gravacao"` voltou a nulo, e `"gravacao_recusada"` diz se foi recusado), ou o
     /// prompter passou a dizer, ou deixou de dizer, que grava (`"par_entende_gravar"`).
     pub const GRAVACAO: u32 = 1 << 13;
+    /// **No controle**: o prompter passou a dizer, ou deixou de dizer, que tem a câmera para
+    /// controlar (`"par_entende_camera"`, `docs/controle-remoto-da-camera.md` §17.3). Com ela, a casca
+    /// bombeia o controlador da câmera sobre o mensageiro da câmera; sem ela, para.
+    pub const CAMERA: u32 = 1 << 14;
 }
 
 /// O que mudou numa bombeada. Ver [`mudou`].
@@ -438,6 +442,11 @@ struct MensagemDeEstado {
     /// Só do prompter: a resposta ao último pedido que ele decidiu nesta sessão.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resposta_de_gravacao: Option<RespostaNoFio>,
+    /// Só do prompter cuja tela tem a câmera do filmador na sessão (R9b pelo canal do
+    /// teleprompter, `docs/controle-remoto-da-camera.md` §17.3). Sem isto, o controle não bombeia a
+    /// câmera. Só vai quando é `true`.
+    #[serde(default, skip_serializing_if = "falso")]
+    entende_camera: bool,
     #[serde(default)]
     texto: ReferenciaDoTexto,
 }
@@ -769,6 +778,10 @@ pub struct Estado {
     /// §13: o outro lado disse, no último estado dele, que a tela dele grava. Sem isto, o controle
     /// não mostra o botão e não pede.
     pub par_entende_gravar: bool,
+    /// R9b pelo canal do teleprompter (`docs/controle-remoto-da-camera.md` §17.3): o outro lado
+    /// disse, no último estado dele, que tem a câmera para controlar. Sem isto, o controle não
+    /// bombeia a câmera e não mostra o painel dela.
+    pub par_entende_camera: bool,
 }
 
 #[derive(Debug, Default)]
@@ -819,6 +832,8 @@ struct VistaDoPar {
     entende_segurar: bool,
     /// O último estado dele trouxe `"entende_gravar": true` (§13).
     entende_gravar: bool,
+    /// O último estado dele trouxe `"entende_camera": true` (R9b, §17.3 do contrato da câmera).
+    entende_camera: bool,
 }
 
 /// Os campos cuja edição daqui espera confirmação. A posição fica de fora: é relato, não comando,
@@ -925,6 +940,9 @@ pub struct Replica {
     /// Só no prompter: **a tela dele grava** (a casca liga). Só então o estado diz
     /// `"entende_gravar": true` e um pedido pode ser aceito.
     gravacao_ligada: bool,
+    /// Só no prompter: **a tela dele tem a câmera do filmador nesta sessão** (R9b, §17.3 do
+    /// contrato da câmera). Só então o estado diz `"entende_camera": true`.
+    camera_ligada: bool,
     /// No prompter: o pedido que chegou e a casca ainda não decidiu. No controle: o pedido daqui que
     /// o prompter ainda não respondeu — vai em todo estado até a resposta, e não passa da sessão.
     pedido_de_gravacao: Option<PedidoAberto>,
@@ -1032,6 +1050,7 @@ impl Replica {
             sessao_acabou: false,
             gravacao: Gravacao::default(),
             gravacao_ligada: false,
+            camera_ligada: false,
             pedido_de_gravacao: None,
             ultimo_pedido: None,
             resposta_de_gravacao: None,
@@ -1603,6 +1622,18 @@ impl Replica {
         }
     }
 
+    /// **Diz se a tela deste prompter tem a câmera para o controle controlar** (R9b pelo canal do
+    /// teleprompter, `docs/controle-remoto-da-camera.md` §17.3): a tela do prompter R5 liga quando
+    /// bombeia o filmador da câmera sobre o mensageiro da câmera da sessão, e desliga ao fechar.
+    /// Ligada, o estado leva `"entende_camera": true`, e só então o controle bombeia a câmera. No
+    /// controle, não muda nada.
+    pub fn ligar_camera(&mut self, ligada: bool) {
+        if self.papel == Papel::Teleprompter && self.camera_ligada != ligada {
+            self.camera_ligada = ligada;
+            self.envio.estado_devido = true;
+        }
+    }
+
     /// **O relato da gravação, por quem grava** (§13): `true` quando o arquivo começou, `false`
     /// quando fechou — pelo botão da tela, por um pedido do controle, por falta de espaço, pela
     /// câmera perdida. **Só o prompter** ([`Error::Invalid`] no controle): ele é o único escritor, e
@@ -1968,6 +1999,9 @@ impl Replica {
         if self.par.entende_gravar {
             m |= mudou::GRAVACAO;
         }
+        if self.par.entende_camera {
+            m |= mudou::CAMERA;
+        }
         self.par = VistaDoPar { anunciado_sumido: true, ..VistaDoPar::default() };
         // Sem sessão, não há a quem reenviar o grupo do segurar (§12.3).
         self.envio.reenvio_do_segurar = None;
@@ -2025,6 +2059,7 @@ impl Replica {
             }),
             gravacao_recusada: self.gravacao_recusada.clone(),
             par_entende_gravar: self.par.entende_gravar,
+            par_entende_camera: self.par.entende_camera,
             pergunta_do_texto: self.pergunta_em(agora),
             copias_do_texto: self
                 .copias
@@ -2363,6 +2398,12 @@ impl Replica {
         if entende_gravar != self.par.entende_gravar {
             self.par.entende_gravar = entende_gravar;
             m |= mudou::GRAVACAO;
+        }
+        // R9b pelo canal do teleprompter (§17.3 do contrato da câmera): o prompter tem a câmera?
+        let entende_camera = msg.get("entende_camera").and_then(Value::as_bool) == Some(true);
+        if entende_camera != self.par.entende_camera {
+            self.par.entende_camera = entende_camera;
+            m |= mudou::CAMERA;
         }
         match self.papel {
             Papel::Teleprompter => match campo::<PedidoNoFio>(msg, "pedido_de_gravacao") {
@@ -2851,6 +2892,10 @@ impl Replica {
         self.envio.reenvio_do_segurar = None;
         self.envio.reenvios_do_texto = 0;
         self.envio.desistiu_do_texto = false;
+        // §17.3 do contrato da câmera: o que o par disse da câmera é da sessão.
+        if self.par.entende_camera {
+            self.mudancas_pendentes |= mudou::CAMERA;
+        }
         self.par = VistaDoPar::default();
         // §13.4: o que da gravação é da sessão.
         self.mudancas_pendentes |= self.gravacao_na_sessao_nova(self.relogio_da_ultima_troca);
@@ -2934,6 +2979,7 @@ impl Replica {
                 Papel::Teleprompter => self.resposta_de_gravacao.clone(),
                 _ => None,
             },
+            entende_camera: self.papel == Papel::Teleprompter && self.camera_ligada,
             texto: self.referencia_anunciada(),
         };
         serde_json::to_string(&e).unwrap_or_default()
@@ -3320,6 +3366,13 @@ impl Teleprompter {
     pub fn ligar_gravacao(&self, ligada: bool) -> Result<()> {
         self.editar(|r| {
             r.ligar_gravacao(ligada);
+            Ok(())
+        })
+    }
+    /// Diz se a tela deste prompter tem a câmera (R9b, §17.3). Ver [`Replica::ligar_camera`].
+    pub fn ligar_camera(&self, ligada: bool) -> Result<()> {
+        self.editar(|r| {
+            r.ligar_camera(ligada);
             Ok(())
         })
     }
@@ -6543,5 +6596,58 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// **A câmera pelo canal do teleprompter** (`docs/controle-remoto-da-camera.md` §17.3), no molde
+    /// do `entende_gravar`:
+    ///
+    /// - fora do fio enquanto a tela não liga (o estado de antes, byte a byte), e só no prompter;
+    /// - ligada, o controle vê `par_entende_camera` com o bit `CAMERA`; desligada, cai com o bit;
+    /// - a queda e a sessão nova esquecem, com o bit; não vai no salvo;
+    /// - um controle de antes, que não conhece a chave, lê o mesmo estado.
+    #[test]
+    fn o_prompter_diz_que_tem_a_camera_e_so_ele() {
+        let mut c = nova("controle", C);
+        let mut p = nova("prompter", P);
+        sessao(&mut c, &mut p, 1, em(10_000, 1_000));
+        assert!(mensagens(&mut p, em(10_000, 1_000)).iter().all(|x| !x.contains("camera")), "a chave antes de ligar");
+        c.ligar_camera(true);
+        assert!(mensagens(&mut c, em(10_000, 1_000)).iter().all(|x| !x.contains("camera")), "o controle nunca diz");
+
+        p.ligar_camera(true);
+        let m = trocar(&mut p, &mut c, em(10_100, 1_100), em(10_100, 1_100));
+        assert_ne!(m & mudou::CAMERA, 0, "sem o bit");
+        assert!(c.estado_em(em(10_100, 1_100)).par_entende_camera);
+        assert!(!p.estado_em(em(10_100, 1_100)).par_entende_camera);
+        // Repetir não acende de novo.
+        p.envio.estado_devido = true;
+        assert_eq!(trocar(&mut p, &mut c, em(10_200, 1_200), em(10_200, 1_200)) & mudou::CAMERA, 0);
+        assert!(!p.salvo_json().contains("camera"), "foi para o salvo");
+
+        p.ligar_camera(false);
+        assert_ne!(trocar(&mut p, &mut c, em(10_300, 1_300), em(10_300, 1_300)) & mudou::CAMERA, 0);
+        assert!(!c.estado_em(em(10_300, 1_300)).par_entende_camera);
+
+        p.ligar_camera(true);
+        trocar(&mut p, &mut c, em(10_400, 1_400), em(10_400, 1_400));
+        assert_ne!(c.perdeu_o_par_em(em(10_500, 1_500)) & mudou::CAMERA, 0, "a queda esquece com o bit");
+        assert!(!c.estado_em(em(10_500, 1_500)).par_entende_camera);
+        p.envio.estado_devido = true;
+        trocar(&mut p, &mut c, em(10_600, 1_600), em(10_600, 1_600));
+        assert!(c.estado_em(em(10_600, 1_600)).par_entende_camera);
+        sessao(&mut c, &mut p, 2, em(10_700, 1_700));
+        assert_ne!(c.mudancas_pendentes & mudou::CAMERA, 0, "a sessão nova esquece com o bit");
+        assert!(!c.estado_em(em(10_700, 1_700)).par_entende_camera);
+
+        // Um controle de antes: o mesmo estado, com e sem a chave, lê igual.
+        let com = mensagens(&mut p, em(10_800, 1_800)).into_iter().find(|x| x.contains("\"tipo\":\"estado\"")).unwrap();
+        assert!(com.contains(r#""entende_camera":true"#), "{com}");
+        let sem = com.replace(r#","entende_camera":true"#, "");
+        let (mut a, mut b) = (nova("controle", C), nova("controle", C));
+        a.receber_em(&com, em(10_900, 1_900));
+        b.receber_em(&sem, em(10_900, 1_900));
+        let (ea, eb) = (a.estado_em(em(10_900, 1_900)), b.estado_em(em(10_900, 1_900)));
+        assert!(ea.par_entende_camera && !eb.par_entende_camera);
+        assert_eq!((ea.velocidade, ea.fonte, ea.rolando), (eb.velocidade, eb.fonte, eb.rolando));
     }
 }

@@ -18,6 +18,15 @@ public final class NucleoDeRede {
         return String(cString: ponteiro)
     }
 
+    /// **O nome que os outros aparelhos veem na lista** (`docs/v3-no-privado.md` §8.7): vale para os
+    /// anúncios que começarem depois. Vazio apaga — a lista dos outros mostra o alias. Devolve o nome
+    /// como ficou depois do saneamento do núcleo.
+    @discardableResult
+    public static func definirNomeAnunciado(_ nome: String) -> String {
+        _ = nome.withCString { quall_set_announced_name($0) }
+        return lerTexto { quall_announced_name($0, $1) }
+    }
+
     /// PIN de seis dígitos, sorteado pelo núcleo — mesma razão do iOS: a qualidade do sorteio é
     /// o que segura o pareamento.
     ///
@@ -194,7 +203,8 @@ public final class NucleoDeRede {
         paresConhecidos: String?,
         prazoMs: UInt32,
         cancelador: Cancelador? = nil,
-        ligarEm: String? = nil
+        ligarEm: String? = nil,
+        confirmacao: ConfirmacaoDeCodigo? = nil
     ) -> Bool {
         guard !tracksPedidas.isEmpty else {
             ultimoMotivo = "hospedar sem track nenhuma"
@@ -240,7 +250,16 @@ public final class NucleoDeRede {
             // `quall_host_cancelable` com cancelador nulo reproduz `quall_host` exatamente — o
             // header promete isso, e é o que deixa o binário de bancada seguir sem cancelador
             // enquanto o app de produto ganha um botão Cancelar que funciona.
+            //
+            // **Com o confirmador, a espera aceita também o código de 4 dígitos** (`docs/conexao.md` §4):
+            // quem chega sem PIN e sem pareamento guardado pareia tocando Confirmar dos dois lados. O
+            // PIN de `opcoes` continua valendo ao mesmo tempo — é o caminho do plugin de OBS publicado
+            // e de toda casca que ainda não conhece o código.
             let nova = withUnsafePointer(to: &opcoes) { p -> OpaquePointer? in
+                if let confirmacao {
+                    guard let cancelador else { return quall_host_with_code(p, nil, nil, confirmacao.ponteiro) }
+                    return cancelador.comPonteiro { c in quall_host_with_code(p, c, nil, confirmacao.ponteiro) }
+                }
                 guard let cancelador else { return quall_host(p) }
                 return cancelador.comPonteiro { c in quall_host_cancelable(p, c) }
             }
@@ -321,16 +340,16 @@ public final class NucleoDeRede {
         return Int(quall_session_descartados(sessao))
     }
 
-    public func paresParaGuardar(somandoA conhecidos: String?) -> String {
+    /// **Só o par desta sessão, e só se o pareamento é novo** (`quall_session_known_peers_json(s, NULL)`),
+    /// para `Identidade.guardarPares` fundir com o disco **lido na hora de gravar**. Somar à tabela lida
+    /// quando a espera abriu ressuscitava um par que a pessoa esqueceu nesse meio tempo (revisão da
+    /// integração, M2). Retomada: nada a gravar — o vínculo já está no disco, ou foi esquecido de
+    /// propósito. Vazio quando não há o que gravar.
+    public func parNovoParaGuardar() -> String {
         travaDoUso.lock()
         let s = sessao
         travaDoUso.unlock()
-        guard let s else { return "" }
-        if let conhecidos, !conhecidos.isEmpty {
-            return conhecidos.withCString { antigos in
-                NucleoDeRede.lerTexto { buf, cap in quall_session_known_peers_json(s, antigos, buf, cap) }
-            }
-        }
+        guard let s, quall_session_pairing_is_new(s) else { return "" }
         return NucleoDeRede.lerTexto { buf, cap in quall_session_known_peers_json(s, nil, buf, cap) }
     }
 

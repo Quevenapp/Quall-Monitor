@@ -291,6 +291,19 @@ impl RelogioDaSessao {
         deslocamento(&e, indice)
     }
 
+    /// Captura para arquivo: preserva a ligação entre os carimbos mesmo quando a guarda
+    /// recusa o uso dela na reprodução ao vivo. Não altera a guarda nem esconde um relógio
+    /// descasado. `None` até existir base, época e ponto do reticulado.
+    /// Usa o cadeado do relógio: consulte na thread de controle/gravador, fora do áudio.
+    pub fn deslocamento_cru(&self, indice: usize) -> Option<i64> {
+        let e = self.estado.lock().ok()?;
+        let t = e.tracks.get(indice)?;
+        t.m?;
+        let referencia = e.referencia?;
+        let ponto = if indice == referencia { 0 } else { t.ponto? };
+        Some(em_microssegundos(t.base? + ponto - e.epoca?))
+    }
+
     /// O retrato do relógio da track `indice`. `None` antes do primeiro pacote dela.
     pub fn retrato(&self, indice: usize) -> Option<RetratoDoRelogio> {
         let e = self.estado.lock().ok()?;
@@ -693,6 +706,29 @@ mod tests {
                 "{deslocamento_us} µs de descasamento tinha de ser recusado, e deu {a:?}"
             );
         }
+    }
+
+    #[test]
+    fn gravacao_tem_deslocamento_cru_sem_liberar_reproducao_recusada() {
+        let s = Simulacao::nova();
+        let origem = 30 * 3_600_000_000u64 + 123_457;
+        // O mesmo carimbo, som atrasado desde o primeiro pacote: nunca houve guarda válida.
+        s.correr(origem, 0, 6, 0.0, 1_100_000, |_| 0, true);
+        s.relogio.fixar_base(s.video, carimbo(origem, HZ_VIDEO));
+        s.relogio.fixar_base(s.audio, carimbo(origem, HZ_OPUS));
+        assert!(matches!(s.relogio.deslocamento(s.audio), DeslocamentoDeCaptura::Recusado { .. }));
+        assert!(matches!(s.relogio.deslocamento(s.video), DeslocamentoDeCaptura::Recusado { .. }));
+        let v = s.relogio.deslocamento_cru(s.video).unwrap();
+        let a = s.relogio.deslocamento_cru(s.audio).unwrap();
+        assert!((a - v).abs() <= 25, "a gravação deve ligar os carimbos, não as chegadas: {a} {v}");
+        assert!(s.relogio.deslocamento_cru(usize::MAX).is_none());
+    }
+
+    #[test]
+    fn deslocamento_cru_espera_medida_e_nao_inventa_base() {
+        let s = Simulacao::nova();
+        assert_eq!(s.relogio.deslocamento_cru(s.video), None);
+        assert_eq!(s.relogio.deslocamento_cru(s.audio), None);
     }
 
     /// O atraso de envio legítimo passa: 30 ms a mais no áudio é a corrida `c30` do §2.

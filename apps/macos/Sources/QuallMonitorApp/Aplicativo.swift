@@ -20,7 +20,14 @@ final class Modelo: ObservableObject {
     @Published private(set) var pinDaEspera = ""
     @Published private(set) var enderecos: [String] = []
     @Published private(set) var nomeNaEspera = ""
-    @Published private(set) var aparelhos: [Aparelho] = []
+    @Published private(set) var aparelhos: [AparelhoNaRede] = []
+    @Published private(set) var dicaDaBusca: DicaDaBusca?
+    @Published private(set) var salvas: [SessaoSalva] = SessoesSalvas.ler()
+    /// Cartão do código no emissor (três números) e no receptor (o código certo).
+    @Published private(set) var codigoDaEspera: EstadoDoCodigo?
+    @Published private(set) var codigoDoReceptor: EstadoDoCodigo?
+    /// O QR deste Mac para um celular/tablet com Quall Studio ler (`docs/conexao.md` §10).
+    @Published private(set) var qrTexto: String?
     @Published private(set) var monitores: [ControleDeMonitores.Monitor] = []
     @Published private(set) var monitoresRetidos = 0
     @Published private(set) var podeEsperarMais = false
@@ -34,7 +41,8 @@ final class Modelo: ObservableObject {
     private var proximoId = 1
     private var encerrandoTudo = false
     private var configuracao: (escala: ModoDoMonitorVirtual.Escala, fps: Int)?
-    private var descoberta: Descoberta?
+    private var navegador: NavegadorDeAparelhos?
+    private var esperaDoQr: Cancelador?
     private let acessoARede = AcessoARedeLocal()
     private var iniciarAposRede: Papel?
     private var descobrirAposRede = false
@@ -51,13 +59,78 @@ final class Modelo: ObservableObject {
             acessoARede.iniciar()
             return
         }
-        guard descoberta == nil else { return }
-        let browser = Descoberta()
-        browser.aoAtualizar = { [weak self] in self?.aparelhos = $0 }
-        descoberta = browser
-        browser.comecar()
+        guard navegador == nil else { return }
+        let browser = NavegadorDeAparelhos()
+        let nomes = Dictionary(salvas.filter { !$0.deviceId.isEmpty }.map { ($0.deviceId, $0.nome) }, uniquingKeysWith: { a, _ in a })
+        browser.definirConhecidos(meuId: Identidade.deviceId, nome: Identidade.nome, pares: Identidade.pares(), nomes: nomes)
+        browser.darDicas(salvas.map(\.endereco))
+        browser.comecar(excluindo: Identidade.deviceId) { [weak self] lista, dica in
+            DispatchQueue.main.async { self?.aparelhos = lista; self?.dicaDaBusca = dica }
+        }
+        navegador = browser
     }
-    func selecionar(_ aparelho: Aparelho) { endereco = aparelho.endereco; pin = "" }
+    func procurarDeNovo() { navegador?.procurarDeNovo() }
+    /// O toque na lista: par conhecido retoma pelo id; senão pareia pelo código (ou pede o PIN).
+    func conectar(_ aparelho: AparelhoNaRede) {
+        endereco = aparelho.endpoint; pin = ""
+        if let id = aparelho.idConhecido, !id.isEmpty {
+            iniciarRecepcao(modo: .conhecido(deviceId: id, enderecoAntigo: aparelho.endpoint))
+        } else if aparelho.aceitaCodigo {
+            iniciarRecepcao(modo: .endereco(aparelho.endpoint, pin: "", alvo: nil))
+        } else {
+            mensagem = .init("Este aparelho não aceita o código. Digite o PIN que aparece na tela dele.")
+        }
+    }
+    func retomar(_ salva: SessaoSalva) {
+        endereco = salva.endereco; pin = ""
+        iniciarRecepcao(modo: salva.deviceId.isEmpty
+            ? .endereco(salva.endereco, pin: "", alvo: nil)
+            : .conhecido(deviceId: salva.deviceId, enderecoAntigo: salva.endereco))
+    }
+    func esquecer(_ salva: SessaoSalva) { salvas = SessoesSalvas.esquecer(salva) }
+    func escolherCodigo(_ indice: Int) {
+        guard let e = codigoDaEspera, let id = controle.espera?.id else { return }
+        sessoes[id]?.escolherCodigo(tentativa: e.tentativa, indice: indice)
+    }
+    func recusarCodigoDaEspera() {
+        guard let e = codigoDaEspera, let id = controle.espera?.id else { return }
+        sessoes[id]?.recusarCodigo(tentativa: e.tentativa)
+    }
+    func recusarCodigoDoReceptor() {
+        guard let e = codigoDoReceptor else { return }
+        receptor?.recusarCodigo(tentativa: e.tentativa)
+    }
+    /// Mostra o QR; quando um aparelho com Quall Studio o lê e autentica, a recepção começa.
+    func mostrarQr() {
+        guard !ocupado, esperaDoQr == nil else { return }
+        guard acessoRede == .navegando else { descobrirAposRede = true; acessoARede.iniciar(); return }
+        guard let convite = ConviteQr(deviceId: Identidade.deviceId, nome: Identidade.nome),
+              let texto = convite.texto else { mensagem = .init("Não consegui criar o QR. Tente novamente."); return }
+        let cancelador = Cancelador()
+        esperaDoQr = cancelador
+        qrTexto = texto
+        let peers = Identidade.pares()
+        let worker = Thread { [weak self] in
+            let r = EsperaPeloConvite.esperar(convite, deviceId: Identidade.deviceId, nome: Identidade.nome,
+                                              paresConhecidos: peers.isEmpty ? nil : peers,
+                                              prazoMs: 300_000, cancelador: cancelador)
+            DispatchQueue.main.async {
+                guard let self, self.esperaDoQr === cancelador else { return }
+                self.esperaDoQr = nil; self.qrTexto = nil
+                switch r {
+                case .success(let sessao): self.iniciarRecepcao(modo: .convite(sessao))
+                case .failure(let f):
+                    if !f.cancelado {
+                        self.mensagem = .init(RecusaDoVinculo.de(status: f.status)?.frase ?? "O QR expirou ou não foi aceito. Mostre um novo QR.")
+                        Registro.linha("qr: espera terminou status=\(f.status)")
+                    }
+                }
+            }
+        }
+        worker.name = "quall.monitor.qr"
+        worker.start()
+    }
+    func fecharQr() { esperaDoQr?.cancelar(); esperaDoQr = nil; qrTexto = nil }
     func iniciar() {
         guard !ocupado else { return }
         guard acessoRede == .navegando else {
@@ -127,6 +200,10 @@ final class Modelo: ObservableObject {
                                      escala: configuration.escala, fps: configuration.fps)
         sessoes[id] = session
         nomeNaEspera = ""
+        session.aoCodigo = { [weak self] estado in
+            guard let self, self.controle.espera?.id == id else { return }
+            self.codigoDaEspera = estado
+        }
         session.aoAnunciar = { [weak self] label in
             guard let self, self.controle.espera?.id == id else { return }
             self.nomeNaEspera = label
@@ -192,7 +269,7 @@ final class Modelo: ObservableObject {
         if let waiting = controle.espera, let session = sessoes[waiting.id] {
             pinDaEspera = session.pin
             enderecos = Rede.enderecos(porta: session.porta)
-        } else { pinDaEspera = ""; enderecos = []; nomeNaEspera = "" }
+        } else { pinDaEspera = ""; enderecos = []; nomeNaEspera = ""; codigoDaEspera = nil }
         podeEsperarMais = configuracao != nil && !encerrandoTudo && controle.podeAbrirEspera
         if encerrandoTudo { estado = .encerrando }
         else if sessoes.isEmpty { estado = .pronto }
@@ -200,6 +277,7 @@ final class Modelo: ObservableObject {
         else { estado = .esperando }
     }
     private func iniciarRecepcao() {
+        fecharQr()
         let target = endereco.trimmingCharacters(in: .whitespacesAndNewlines)
         let digits = pin.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !target.isEmpty else { mensagem = .init("Digite o endereço e a porta mostrados no emissor."); return }
@@ -213,12 +291,19 @@ final class Modelo: ObservableObject {
         let hasPort = target.hasPrefix("[") ? target.contains("]:") : target.filter { $0 == ":" }.count == 1
         guard hasPort else { mensagem = .init("Inclua a porta indicada no emissor: por exemplo, 192.168.1.20:7878."); return }
         UserDefaults.standard.set(target, forKey: "monitor.endereco")
+        let salvaNoEndereco = salvas.first { $0.endereco == target && !$0.deviceId.isEmpty }
+        iniciarRecepcao(modo: .endereco(target, pin: digits, alvo: salvaNoEndereco?.deviceId))
+    }
+    private func iniciarRecepcao(modo: ModoDeConexao) {
+        guard receptor == nil, sessoes.isEmpty else { return }
+        fecharQr()
+        mensagem = .init()
         exibidor.reiniciar()
         exibidor.camada.flushAndRemoveImage()
         let screen = NSApp.keyWindow?.screen ?? NSScreen.main
         let pixels = screen.map { (UInt32(($0.frame.width * $0.backingScaleFactor).rounded()),
                                    UInt32(($0.frame.height * $0.backingScaleFactor).rounded())) } ?? (1920, 1080)
-        let session = SessaoReceptora(endereco: target, pin: digits, tela: pixels, exibidor: exibidor)
+        let session = SessaoReceptora(modo: modo, tela: pixels, exibidor: exibidor)
         receptor = session
         estado = .esperando
         mensagem = .init("Conectando…")
@@ -226,8 +311,11 @@ final class Modelo: ObservableObject {
             guard let self, self.estado != .encerrando else { return }
             self.estado = .conectado; self.mensagem = text
         }
+        session.aoCodigo = { [weak self] estado in self?.codigoDoReceptor = estado }
+        session.aoAutenticar = { [weak self] salva in self?.salvas = SessoesSalvas.gravar(salva) }
         session.aoTerminar = { [weak self] text in
             self?.receptor = nil; self?.estado = .pronto; self?.mensagem = text; self?.pin = ""
+            self?.codigoDoReceptor = nil
         }
         session.comecar()
     }
@@ -243,7 +331,7 @@ final class Modelo: ObservableObject {
     }
     func sair() {
         iniciarAposRede = nil; descobrirAposRede = false
-        acessoARede.parar(); descoberta?.parar(); parar()
+        fecharQr(); acessoARede.parar(); navegador?.parar(); parar()
     }
 }
 
@@ -374,6 +462,9 @@ private struct TelaPrincipal: View {
                     }
                     Text(T("Use sempre o PIN e o endereço atuais para conectar o próximo aparelho."))
                         .font(.caption).foregroundStyle(.secondary)
+                    Text(T("Sem digitar: no outro aparelho, toque neste Mac na lista e confira o código de 4 dígitos."))
+                        .font(.caption).foregroundStyle(.secondary)
+                    if let codigo = modelo.codigoDaEspera { cartaoDaEspera(codigo) }
                 } else if modelo.podeEsperarMais {
                     Button(T("Conectar mais um aparelho")) { modelo.abrirEspera() }
                 } else if modelo.monitores.count == ControleDeMonitores.limite {
@@ -394,6 +485,26 @@ private struct TelaPrincipal: View {
             }
         }
     }
+    /// O emissor não vê o código: escolhe entre três o número que o outro aparelho mostra.
+    private func cartaoDaEspera(_ e: EstadoDoCodigo) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if let frase = e.desfecho {
+                Text(frase).font(.callout).foregroundStyle(.orange)
+            } else if e.escolhaEntreTres {
+                Text(T("%@ quer conectar. Toque no número que aparece na tela dele.", e.par ?? T("Outro aparelho")))
+                    .font(.headline)
+                HStack(spacing: 12) {
+                    ForEach(Array(e.opcoes.enumerated()), id: \.offset) { indice, numero in
+                        Button { modelo.escolherCodigo(indice) } label: {
+                            Text(EstadoDoCodigo.emGrupos(numero)).font(.system(size: 28, weight: .semibold, design: .monospaced))
+                                .frame(minWidth: 96)
+                        }.buttonStyle(.bordered).accessibilityLabel(EstadoDoCodigo.paraOLeitor(numero))
+                    }
+                }
+                Button(T("Nenhum destes")) { modelo.recusarCodigoDaEspera() }
+            }
+        }.padding(14).background(Color.cyan.opacity(0.10)).clipShape(RoundedRectangle(cornerRadius: 10))
+    }
     private func linha(_ monitor: ControleDeMonitores.Monitor) -> some View {
         HStack {
             VStack(alignment: .leading, spacing: 4) {
@@ -413,16 +524,78 @@ private struct TelaPrincipal: View {
             TextField(T("Endereço do emissor · IP:porta"), text: $modelo.endereco).textFieldStyle(.roundedBorder)
             TextField(T("PIN · 6 dígitos (vazio para pareamento salvo)"), text: $modelo.pin).textFieldStyle(.roundedBorder)
                 .onSubmit { modelo.iniciar() }
-            Button(T("Conectar")) { modelo.iniciar() }.buttonStyle(.borderedProminent).tint(.cyan)
-            if !modelo.aparelhos.isEmpty {
-                Text(T("Aparelhos na rede")).font(.subheadline.bold())
-                ForEach(modelo.aparelhos) { device in
-                    Button { modelo.selecionar(device) } label: {
-                        HStack { Text(device.nome); Spacer(); Text(device.endereco).foregroundStyle(.secondary) }
-                    }.buttonStyle(.plain)
+            HStack {
+                Button(T("Conectar")) { modelo.iniciar() }.buttonStyle(.borderedProminent).tint(.cyan)
+                Button(T(modelo.qrTexto == nil ? "Mostrar QR para celular ou tablet" : "Fechar QR")) {
+                    modelo.qrTexto == nil ? modelo.mostrarQr() : modelo.fecharQr()
                 }
             }
+            if let texto = modelo.qrTexto, let imagem = DesenhoDoQr.imagem(de: texto) {
+                HStack(alignment: .top, spacing: 16) {
+                    Image(decorative: imagem, scale: 1).interpolation(.none).resizable()
+                        .frame(width: 200, height: 200).padding(12).background(.white)
+                    Text(T("Abra o Quall Studio no celular ou tablet e leia este QR. A tela dele aparece aqui quando ele confirmar."))
+                        .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            if let codigo = modelo.codigoDoReceptor { cartaoDoReceptor(codigo) }
+            if !modelo.salvas.isEmpty {
+                Text(T("Conectados antes")).font(.subheadline.bold())
+                ForEach(modelo.salvas, id: \.endereco) { salva in
+                    HStack {
+                        Button { modelo.retomar(salva) } label: {
+                            HStack { Text(salva.nome.isEmpty ? salva.endereco : salva.nome); Spacer()
+                                Text(salva.endereco).foregroundStyle(.secondary) }
+                        }.buttonStyle(.plain)
+                        Button(T("Esquecer")) { modelo.esquecer(salva) }.buttonStyle(.borderless)
+                    }
+                }
+            }
+            HStack {
+                Text(T("Por perto")).font(.subheadline.bold())
+                Spacer()
+                Button(T("Procurar de novo")) { modelo.procurarDeNovo() }.buttonStyle(.borderless)
+            }
+            if modelo.aparelhos.isEmpty {
+                Text(modelo.dicaDaBusca?.texto ?? T("Procurando aparelhos em Estender tela na rede local…"))
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            ForEach(modelo.aparelhos) { device in
+                Button { modelo.conectar(device) } label: {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(device.nome)
+                            if let baixo = device.rotuloDoPareado ?? device.aliasEmbaixo {
+                                Text(baixo).font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                        Spacer()
+                        if let visto = device.rotuloDoVisto { Text(visto).font(.caption).foregroundStyle(.secondary) }
+                        Text(T(device.idConhecido != nil ? "Reconectar" : (device.aceitaCodigo ? "Conectar" : "Usar PIN")))
+                            .foregroundStyle(.cyan)
+                    }
+                }.buttonStyle(.plain)
+            }
         }
+    }
+}
+
+extension TelaPrincipal {
+    /// O receptor mostra o código certo; quem escolhe entre três é o emissor.
+    fileprivate func cartaoDoReceptor(_ e: EstadoDoCodigo) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if let frase = e.desfecho {
+                Text(frase).font(.callout).foregroundStyle(.orange)
+            } else {
+                if e.pareamentoAnteriorInvalido {
+                    Text(T("O pareamento anterior não vale mais. Confirme o código para parear de novo.")).font(.callout)
+                }
+                Text(T("Toque neste número no outro aparelho:")).font(.headline)
+                Text(e.codigoEmGrupos).font(.system(size: 44, weight: .semibold, design: .monospaced))
+                    .accessibilityLabel(EstadoDoCodigo.paraOLeitor(e.codigo ?? ""))
+                Button(T("Recusar")) { modelo.recusarCodigoDoReceptor() }
+            }
+        }.padding(14).background(Color.cyan.opacity(0.10)).clipShape(RoundedRectangle(cornerRadius: 10))
     }
 }
 

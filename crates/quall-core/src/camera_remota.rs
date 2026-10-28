@@ -39,6 +39,47 @@ use crate::transport::{Mensageiro, ParDaSessao, FILA_DE_DADOS};
 // O contrato, em constantes
 // =============================================================================================
 
+/// **Os ajustes de imagem** (13/10, `docs/controles-de-camera.md` §3.7): inteiros de
+/// [`IMAGEM_MIN`] a [`IMAGEM_MAX`], `0` = neutro (passa sem mudança). Aditivos (o `v` continua 1):
+/// o ausente e o `null` valem `0` ([`PADRAO_DO_AUSENTE`]). Valem em qualquer exposição (nenhuma
+/// regra de coerência). O núcleo os trata como `"inteiro":true` mesmo sem a chave no descritor, e
+/// exige a faixa dentro de `[-100, 100]` com o `0` dentro.
+pub const AJUSTES_DE_IMAGEM: [&str; 4] = ["gama", "contraste", "saturacao", "nitidez"];
+/// A ponta de baixo dos [`AJUSTES_DE_IMAGEM`] no fio.
+pub const IMAGEM_MIN: i64 = -100;
+/// A ponta de cima dos [`AJUSTES_DE_IMAGEM`] no fio.
+pub const IMAGEM_MAX: i64 = 100;
+/// **A compensação de contraluz** (§3.7): só onde a câmera declara. Sim/não (`{}`) ou um nível
+/// inteiro do driver (`{"min":0,"max":N}`, o núcleo exige inteiros e `min >= 0`). O **ausente** é o
+/// neutro: a câmera fica no padrão dela; `false` e `0` são "desligada", explícitos.
+pub const CONTRALUZ: &str = "contraluz";
+/// A dica `origem` nos descritores de imagem: `"camera"` (o ajuste do driver ou do sensor) ou
+/// `"quall"` (o processamento do Quall antes do codificador). Atenção: no `ev` e no `iso` do
+/// Windows a mesma chave é o **número** do padrão do driver (§3.2 do contrato); quem mostra lê a
+/// forma que vier.
+pub const ORIGENS_DA_IMAGEM: [&str; 2] = ["camera", "quall"];
+
+/// O campo é um dos [`AJUSTES_DE_IMAGEM`]?
+pub fn e_ajuste_de_imagem(campo: &str) -> bool {
+    AJUSTES_DE_IMAGEM.contains(&campo)
+}
+
+/// **O zoom** (13/10, `docs/controles-de-camera.md` §3.8): o fator, um número; **`1.0` = a lente
+/// principal** (a do `1×` da câmera do sistema). Abaixo de 1 é a ultra-angular de uma câmera lógica
+/// (0,5–0,6). Aditivo (o `v` continua 1): o ausente e o `null` valem [`ZOOM_NEUTRO`]
+/// ([`PADRAO_DO_AUSENTE`]). Vale em Auto e em Manual (nenhuma regra de coerência). O descritor:
+/// `{"min":x,"max":y,"passo":0.1,"paradas":[…],"opticas":[…],"origem":"camera"|"quall"}`, com
+/// `0 < min <= max <= `[`ZOOM_MAX`]; `paradas` (os botões rápidos) e `opticas` (os fatores com lente
+/// física) dentro de `[min, max]`, até [`TETO_DE_PARADAS`] cada.
+pub const ZOOM: &str = "zoom";
+/// O zoom sem zoom: a lente principal. É o do ausente e o do "Restaurar automático" (cortado pela
+/// faixa da câmera: uma câmera que só começa em 2× restaura em 2×).
+pub const ZOOM_NEUTRO: f64 = 1.0;
+/// O maior fator que o fio aceita num descritor (o S24 Ultra declara 100×).
+pub const ZOOM_MAX: f64 = 1000.0;
+/// Quantos números cabem em `paradas` e em `opticas`.
+pub const TETO_DE_PARADAS: usize = 12;
+
 /// O valor da chave `"app"` de toda mensagem da câmera.
 pub const APP: &str = "camera";
 /// A versão **deste** contrato (`"v"`). Campo novo e aditivo não a sobe.
@@ -60,8 +101,10 @@ pub const TETO_DO_LIDO: usize = 512;
 pub const TETO_DO_NOME: usize = 64;
 /// O teto de um código (de "quem limita" e de recusa): `[a-z0-9_]`, de 1 a 32 bytes.
 pub const TETO_DO_CODIGO: usize = 32;
-/// Quantos campos cabem num pedido.
-pub const TETO_DE_CAMPOS: usize = 16;
+/// Quantos campos cabem num pedido. Era 16 até 13/10; os ajustes de imagem (R9 §3.7) levaram o
+/// registro a 20 campos que um receptor pode pedir. Um filmador de antes nunca recebe mais de 16:
+/// ele não lista os campos novos, e o receptor os recusa na hora (`campo_desconhecido`).
+pub const TETO_DE_CAMPOS: usize = 24;
 /// Quantas sessões um filmador serve. Acima disso o `ola` é ignorado e contado.
 pub const TETO_DE_SESSOES: usize = 16;
 /// Quantos pedidos aceitos esperam a casca do filmador. Acima disso, `ocupado`.
@@ -77,6 +120,10 @@ pub const INTERVALO_DO_LIDO: Duration = Duration::from_millis(250);
 pub const INTERVALO_DOS_PEDIDOS: Duration = Duration::from_millis(67);
 /// O reenvio do pedido ainda sem recibo.
 pub const REENVIO_DO_PEDIDO: Duration = Duration::from_millis(250);
+/// O reenvio do pedido **num canal confiável** (o do teleprompter, `docs/controle-remoto-da-camera.md`
+/// §17.4): o SCTP já retransmite, e o reenvio de 250 ms só duplicaria. Fica um por segundo, para o
+/// pedido que a casca do filmador perdeu (uma sessão que reabriu no meio) não esperar o prazo.
+pub const REENVIO_DO_PEDIDO_CONFIAVEL: Duration = Duration::from_millis(1000);
 /// Sem recibo depois disto, contado da última mudança, o receptor desiste (`sem_resposta`).
 pub const PRAZO_DO_PEDIDO: Duration = Duration::from_secs(3);
 /// O reenvio do `ola` enquanto não há estado, ou enquanto as capacidades não batem.
@@ -245,6 +292,84 @@ fn descritor(v: &Value) -> Option<Descritor> {
     }
 }
 
+/// Os campos que o contrato diz inteiros (os [`AJUSTES_DE_IMAGEM`] e o nível do [`CONTRALUZ`])
+/// valem como `"inteiro":true` mesmo que a casca esqueça a chave: o Android lê `Double` e trunca, e
+/// `12.7` viraria 12 calado.
+fn com_inteiro_do_contrato(campo: &str, d: Descritor) -> Descritor {
+    match d {
+        Descritor::Numero { min, max, .. } if e_ajuste_de_imagem(campo) || campo == CONTRALUZ => {
+            Descritor::Numero { min, max, inteiro: true }
+        }
+        d => d,
+    }
+}
+
+/// Confere o descritor do [`ZOOM`] (§3.8): a faixa positiva, as `paradas` e as `opticas` dentro
+/// dela, e a `origem` quando vier.
+fn conferir_descritor_do_zoom(bruto: &Value, d: &Descritor) -> std::result::Result<(), String> {
+    let Descritor::Numero { min, max, .. } = d else {
+        return Err("\"zoom\" é um número {\"min\",\"max\"}".into());
+    };
+    if !(*min > 0.0 && *max <= ZOOM_MAX) {
+        return Err(format!("\"zoom\" vai de mais que 0 a até {ZOOM_MAX}"));
+    }
+    if let Some(o) = bruto.get("origem") {
+        if !o.as_str().is_some_and(|o| ORIGENS_DA_IMAGEM.contains(&o)) {
+            return Err("a origem de \"zoom\" não é \"camera\" nem \"quall\"".into());
+        }
+    }
+    if let Some(p) = bruto.get("passo") {
+        if !p.as_f64().is_some_and(|p| p.is_finite() && p > 0.0) {
+            return Err("o passo de \"zoom\" é um número maior que 0".into());
+        }
+    }
+    let folga = 1e-6 * max.max(1.0);
+    for chave in ["paradas", "opticas"] {
+        let Some(lista) = bruto.get(chave) else { continue };
+        let lista = lista.as_array().ok_or_else(|| format!("\"{chave}\" do zoom não é lista"))?;
+        if lista.len() > TETO_DE_PARADAS {
+            return Err(format!("\"{chave}\" do zoom passa de {TETO_DE_PARADAS} números"));
+        }
+        for x in lista {
+            if !x.as_f64().is_some_and(|x| x.is_finite() && x >= min - folga && x <= max + folga) {
+                return Err(format!("\"{chave}\" do zoom tem um fator fora de [{min}, {max}]"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Confere o descritor de um campo de imagem (§3.7): a faixa do fio, e a `origem` quando vier.
+fn conferir_descritor_de_imagem(campo: &str, bruto: &Value, d: &Descritor) -> std::result::Result<(), String> {
+    let origem_ok = match bruto.get("origem") {
+        None => true,
+        Some(o) => o.as_str().is_some_and(|o| ORIGENS_DA_IMAGEM.contains(&o)),
+    };
+    if !origem_ok {
+        return Err(format!("a origem de \"{campo}\" não é \"camera\" nem \"quall\""));
+    }
+    let inteiro = |x: f64| x.fract() == 0.0;
+    match d {
+        Descritor::Numero { min, max, .. } if e_ajuste_de_imagem(campo) => {
+            let dentro = *min >= IMAGEM_MIN as f64 && *max <= IMAGEM_MAX as f64 && *min <= 0.0 && *max >= 0.0;
+            if dentro && inteiro(*min) && inteiro(*max) {
+                Ok(())
+            } else {
+                Err(format!("\"{campo}\" vai de -100 a 100 com o 0 dentro, em inteiros"))
+            }
+        }
+        Descritor::Numero { min, max, .. } if campo == CONTRALUZ => {
+            if *min >= 0.0 && inteiro(*min) && inteiro(*max) {
+                Ok(())
+            } else {
+                Err("o nível do \"contraluz\" é inteiro, de 0 para cima".into())
+            }
+        }
+        Descritor::Sim if campo == CONTRALUZ => Ok(()),
+        _ => Err(format!("\"{campo}\" não tem a forma do contrato")),
+    }
+}
+
 /// O número na forma do fio: **inteiro sem `.0`** quando não tem parte fracionária, porque o
 /// Android lê `iso` e `kelvin` como `Int` e `obturadorNs` como `Long`.
 fn numero_no_fio(x: f64) -> Value {
@@ -290,6 +415,17 @@ fn modo<'a>(ajuste: &'a Objeto, campo: &str) -> &'a str {
 
 /// As regras do R9 que um receptor pode quebrar (contrato §6, item 8): **pedir** o campo exige o
 /// modo certo no ajuste resultante.
+///
+/// `travarFps` **não** está aqui, de propósito (`docs/controles-de-camera.md` §3.1.1): vale em
+/// qualquer modo. Com a exposição manual ele não muda nada (o manual já segura o fps), mas fica
+/// guardado e passa a valer ao voltar ao Auto. Recusar com `incoerente` faria o botão do aviso, num
+/// controlador que viu o estado um instante antes de o filmador passar a manual, falhar por um
+/// motivo que a pessoa não entende.
+///
+/// Os [`AJUSTES_DE_IMAGEM`] e o [`CONTRALUZ`] também não (§3.7): são ajustes de imagem, que valem em
+/// Auto e em Manual, com e sem travas. Nem o [`ZOOM`] (§3.8): enquadramento não é exposição.
+///
+/// O `ev` sai da regra quando as capacidades dizem [`DICA_DO_EV_INDEPENDENTE`] (o brilho do Windows).
 const COERENCIA: &[(&str, &str, &str)] = &[
     ("ev", "exposicao", "auto"),
     ("travaExposicao", "exposicao", "auto"),
@@ -338,6 +474,7 @@ fn conferir_pedido(
                 .and_then(|c| c.get(campo))
                 .and_then(descritor)
                 .ok_or_else(|| Recusa::de(motivo::CAMPO_DESCONHECIDO, Some(campo)))?;
+            let d = com_inteiro_do_contrato(campo, d);
             let valor = conferir_valor(&d, valor)
                 .map_err(|()| Recusa::de(motivo::FORA_DA_FAIXA, Some(campo)))?;
             saida.ajuste.insert(campo.clone(), valor);
@@ -373,17 +510,39 @@ fn conferir_pedido(
     // Com `restaurar`, a casca restaura **antes** de aplicar os campos (contrato §6, a ordem): a
     // coerência é a do registro padrão, que é todo "auto".
     let vazio = Objeto::new();
-    conferir_coerencia(if saida.restaurar { &vazio } else { vigente }, &saida.ajuste)?;
+    conferir_coerencia(capacidades, if saida.restaurar { &vazio } else { vigente }, &saida.ajuste)?;
     Ok(saida)
 }
 
+/// A dica que solta o `ev` da exposição (13/10, `docs/controles-de-camera.md` §3.3): no descritor
+/// de `ev`, `"independenteDaExposicao": true` diz que o campo **não** é a compensação do automático,
+/// e sim um ajuste de imagem que vale em qualquer exposição — o brilho do driver no Windows
+/// (`VideoProcAmp_Brightness`). Com ela, pedir `ev` não exige `exposicao = auto` nem a trava de
+/// exposição desligada. É aditiva: sem a chave (os filmadores de antes, e os celulares, onde o EV é a
+/// compensação do AE), vale a regra de sempre.
+pub const DICA_DO_EV_INDEPENDENTE: &str = "independenteDaExposicao";
+
+/// O `ev` destas capacidades vale em qualquer exposição ([`DICA_DO_EV_INDEPENDENTE`])?
+fn ev_independente(capacidades: &Objeto) -> bool {
+    capacidades
+        .get("controles")
+        .and_then(|c| c.get("ev"))
+        .and_then(|d| d.get(DICA_DO_EV_INDEPENDENTE))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 /// A coerência do ajuste resultante (`vigente` com `parcial` por cima), só para os campos pedidos.
-fn conferir_coerencia(vigente: &Objeto, parcial: &Objeto) -> std::result::Result<(), Recusa> {
+fn conferir_coerencia(capacidades: &Objeto, vigente: &Objeto, parcial: &Objeto) -> std::result::Result<(), Recusa> {
     let mut resultado = vigente.clone();
     for (k, v) in parcial {
         resultado.insert(k.clone(), v.clone());
     }
+    let ev_solto = ev_independente(capacidades);
     for (campo, modo_de, exigido) in COERENCIA {
+        if *campo == "ev" && ev_solto {
+            continue;
+        }
         if parcial.contains_key(*campo) {
             // Uma trava desligada não exige modo nenhum.
             if parcial.get(*campo) == Some(&Value::Bool(false)) {
@@ -395,7 +554,8 @@ fn conferir_coerencia(vigente: &Objeto, parcial: &Objeto) -> std::result::Result
         }
     }
     // O EV fica apagado com a trava de exposição ligada (R9 §3.3).
-    if parcial.contains_key("ev") && resultado.get("travaExposicao") == Some(&Value::Bool(true)) {
+    // Um `ev` independente (o brilho do Windows) não é apagado pela trava.
+    if !ev_solto && parcial.contains_key("ev") && resultado.get("travaExposicao") == Some(&Value::Bool(true)) {
         return Err(Recusa::de(motivo::INCOERENTE, Some("ev")));
     }
     Ok(())
@@ -420,8 +580,15 @@ fn conferir_capacidades(c: &Objeto) -> Result<()> {
         .and_then(Value::as_object)
         .ok_or_else(|| Error::Invalid("capacidades: falta o objeto \"controles\"".into()))?;
     for (campo, d) in controles {
-        if campo.is_empty() || campo.len() > TETO_DO_CODIGO || descritor(d).is_none() {
+        let lido = descritor(d);
+        if campo.is_empty() || campo.len() > TETO_DO_CODIGO || lido.is_none() {
             return Err(Error::Invalid(format!("capacidades: o descritor de \"{campo}\" não tem forma conhecida")));
+        }
+        if let Some(lido) = lido.as_ref().filter(|_| e_ajuste_de_imagem(campo) || campo == CONTRALUZ) {
+            conferir_descritor_de_imagem(campo, d, lido).map_err(|e| Error::Invalid(format!("capacidades: {e}")))?;
+        }
+        if let Some(lido) = lido.as_ref().filter(|_| campo == ZOOM) {
+            conferir_descritor_do_zoom(d, lido).map_err(|e| Error::Invalid(format!("capacidades: {e}")))?;
         }
     }
     if let Some(limites) = c.get("limites") {
@@ -440,6 +607,50 @@ fn conferir_capacidades(c: &Objeto) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Os campos **aditivos** do registro, com o valor que o ausente quer dizer: um registro antigo,
+/// sem a chave, vale o padrão (`docs/controles-de-camera.md` §3.1.1). Por isso `travarFps: false` e a
+/// chave ausente são o mesmo valor: a casca que grava o `false` explícito não muda o dono do campo
+/// nem sobe a versão contra o registro que veio sem ele.
+///
+/// Os [`AJUSTES_DE_IMAGEM`] (13/10, §3.7) valem `0` ausentes. O [`CONTRALUZ`] **não** está aqui: o
+/// ausente dele é "o padrão da câmera", e `false`/`0` é "desligada", que pode ser outra coisa.
+///
+/// O [`ZOOM`] (13/10, §3.8) vale [`ZOOM_NEUTRO`] ausente: `1`, `1.0` e a chave ausente são o mesmo.
+const PADRAO_DO_AUSENTE: &[(&str, PadraoDoAusente)] = &[
+    ("travarFps", PadraoDoAusente::Falso),
+    ("gama", PadraoDoAusente::Zero),
+    ("contraste", PadraoDoAusente::Zero),
+    ("saturacao", PadraoDoAusente::Zero),
+    ("nitidez", PadraoDoAusente::Zero),
+    (ZOOM, PadraoDoAusente::ZoomNeutro),
+];
+
+/// O valor que um campo aditivo ausente quer dizer.
+#[derive(Clone, Copy)]
+enum PadraoDoAusente {
+    Falso,
+    Zero,
+    ZoomNeutro,
+}
+
+/// O valor de um campo do registro com o ausente (ou `null`) trocado pelo padrão, quando o campo é
+/// aditivo ([`PADRAO_DO_AUSENTE`]).
+fn com_padrao(campo: &str, v: Option<&Value>) -> Option<Value> {
+    match v.filter(|v| !v.is_null()) {
+        Some(v) => Some(v.clone()),
+        None => PADRAO_DO_AUSENTE.iter().find(|(c, _)| *c == campo).map(|(_, p)| match p {
+            PadraoDoAusente::Falso => Value::Bool(false),
+            PadraoDoAusente::Zero => Value::from(0),
+            PadraoDoAusente::ZoomNeutro => numero_no_fio(ZOOM_NEUTRO),
+        }),
+    }
+}
+
+/// [`igual`] no campo `campo`: o ausente de um campo aditivo vale o padrão dele.
+fn igual_no_campo(campo: &str, a: Option<&Value>, b: Option<&Value>) -> bool {
+    igual(com_padrao(campo, a).as_ref(), com_padrao(campo, b).as_ref())
 }
 
 /// **Dois valores do registro são o mesmo?** `null` e ausente são iguais (o Android grava `null`
@@ -829,7 +1040,7 @@ impl NucleoDoFilmador {
         chaves.dedup();
         let mudados: Vec<String> = chaves
             .into_iter()
-            .filter(|k| !igual(novo.get(*k), self.ajuste.get(*k)))
+            .filter(|k| !igual_no_campo(k, novo.get(*k), self.ajuste.get(*k)))
             .cloned()
             .collect();
         if !mudados.is_empty() {
@@ -926,7 +1137,8 @@ impl NucleoDoFilmador {
         }
         let vazio = Objeto::new();
         let base = if p.restaurar { &vazio } else { &self.ajuste };
-        if let Err(r) = conferir_coerencia(base, &ajuste) {
+        let caps = self.capacidades.as_ref().unwrap_or(&vazio);
+        if let Err(r) = conferir_coerencia(caps, base, &ajuste) {
             return Err(if caidos > 0 { Recusa::de(motivo::SUPERADO, primeiro.as_deref()) } else { r });
         }
         Ok((ajuste, caidos))
@@ -1056,7 +1268,7 @@ impl NucleoDoFilmador {
         // OBS que reabre com os valores salvos na fonte não mexe na câmera de ninguém).
         if !conferido.restaurar {
             let vigente = &self.ajuste;
-            conferido.ajuste.retain(|k, v| !igual(vigente.get(k), Some(v)));
+            conferido.ajuste.retain(|k, v| !igual_no_campo(k, vigente.get(k), Some(v)));
             if conferido.ajuste.is_empty() && conferido.toque.is_none() {
                 self.dar_recibo(sessao, seq);
                 return 0;
@@ -1366,6 +1578,9 @@ pub struct NucleoDoReceptor {
     situacao: &'static str,
     contadores: ContadoresDoReceptor,
     mudancas: Mudancas,
+    /// A entrega do canal desta sessão é confiável (§17.4): o pedido se reenvia a cada
+    /// [`REENVIO_DO_PEDIDO_CONFIAVEL`]. `None` enquanto não se sabe; volta a `None` numa sessão nova.
+    confiavel: Option<bool>,
 }
 
 impl NucleoDoReceptor {
@@ -1390,6 +1605,18 @@ impl NucleoDoReceptor {
         self.comecou = Some(agora);
         self.ola_devido = true;
         self.mudancas |= mudou_no_receptor::CAPACIDADES | mudou_no_receptor::AJUSTE | mudou_no_receptor::LIDO;
+    }
+
+    /// **A entrega do canal desta sessão** (§17.4): confiável, o pedido se reenvia a cada
+    /// [`REENVIO_DO_PEDIDO_CONFIAVEL`] em vez de [`REENVIO_DO_PEDIDO`]. O [`Controlador`] lê do
+    /// mensageiro ([`Mensageiro::confiavel`]) a cada bombeada.
+    pub fn definir_entrega_confiavel(&mut self, confiavel: bool) {
+        self.confiavel = Some(confiavel);
+    }
+
+    /// A entrega desta sessão, se já se sabe.
+    pub fn entrega_confiavel(&self) -> Option<bool> {
+        self.confiavel
     }
 
     fn esquecer_o_filmador(&mut self) {
@@ -1698,7 +1925,8 @@ impl NucleoDoReceptor {
         if self.tem_pendente() {
             let intervalo_ok = self.ultimo_envio.is_none_or(|t| agora.duration_since(t) >= INTERVALO_DOS_PEDIDOS);
             let novo = self.enviado_seq != self.seq_pendente;
-            let reenvio = !novo && self.ultimo_envio.is_some_and(|t| agora.duration_since(t) >= REENVIO_DO_PEDIDO);
+            let intervalo_do_reenvio = if self.confiavel == Some(true) { REENVIO_DO_PEDIDO_CONFIAVEL } else { REENVIO_DO_PEDIDO };
+            let reenvio = !novo && self.ultimo_envio.is_some_and(|t| agora.duration_since(t) >= intervalo_do_reenvio);
             if intervalo_ok && (novo || reenvio) {
                 let e = self.estado.as_ref();
                 let mut corpo = Objeto::new();
@@ -2091,6 +2319,14 @@ impl Controlador {
                 i.mensageiro = Some(m.clone());
             }
             i.nucleo.comecar_sessao(m.sessao(), agora);
+            // §17.4: o canal do teleprompter é confiável, e o reenvio se espaça. `None` (o canal
+            // ainda não existe deste lado) pergunta de novo na bombeada seguinte; sabida, não pergunta
+            // mais nesta sessão.
+            if i.nucleo.entrega_confiavel().is_none() {
+                if let Some(confiavel) = m.confiavel() {
+                    i.nucleo.definir_entrega_confiavel(confiavel);
+                }
+            }
             despachar_receptor(i, agora)
         })?;
         let mut espera = if fechada { Duration::ZERO } else { limite };

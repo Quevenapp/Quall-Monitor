@@ -47,6 +47,10 @@ getrandom = { workspace = true }
 hkdf = { workspace = true }
 hmac = { workspace = true }
 mdns-sd = { workspace = true }
+# **Só para a busca por UDP saber as redes deste aparelho** — endereço e máscara, para o broadcast de
+# cada rede e a sondagem da /24 (`docs/conexao.md` §2). Já estava no `Cargo.lock` como dependência
+# do `mdns-sd`, na mesma versão: usar direto não muda o grafo.
+if-addrs = "0.15"
 sha2 = { workspace = true }
 subtle = { workspace = true }
 tungstenite = { workspace = true }

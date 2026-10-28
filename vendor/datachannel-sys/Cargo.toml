@@ -60,5 +60,7 @@ version = "1"
 optional = true
 
 [build-dependencies.openssl-src]
-version = "300"
+# OpenSSL 4.0.3 includes the 2026-09-29 DTLS security fixes. The registry
+# checksum is pinned in both platform locks; older 3.6.3 payloads are excluded.
+version = "=400.0.2"
 optional = true

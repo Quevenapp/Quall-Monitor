@@ -166,6 +166,11 @@ impl Codigo {
             Error::Cancelled => Codigo::Cancelado,
             Error::Io(_) => Codigo::Io,
             Error::Ocupado(_) => Codigo::Ocupado,
+            // Os três do código e do QR (`docs/v3-no-privado.md`): o teleprompter os trata como
+            // pareamento; as telas de conexão os separam pelo erro.
+            Error::Interferencia(_) | Error::ParNaoReconhecido(_) | Error::JaPareado(_) => {
+                Codigo::Pareamento
+            }
         }
     }
 
@@ -1833,6 +1838,7 @@ mod testes {
             pedido_de_gravacao: None,
             gravacao_recusada: None,
             par_entende_gravar: false,
+            par_entende_camera: false,
         }
     }
 

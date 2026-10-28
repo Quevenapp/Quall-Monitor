@@ -280,6 +280,8 @@ pub enum Icone {
     /// O botão da tela cheia do teleprompter (as duas telas): entrar e sair.
     TelaCheia,
     SairDaTelaCheia,
+    /// "Procurar de novo" na lista da rede (`docs/v3-no-privado.md` §8.9).
+    Atualizar,
 }
 
 impl Icone {
@@ -308,6 +310,7 @@ impl Icone {
             Icone::Mudo => '\u{E74F}',          // Mute
             Icone::TelaCheia => '\u{E740}',     // FullScreen
             Icone::SairDaTelaCheia => '\u{E73F}', // BackToWindow
+            Icone::Atualizar => '\u{E72C}',     // Refresh
         }
     }
 }
@@ -644,6 +647,27 @@ pub fn largura_do_letreiro() -> f32 {
     6.0 * CASA_L + 5.0 * CASA_ESPACO + CASA_ENTRE_GRUPOS
 }
 
+/// **O código de 4 dígitos** (`docs/conexao.md` §4): as mesmas casas do letreiro do PIN, em dois
+/// grupos de dois ("04 27", como o Mac e o Android mostram), com a borda violeta — é o número que a
+/// pessoa compara com o da outra tela, e não um que ela digita. Centrado em `cx`.
+pub fn codigo(cx: f32, y: f32, codigo: &str) -> Vec<Item> {
+    let digitos: Vec<char> = codigo.chars().collect();
+    let mut x = cx - largura_do_codigo() / 2.0;
+    let mut itens = Vec::new();
+    for i in 0..4 {
+        let casa = Ret::new(x, y, CASA_L, CASA_A);
+        itens.push(caixa_com_borda(casa, 12.0, SUPERFICIE_ALTA, ACENTO, 1.0));
+        let d = digitos.get(i).map(|c| c.to_string()).unwrap_or_default();
+        itens.push(texto(casa, d, F_PIN, TEXTO).centro().meio().item());
+        x += CASA_L + CASA_ESPACO + if i == 1 { CASA_ENTRE_GRUPOS } else { 0.0 };
+    }
+    itens
+}
+
+pub fn largura_do_codigo() -> f32 {
+    4.0 * CASA_L + 3.0 * CASA_ESPACO + CASA_ENTRE_GRUPOS
+}
+
 /// **O interruptor** desenhado, com o canto de cima à esquerda em `(x, y)`: 40 × 20. Ligado: a
 /// cápsula cheia de `acento` e a bolinha à direita; desligado: só o contorno e a bolinha à esquerda.
 pub fn interruptor(x: f32, y: f32, ligado: bool) -> Vec<Item> {
@@ -927,9 +951,11 @@ pub mod lugar {
     ];
     /// "Um papel por vez…", com a sessão de pé.
     pub const NOTA_DA_SESSAO: Ret = Ret::new(20.0, 186.0, 190.0, 66.0);
-    /// "Este computador aparece como" e o nome.
-    pub const NOME_ROTULO: Ret = Ret::new(20.0, 474.0, 190.0, 16.0);
-    pub const NOME: Ret = Ret::new(20.0, 490.0, 190.0, 24.0);
+    /// **O nome que os outros aparelhos veem** (`docs/v3-no-privado.md` §8.7), no lugar do "Nome deste
+    /// computador" de antes: o rótulo (até duas linhas), o campo editável e a nota, no pé da barra.
+    pub const NOME_ROTULO: Ret = Ret::new(20.0, 420.0, 190.0, 30.0);
+    pub const CAMPO_DO_NOME: Ret = Ret::new(20.0, 452.0, 190.0, 32.0);
+    pub const NOTA_DO_NOME: Ret = Ret::new(20.0, 488.0, 190.0, 30.0);
     /// O item Ajustes, no pé.
     pub const ITEM_AJUSTES: Ret = Ret::new(8.0, ALTURA_MINIMA - 12.0 - 36.0, 214.0, 36.0);
 
@@ -1021,8 +1047,12 @@ pub mod lugar {
 
     // --- Exibir ---
 
-    pub const ROTULO_DA_LISTA: Ret = Ret::new(X, CONTEUDO_Y, L - 130.0, 18.0);
+    pub const ROTULO_DA_LISTA: Ret = Ret::new(X, CONTEUDO_Y, L - 130.0 - LARGURA_DO_PROCURAR - 8.0, 18.0);
     pub const PROCURANDO: Ret = Ret::new(DIREITA - 120.0, CONTEUDO_Y, 120.0, 18.0);
+    /// **"Procurar de novo"** (`docs/v3-no-privado.md` §8.9), à esquerda do "procurando", na linha do
+    /// rótulo da lista: a varredura da /24 sai sozinha uma vez, com a lista vazia; de novo, por ele.
+    pub const LARGURA_DO_PROCURAR: f32 = 150.0;
+    pub const PROCURAR_DE_NOVO: Ret = Ret::new(DIREITA - 120.0 - 8.0 - LARGURA_DO_PROCURAR, CONTEUDO_Y - 5.0, LARGURA_DO_PROCURAR, 28.0);
     /// A lista: **altura fixa de três linhas**, que nunca empurra os campos (a mesma regra do
     /// Android, §11.3). Uma linha tem 60 (o cartão de 54 e 6 de espaço).
     pub const LINHA_DA_LISTA: f32 = 60.0;
@@ -1042,6 +1072,24 @@ pub mod lugar {
     pub fn edit_no_campo(campo: Ret) -> Ret {
         Ret::new(campo.x + 12.0, campo.y + (campo.a - 22.0) / 2.0, campo.l - 24.0, 22.0)
     }
+
+    // --- o QR do computador (`docs/conexao.md` §10): uma coluna à direita da lista ---
+
+    /// **A coluna do QR**: o rótulo na linha do da lista, o quadrado do QR na altura da lista, e a
+    /// frase da fase embaixo — tudo acima dos campos, que continuam com a largura inteira.
+    pub const QR_L: f32 = 172.0;
+    pub const QR_X: f32 = DIREITA - QR_L;
+    pub const ROTULO_DO_QR: Ret = Ret::new(QR_X, CONTEUDO_Y, QR_L, 18.0);
+    pub const QR: Ret = Ret::new(QR_X, CONTEUDO_Y + 26.0, QR_L, QR_L);
+    pub const FASE_DO_QR: Ret = Ret::new(QR_X, CONTEUDO_Y + 26.0 + QR_L + 4.0, QR_L, 18.0);
+    /// A lista, mais estreita, com o QR ao lado (16 de espaço).
+    pub const LISTA_COM_QR_L: f32 = L - QR_L - 16.0;
+    pub const ROTULO_DA_LISTA_COM_QR: Ret = Ret::new(X, CONTEUDO_Y, LISTA_COM_QR_L - 130.0 - LARGURA_DO_PROCURAR - 8.0, 18.0);
+    pub const PROCURANDO_COM_QR: Ret = Ret::new(X + LISTA_COM_QR_L - 120.0, CONTEUDO_Y, 120.0, 18.0);
+    pub const PROCURAR_DE_NOVO_COM_QR: Ret =
+        Ret::new(X + LISTA_COM_QR_L - 120.0 - 8.0 - LARGURA_DO_PROCURAR, CONTEUDO_Y - 5.0, LARGURA_DO_PROCURAR, 28.0);
+    pub const LISTA_COM_QR: Ret = Ret::new(X, CONTEUDO_Y + 26.0, LISTA_COM_QR_L, 3.0 * LINHA_DA_LISTA);
+    pub const LISTA_VAZIA_COM_QR: Ret = Ret::new(X, CONTEUDO_Y + 26.0, LISTA_COM_QR_L, 54.0);
 
     // --- Teleprompter ---
 
@@ -1107,6 +1155,40 @@ pub mod lugar {
     pub const RODAPE_DA_SESSAO: Ret = Ret::new(X, ALTURA_MINIMA - PE - 36.0, L - 120.0 - 20.0, 36.0);
     pub const DESTINO: Ret = Ret::new(X, TOPO + 88.0, L, 24.0);
     pub const PARAGRAFO_DA_CONEXAO: Ret = Ret::new(CX - 240.0, TOPO + 124.0, 480.0, 62.0);
+
+    // --- o cartão do código de 4 dígitos (`docs/conexao.md` §4), na espera e na conexão ---
+
+    /// **O cartão**: no lugar da instrução, do PIN e do chip (na espera), do destino e do parágrafo
+    /// (na conexão) e das linhas dos receptores e do "Mais um aparelho" (com vários). Acaba antes da
+    /// frase do som (352) e do rodapé dos vários, que continuam valendo.
+    pub const CARTAO_DO_CODIGO: Ret = Ret::new(CX - 260.0, TOPO + 90.0, 520.0, 220.0);
+    /// "Galaxy A07 quer conectar" / "Conectando a Galaxy A07".
+    pub const CODIGO_QUEM: Ret = Ret::new(CARTAO_DO_CODIGO.x + 16.0, CARTAO_DO_CODIGO.y + 14.0, CARTAO_DO_CODIGO.l - 32.0, 22.0);
+    /// **O convidado**: o topo das quatro casas do código.
+    pub const CODIGO_Y: f32 = CARTAO_DO_CODIGO.y + 44.0;
+    /// "Escolha este número no outro aparelho." e, embaixo, "Ele mostra três números…".
+    pub const CODIGO_PERGUNTA: Ret = Ret::new(CARTAO_DO_CODIGO.x + 16.0, CODIGO_Y + super::CASA_A + 8.0, CARTAO_DO_CODIGO.l - 32.0, 20.0);
+    pub const CODIGO_CONSELHO: Ret = Ret::new(CARTAO_DO_CODIGO.x + 16.0, CODIGO_Y + super::CASA_A + 30.0, CARTAO_DO_CODIGO.l - 32.0, 18.0);
+    /// **O anfitrião** (`docs/v3-no-privado.md` §3.6): "Qual número o outro aparelho mostra?", logo
+    /// abaixo de quem pede.
+    pub const ESCOLHA_PERGUNTA: Ret = Ret::new(CARTAO_DO_CODIGO.x + 16.0, CARTAO_DO_CODIGO.y + 42.0, CARTAO_DO_CODIGO.l - 32.0, 20.0);
+    pub const OPCAO_L: f32 = 140.0;
+    pub const OPCAO_A: f32 = 64.0;
+    pub const OPCAO_ESPACO: f32 = 16.0;
+    pub const OPCOES_Y: f32 = CARTAO_DO_CODIGO.y + 72.0;
+    /// Os três números: botões grandes, iguais em cor e tamanho, lado a lado e centrados.
+    pub fn opcoes_do_codigo() -> [Ret; 3] {
+        let total = 3.0 * OPCAO_L + 2.0 * OPCAO_ESPACO;
+        [0.0f32, 1.0, 2.0].map(|i| Ret::new(CX - total / 2.0 + i * (OPCAO_L + OPCAO_ESPACO), OPCOES_Y, OPCAO_L, OPCAO_A))
+    }
+    /// "Nenhum destes": o quarto botão, separado, embaixo dos três.
+    pub const NENHUM_DESTES: Ret = Ret::new(CX - 80.0, OPCOES_Y + OPCAO_A + 14.0, 160.0, 36.0);
+    /// "Errar o número desliga o código…" (ou "Número certo. Conectando…" no lugar da pergunta).
+    pub const ESCOLHA_CONSELHO: Ret = Ret::new(CARTAO_DO_CODIGO.x + 16.0, OPCOES_Y + OPCAO_A + 14.0 + 36.0 + 10.0, CARTAO_DO_CODIGO.l - 32.0, 18.0);
+
+    /// **"Esquecer este aparelho"** no pé do Exibir (A2, `docs/v3-no-privado.md` §3.5), à esquerda do
+    /// Exibir.
+    pub const ESQUECER_ESTE_APARELHO: Ret = Ret::new(DIREITA - 150.0 - 12.0 - 210.0, PE_Y, 210.0, ALTURA_DO_BOTAO);
 
     // --- a câmera pela espera: os três controles redondos (§7.4) ---
 

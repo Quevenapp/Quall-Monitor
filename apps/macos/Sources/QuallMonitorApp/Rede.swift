@@ -1,5 +1,6 @@
 import CQuall
 import Foundation
+import QuallReceptorKit
 
 enum Rede {
     /// Prefer Monitor's port, then an ephemeral port. A bind race is reported by the host.
@@ -55,43 +56,33 @@ enum Rede {
     }
 }
 
-struct Aparelho: Identifiable, Equatable {
-    let id: String
-    let nome: String
-    let endereco: String
-}
-
-/// One dedicated thread owns browser collect/read/free for its lifetime.
-final class Descoberta {
-    private let lock = NSLock()
-    private var stopping = false
-    var aoAtualizar: (([Aparelho]) -> Void)?
-    func comecar() {
-        let worker = Thread { [self] in
-            guard let browser = quall_browser_start() else { return }
-            defer { quall_browser_stop(browser) }
-            var previous: [Aparelho] = []
-            while !lock.withLock({ stopping }) {
-                _ = quall_browser_collect(browser, 500)
-                let json = lerTexto { p, size in Int(quall_browser_devices_json(browser, p, size)) }
-                guard let data = json.data(using: .utf8),
-                      let list = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { continue }
-                let devices = list.compactMap { d -> Aparelho? in
-                    guard let id = d["device_id"] as? String, id != Identidade.deviceId,
-                          let endpoint = d["endpoint"] as? String,
-                          let capabilities = d["capabilities"] as? [String: Any],
-                          capabilities["screen_source"] as? Bool == true else { return nil }
-                    return Aparelho(id: id, nome: d["display_name"] as? String ?? "Quall", endereco: endpoint)
-                }.sorted { $0.nome < $1.nome }
-                if devices != previous {
-                    previous = devices
-                    DispatchQueue.main.async { [weak self] in self?.aoAtualizar?(devices) }
-                }
-            }
-        }
-        worker.name = "quall.monitor.descoberta"
-        worker.start()
+/// Sessões salvas do Exibir, por identidade autenticada (`docs/conexao.md` §3), no diretório do
+/// Monitor. O endereço é só dica: a retomada procura o aparelho pelo id quando o IP muda.
+enum SessoesSalvas {
+    static let limite = 8
+    private static var arquivo: URL { Identidade.pasta.appendingPathComponent("sessoes.json") }
+    static func ler() -> [SessaoSalva] {
+        guard let data = try? Data(contentsOf: arquivo) else { return [] }
+        return (try? JSONDecoder().decode([SessaoSalva].self, from: data)) ?? []
     }
-    func parar() { lock.withLock { stopping = true } }
-    deinit { parar() }
+    /// Só depois de autenticar. A mais recente primeiro; uma linha por aparelho.
+    @discardableResult
+    static func gravar(_ nova: SessaoSalva) -> [SessaoSalva] {
+        var lista = ler().filter { $0.endereco != nova.endereco && (nova.deviceId.isEmpty || $0.deviceId != nova.deviceId) }
+        lista.insert(nova, at: 0)
+        return escrever(Array(lista.prefix(limite)))
+    }
+    @discardableResult
+    static func esquecer(_ salva: SessaoSalva) -> [SessaoSalva] {
+        escrever(ler().filter { $0 != salva })
+    }
+    private static func escrever(_ lista: [SessaoSalva]) -> [SessaoSalva] {
+        try? FileManager.default.createDirectory(at: Identidade.pasta, withIntermediateDirectories: true,
+                                                  attributes: [.posixPermissions: 0o700])
+        if let data = try? JSONEncoder().encode(lista) {
+            try? data.write(to: arquivo, options: .atomic)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: arquivo.path)
+        }
+        return lista
+    }
 }
