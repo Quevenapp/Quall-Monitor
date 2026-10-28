@@ -596,7 +596,11 @@ fn parear_link(
     // O QR invertido (`docs/v3-no-privado.md` §4): o anfitrião aceita os convites lidos neste
     // processo; o convidado que recebeu o chamado pareia com a chave do QR.
     match (role, qr) {
-        (Role::Host, _) => maquina.com_convites(crate::qr::lidos_de(link.peer_addr().ip()))?,
+        (Role::Host, _) => maquina.com_convites(crate::qr::lidos_de_apos_aceite(
+            link.peer_addr().ip(),
+            *prazo,
+            &cfg.cancelamento,
+        )?)?,
         (Role::Guest, Some((celular, chave))) => maquina.com_qr(celular, chave)?,
         (Role::Guest, None) => {}
     }

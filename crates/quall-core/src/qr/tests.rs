@@ -36,6 +36,214 @@ fn motivo(resposta: &str) -> String {
     serde_json::from_str::<serde_json::Value>(resposta).unwrap()["motivo"].as_str().unwrap_or("").into()
 }
 
+thread_local! {
+    static AO_ESPERAR: std::cell::RefCell<Option<mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn notificar_espera() {
+    AO_ESPERAR.with(|canal| {
+        if let Some(tx) = canal.borrow_mut().take() {
+            let _ = tx.send(());
+        }
+    });
+}
+
+/// Libera o aceite só quando o host já capturou o snapshot (antes do conserto),
+/// ou quando ele bloqueou esperando o aceite (depois). Sem sleep ou aposta no escalonador.
+#[test]
+fn regressao_host_pareia_depois_do_aceite_atrasado() {
+    use crate::pairing::{Pairing, Role};
+    use crate::signaling::{connect, SignalMessage, SignalingServer};
+
+    let desktop = id("aceite-atrasado");
+    let celular = id("aceite-atrasado-celular");
+    let chave = [0x67; CHAVE_DO_QR_LEN];
+    guardar(&desktop, chave, &[Ipv4Addr::LOCALHOST]);
+    assert!(!lidos_de(Ipv4Addr::LOCALHOST.into()).iter().any(|(i, _)| *i == desktop));
+    let servidor = SignalingServer::bind(0).unwrap();
+    let destino = SocketAddr::from((Ipv4Addr::LOCALHOST, servidor.port().unwrap()));
+    let id_host = celular.clone();
+    let (tx, rx) = mpsc::channel();
+    let host = std::thread::spawn(move || -> Result<crate::pairing::PairOutcome> {
+        let mut link = servidor.accept(Duration::from_secs(5))?.unwrap();
+        let mut host = Pairing::new(Role::Host, id_host, None, None)?;
+        host.bind_local_role(0)?;
+        AO_ESPERAR.with(|canal| *canal.borrow_mut() = Some(tx.clone()));
+        // O mesmo ponto de snapshot de session::parear_link, sem compilar WebRTC.
+        host.com_convites(lidos_de_apos_aceite(
+            link.peer_addr().ip(), Instant::now() + Duration::from_secs(5), &Cancelamento::novo(),
+        )?)?;
+        let _ = tx.send(());
+        let prazo = Instant::now() + Duration::from_secs(5);
+        loop {
+            if Instant::now() >= prazo {
+                return Err(Error::Timeout("regressão QR host".into()));
+            }
+            if let Some(SignalMessage::Pair(quadro)) = link.poll()? {
+                let passo = host.step(quadro)?;
+                if let Some(resposta) = passo.reply {
+                    link.send(&SignalMessage::Pair(resposta))?;
+                }
+                if let Some(r) = passo.done {
+                    return Ok(r);
+                }
+            }
+        }
+    });
+    let mut link = connect(destino, Duration::from_secs(5)).unwrap();
+    let mut guest = Pairing::new(Role::Guest, desktop.clone(), None, None).unwrap();
+    guest.bind_local_role(0).unwrap();
+    guest.com_qr(celular, chave).unwrap();
+    link.send(&SignalMessage::Pair(guest.open().unwrap())).unwrap();
+    rx.recv_timeout(Duration::from_secs(5)).expect("host chegou ao snapshot/espera");
+    marcar_aceito(&desktop);
+    let resultado = (|| -> Result<crate::pairing::PairOutcome> {
+        let prazo = Instant::now() + Duration::from_secs(5);
+        loop {
+            if Instant::now() >= prazo {
+                return Err(Error::Timeout("regressão QR".into()));
+            }
+            if let Some(SignalMessage::Pair(quadro)) = link.poll()? {
+                let passo = guest.step(quadro)?;
+                if let Some(resposta) = passo.reply {
+                    link.send(&SignalMessage::Pair(resposta))?;
+                }
+                if let Some(r) = passo.done {
+                    return Ok(r);
+                }
+            }
+        }
+    })();
+    drop(link);
+    let no_host = host.join().unwrap();
+    concluir(&desktop);
+    let no_host = no_host.expect("host deve aceitar o QR após o aceite atrasado");
+    let no_guest = resultado.expect("desktop deve autenticar o celular");
+    assert_eq!(no_host.secret, no_guest.secret);
+    assert_eq!(no_host.peer, desktop);
+    assert!(no_host.novo && no_guest.novo);
+}
+
+/// Um snapshot sem a chave não pode autorizar nem iniciar OPAQUE com o QR.
+fn conferir_qr_recusado(
+    desktop: &DeviceId,
+    chave: [u8; CHAVE_DO_QR_LEN],
+    lidos: Vec<(DeviceId, [u8; CHAVE_DO_QR_LEN])>,
+) {
+    use crate::pairing::{Pairing, Role};
+    let celular = id("recusa-pendente-celular");
+    let mut guest = Pairing::new(Role::Guest, desktop.clone(), None, None).unwrap();
+    guest.bind_local_role(0).unwrap();
+    guest.com_qr(celular.clone(), chave).unwrap();
+    let mut host = Pairing::new(Role::Host, celular, None, None).unwrap();
+    host.bind_local_role(0).unwrap();
+    host.com_convites(lidos).unwrap();
+    let challenge = host.step(guest.open().unwrap()).unwrap().reply.unwrap();
+    let hello = guest.step(challenge).unwrap().reply.unwrap();
+    assert!(matches!(host.step(hello), Err(Error::NeedsPin(_))));
+    assert!(host.convite_do_qr().is_none() && !host.attempt_started());
+}
+
+#[test]
+fn espera_do_aceite_preserva_origem_e_ipv4_mapeado() {
+    let desktop = id("espera-origem");
+    let origem: Ipv4Addr = "10.77.1.1".parse().unwrap();
+    guardar(&desktop, [0x68; CHAVE_DO_QR_LEN], &[origem]);
+    let inicio = Instant::now();
+    let outros = lidos_de_apos_aceite(
+        "10.77.1.2".parse().unwrap(), inicio + Duration::from_secs(5), &Cancelamento::novo(),
+    ).unwrap();
+    assert!(outros.iter().all(|(i, _)| *i != desktop));
+    assert!(inicio.elapsed() < Duration::from_millis(500), "outra origem não deve esperar");
+    marcar_aceito(&desktop);
+    let aceitos = lidos_de_apos_aceite(
+        "::ffff:10.77.1.1".parse().unwrap(), Instant::now() + Duration::from_secs(5), &Cancelamento::novo(),
+    ).unwrap();
+    assert!(aceitos.iter().any(|(i, k)| *i == desktop && *k == [0x68; CHAVE_DO_QR_LEN]));
+    let outros = lidos_de_apos_aceite(
+        "10.77.1.2".parse().unwrap(), Instant::now() + Duration::from_secs(5), &Cancelamento::novo(),
+    ).unwrap();
+    assert!(outros.iter().all(|(i, _)| *i != desktop), "nem aceito vale de outra origem");
+    conferir_qr_recusado(&desktop, [0x68; CHAVE_DO_QR_LEN], outros);
+    concluir(&desktop);
+}
+
+#[test]
+fn espera_do_aceite_tem_teto_e_nao_autoriza_pendente() {
+    let desktop = id("espera-teto");
+    let origem: Ipv4Addr = "10.77.2.1".parse().unwrap();
+    guardar(&desktop, [0x69; CHAVE_DO_QR_LEN], &[origem]);
+    let inicio = Instant::now();
+    let lidos = lidos_de_apos_aceite(
+        origem.into(), inicio + Duration::from_secs(10), &Cancelamento::novo(),
+    ).unwrap();
+    let duracao = inicio.elapsed();
+    assert!(duracao >= PRAZO_DO_ACEITE && duracao < PRAZO_DO_ACEITE + Duration::from_secs(1));
+    assert!(lidos.iter().all(|(i, _)| *i != desktop), "vencer o teto não é aceite");
+    assert!(!caixa().iter().find(|l| l.id == desktop).unwrap().aceito);
+    conferir_qr_recusado(&desktop, [0x69; CHAVE_DO_QR_LEN], lidos);
+    concluir(&desktop);
+}
+
+#[test]
+fn espera_do_aceite_respeita_prazo_da_sessao() {
+    let desktop = id("espera-prazo");
+    let origem: Ipv4Addr = "10.77.3.1".parse().unwrap();
+    guardar(&desktop, [0x70; CHAVE_DO_QR_LEN], &[origem]);
+    let inicio = Instant::now();
+    let r = lidos_de_apos_aceite(
+        origem.into(), inicio + Duration::from_millis(100), &Cancelamento::novo(),
+    );
+    assert!(matches!(r, Err(Error::Timeout(_))), "{r:?}");
+    assert!(inicio.elapsed() < Duration::from_secs(1));
+    concluir(&desktop);
+}
+
+#[test]
+fn espera_do_aceite_cancela_enquanto_bloqueada() {
+    let desktop = id("espera-cancelar");
+    let origem: Ipv4Addr = "10.77.4.1".parse().unwrap();
+    guardar(&desktop, [0x71; CHAVE_DO_QR_LEN], &[origem]);
+    let cancelar = Cancelamento::novo();
+    let outro = cancelar.clone();
+    let (tx, rx) = mpsc::channel();
+    let (esperando_tx, esperando_rx) = mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        AO_ESPERAR.with(|canal| *canal.borrow_mut() = Some(esperando_tx));
+        tx.send(lidos_de_apos_aceite(
+            origem.into(), Instant::now() + Duration::from_secs(10), &outro,
+        )).unwrap();
+    });
+    esperando_rx.recv_timeout(Duration::from_secs(5)).expect("espera bloqueada");
+    let inicio = Instant::now();
+    cancelar.cancelar();
+    assert!(matches!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), Err(Error::Cancelled)));
+    assert!(inicio.elapsed() < Duration::from_secs(1));
+    thread.join().unwrap();
+    concluir(&desktop);
+}
+
+#[test]
+fn espera_do_aceite_nao_ressuscita_vencido_ou_sem_tentativas() {
+    let desktop = id("espera-vencido");
+    let origem: Ipv4Addr = "10.77.5.1".parse().unwrap();
+    guardar(&desktop, [0x72; CHAVE_DO_QR_LEN], &[origem]);
+    marcar_aceito(&desktop);
+    caixa().iter_mut().find(|l| l.id == desktop).unwrap().ate = Instant::now();
+    assert!(lidos_de_apos_aceite(
+        origem.into(), Instant::now() + Duration::from_secs(5), &Cancelamento::novo(),
+    ).unwrap().iter().all(|(i, _)| *i != desktop));
+    guardar(&desktop, [0x72; CHAVE_DO_QR_LEN], &[origem]);
+    marcar_aceito(&desktop);
+    for _ in 0..TENTATIVAS_DO_LIDO {
+        assert!(tomar(&desktop).is_some());
+    }
+    assert!(lidos_de_apos_aceite(
+        origem.into(), Instant::now() + Duration::from_secs(5), &Cancelamento::novo(),
+    ).unwrap().iter().all(|(i, _)| *i != desktop));
+    concluir(&desktop);
+}
+
 // ---- o texto ----
 
 #[test]

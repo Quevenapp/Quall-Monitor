@@ -67,6 +67,9 @@ const TETO_DA_LINHA: usize = 1024;
 /// uma conexão muda não segurar a vaga). O celular manda a linha logo que conecta.
 const PRAZO_DA_LINHA: Duration = Duration::from_millis(300);
 const PRAZO_DE_CONEXAO: Duration = Duration::from_millis(1500);
+/// O desktop pode conectar antes de o celular processar o aceite selado do chamado.
+/// Não deixa um chamado sem resposta segurar a autenticação indefinidamente.
+const PRAZO_DO_ACEITE: Duration = Duration::from_secs(2);
 const CAIXA_NO_MAXIMO: usize = 8;
 /// Conexões em tratamento ao mesmo tempo, no total (revisão M1) — e no máximo **uma** por IP.
 const EM_TRATAMENTO_NO_MAXIMO: usize = 16;
@@ -886,6 +889,7 @@ struct Lido {
 
 /// **A caixa do processo** (`docs/conexao.md` §10.6): as chaves dos QR lidos, por id do desktop.
 static CAIXA: Mutex<Vec<Lido>> = Mutex::new(Vec::new());
+static CAIXA_MUDOU: Condvar = Condvar::new();
 
 fn caixa() -> MutexGuard<'static, Vec<Lido>> {
     let mut c = travar(&CAIXA);
@@ -917,6 +921,7 @@ fn guardar(id: &DeviceId, chave: [u8; CHAVE_DO_QR_LEN], enderecos: &[Ipv4Addr]) 
 fn marcar_aceito(id: &DeviceId) {
     if let Some(l) = caixa().iter_mut().find(|l| l.id == *id) {
         l.aceito = true;
+        CAIXA_MUDOU.notify_all();
     }
 }
 
@@ -932,13 +937,55 @@ fn esquecer_se_nao_aceito(id: &DeviceId) {
 /// voltou com o aceite selado) e só de uma origem entre os endereços que o QR deu — quem viu o QR
 /// na tela e conecta de outra máquina antes do desktop não sequestra o emissor.
 pub fn lidos_de(origem: IpAddr) -> Vec<(DeviceId, [u8; CHAVE_DO_QR_LEN])> {
+    lidos_da_caixa(&caixa(), origem)
+}
+
+fn lidos_da_caixa(c: &[Lido], origem: IpAddr) -> Vec<(DeviceId, [u8; CHAVE_DO_QR_LEN])> {
     let origem = origem.to_canonical();
-    caixa()
-        .iter()
+    c.iter()
         .filter(|l| l.tentativas < TENTATIVAS_DO_LIDO && l.aceito)
         .filter(|l| l.enderecos.iter().any(|e| IpAddr::V4(*e) == origem))
         .map(|l| (l.id.clone(), l.chave))
         .collect()
+}
+
+/// Antes do snapshot do PAKE, aguarda somente os chamados pendentes da mesma origem.
+/// O aceite continua vindo exclusivamente da resposta autenticada em `chamar`.
+/// Ao vencer a tolerância, retorna só os já aceitos (PIN/retomada continuam possíveis).
+pub(crate) fn lidos_de_apos_aceite(
+    origem: IpAddr,
+    prazo: Instant,
+    cancelar: &Cancelamento,
+) -> Result<Vec<(DeviceId, [u8; CHAVE_DO_QR_LEN])>> {
+    let limite = prazo.min(Instant::now() + PRAZO_DO_ACEITE);
+    let origem = origem.to_canonical();
+    let mut c = caixa();
+    loop {
+        if cancelar.cancelado() {
+            return Err(Error::Cancelled);
+        }
+        let agora = Instant::now();
+        if agora >= prazo {
+            return Err(Error::Timeout("a sessão não fechou dentro do prazo".into()));
+        }
+        c.retain(|l| l.ate > agora);
+        let pendente = c.iter().any(|l| {
+            !l.aceito
+                && l.tentativas < TENTATIVAS_DO_LIDO
+                && l.enderecos.iter().any(|e| IpAddr::V4(*e) == origem)
+        });
+        if !pendente || agora >= limite {
+            return Ok(lidos_da_caixa(&c, origem));
+        }
+        // Condvar libera a caixa para `marcar_aceito`; fatias permitem cancelar mesmo
+        // se a resposta nunca chegar. Reavalia o predicado em todo despertar.
+        #[cfg(test)]
+        tests::notificar_espera();
+        c = CAIXA_MUDOU
+            .wait_timeout(c, (limite - agora).min(FATIA))
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
+    }
 }
 
 /// **A chave do QR lido para este desktop**, gastando uma tentativa. `None` sem QR lido, vencido ou
